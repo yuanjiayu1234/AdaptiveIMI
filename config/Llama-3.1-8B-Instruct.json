@@ -1,0 +1,63 @@
+{
+    "RetroInfer": {
+        "static_pattern_start": 32,
+        "static_pattern_end": 64,
+        "core": 22,
+        "n_centroids": 8192,
+        "n_segment": 16,
+        "pages_per_cluster": 2,
+        "retrieval_budget": 0.1,
+        "estimation_budget": 0,
+        "cache_ratio": 0.05,
+        "buffer_cluster_num": 32,
+        "use_cuda_graph": false,
+        "gpu_only": false
+    },
+    "AdaptiveIMI": {
+        "static_pattern_start": 32,
+        "static_pattern_end": 64,
+        "core": 24,
+        "pages_per_cluster": 2,
+        "retrieval_budget": 0.1,
+        "buffer_cluster_num": 32,
+        "use_cuda_graph": false,
+        "gpu_only": false,
+        "subspace_parts": 4,
+        "pipeline": {
+            "worker_threads": 24,
+            "chunk_buffer_count": 8,
+            "enable_omp_nested": true,
+            "omp_max_active_levels": 2
+        },
+        "kmeans": {
+            "max_iters": 20,
+            "tol": 0.0005,
+            "early_stop_min_iter": 20,
+            "early_stop_rel_tol": 0.0005,
+            "fp32_convert_chunk_elems": 1048576
+        },
+        "prefetch": {
+            "enabled": true,
+            "ratio": 0.1,
+            "mode": "random",
+            "seed": 0,
+            "tiles_per_layer": 1
+        },
+        "prefill": {
+            "prefill_chunk_size": 4096,
+            "enable_prefill_attn_chunk": true,
+            "streaming_prefill_threshold": 98304,
+            "streaming": {
+                "prefill_queue_depth": 8,
+                "prefill_stage_slots": 8
+            }
+        },
+        "async_update": {
+            "enabled": true,
+            "batch": 16,
+            "threshold": 16,
+            "delta_tokens": 512
+        },
+        "cpu_threads": 24
+    }
+}
