@@ -10,11 +10,13 @@
 *.userosscache
 *.sln.docstates
 *.md
+*.so
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 /throughput_eval/
 /benchmark/
 /build/
+/ruler_eval_result/
 # Mono auto generated files
 mono_crash.*
 
