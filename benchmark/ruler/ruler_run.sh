@@ -14,8 +14,8 @@
 # limitations under the License.
 
 
-if [ $# -ne 8 ]; then
-    echo "Usage: $0 <model_name> $1 <benchmark_name> $2 <attn_type> $3 <context length> $4 <task> $5 <dtype> $6 <budget_ratio> $7 <estimate_ratio>"
+if [ $# -ne 7 ]; then
+    echo "Usage: $0 <model_name> <benchmark_name> <attn_type> <context_length> <task> <dtype> <budget_ratio>"
     exit 1
 fi
 
@@ -27,7 +27,6 @@ MAX_SEQ_LENGTH=${4}
 ATTN_TYPE=${3}
 DEVICE=${DEVICE:-cuda:0}
 BUDGET_RATIO=${7}
-ESTIMATE_RATIO=${8}
 SUBSPACE_PARTS=${SUBSPACE_PARTS:-2}
 
 # Model and Tokenizer
@@ -124,7 +123,7 @@ fi
 
 # Start client (prepare data / call model API / obtain final metrics)
     
-RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${ATTN_TYPE}-br${BUDGET_RATIO}-er${ESTIMATE_RATIO}-sp${SUBSPACE_PARTS}"
+RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${ATTN_TYPE}-br${BUDGET_RATIO}-sp${SUBSPACE_PARTS}"
 DATA_DIR="${RESULTS_DIR}/data"
 PRED_DIR="${RESULTS_DIR}/pred"
 mkdir -p ${DATA_DIR}
@@ -183,7 +182,6 @@ for TASK in "${TASK_LIST[@]}"; do
         --server_type ${MODEL_FRAMEWORK} \
         --device ${DEVICE} \
         --budget_ratio ${BUDGET_RATIO} \
-        --estimate_ratio ${ESTIMATE_RATIO} \
         --synthetic_len ${MAX_SEQ_LENGTH} \
         --subspace_parts ${SUBSPACE_PARTS}
 done

@@ -105,7 +105,6 @@ class HuggingFaceModel:
         dtype,
         device,
         budget_ratio,
-        estimate_ratio,
         synthetic_len,
         subspace_parts=2,
     ) -> None:
@@ -139,7 +138,6 @@ class HuggingFaceModel:
 
         self.model_name = model_name
         self.budget_ratio = budget_ratio
-        self.estimate_ratio = estimate_ratio
         self.synthetic_len = synthetic_len
         self.subspace_parts = subspace_parts
         self._generate_lock = threading.Lock()
@@ -153,7 +151,6 @@ class HuggingFaceModel:
                 attn_type=self.attn_type,
                 model_name=self.model_name,
                 budget_ratio=self.budget_ratio,
-                estimate_ratio=self.estimate_ratio,
                 synthetic_len=self.synthetic_len,
                 answer_prefix=answer_prefix,
                 subspace_parts=self.subspace_parts,
@@ -175,7 +172,6 @@ def get_llm(
     dtype,
     device,
     budget_ratio,
-    estimate_ratio,
     synthetic_len,
     model_path=None,
     subspace_parts=2,
@@ -190,7 +186,6 @@ def get_llm(
             dtype=dtype,
             device=device,
             budget_ratio=budget_ratio,
-            estimate_ratio=estimate_ratio,
             synthetic_len=synthetic_len,
             subspace_parts=subspace_parts,
         )
@@ -226,7 +221,6 @@ def get_pred(
     attn_type: str,
     model_name: str,
     budget_ratio: float,
-    estimate_ratio: float,
     synthetic_len: int,
     answer_prefix: str = "",
     subspace_parts: int = 2,
@@ -250,7 +244,6 @@ def get_pred(
         input_ids.shape[1],  # 使用实际输入长度，而非预设的 synthetic_len
         attn_type,
         budget_ratio=budget_ratio,
-        estimate_ratio=estimate_ratio,
         subspace_parts=subspace_parts,
     )
 
@@ -341,7 +334,6 @@ def main(args):
         dtype,
         args.device,
         budget_ratio=args.budget_ratio,
-        estimate_ratio=args.estimate_ratio,
         synthetic_len=args.synthetic_len,
         model_path=args.model_path,
         subspace_parts=args.subspace_parts,
