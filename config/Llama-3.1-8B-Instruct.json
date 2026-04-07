@@ -1,18 +1,4 @@
 {
-    "RetroInfer": {
-        "static_pattern_start": 32,
-        "static_pattern_end": 64,
-        "core": 22,
-        "n_centroids": 8192,
-        "n_segment": 16,
-        "pages_per_cluster": 2,
-        "retrieval_budget": 0.1,
-        "estimation_budget": 0,
-        "cache_ratio": 0.05,
-        "buffer_cluster_num": 32,
-        "use_cuda_graph": false,
-        "gpu_only": false
-    },
     "AdaptiveIMI": {
         "static_pattern_start": 32,
         "static_pattern_end": 64,
@@ -20,7 +6,6 @@
         "pages_per_cluster": 2,
         "retrieval_budget": 0.1,
         "buffer_cluster_num": 32,
-        "use_cuda_graph": false,
         "gpu_only": false,
         "subspace_parts": 4,
         "pipeline": {
@@ -46,7 +31,6 @@
         "prefill": {
             "prefill_chunk_size": 4096,
             "enable_prefill_attn_chunk": true,
-            "streaming_prefill_threshold": 98304,
             "streaming": {
                 "prefill_queue_depth": 8,
                 "prefill_stage_slots": 8

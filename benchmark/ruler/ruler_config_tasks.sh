@@ -30,8 +30,8 @@ fi
 # task name in `synthetic.yaml`
 synthetic=(
     "niah_single_1"
-    "qa_1"
-    "qa_2"
+    # "qa_1"
+    # "qa_2"
     # "niah_single_1"
     # "niah_single_2"
     # "niah_single_3"

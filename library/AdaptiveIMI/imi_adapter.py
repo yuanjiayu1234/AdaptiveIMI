@@ -240,6 +240,31 @@ class IMIPipeline:
             print(json.dumps(stats_payload, ensure_ascii=False), flush=True)
 
         metadata = pipeline.get_metadata_result()
+        if os.getenv("IMI_DEBUG_INDEX_METADATA", "0") == "1":
+            cluster_counts = metadata.get("cluster_counts")
+            head_indices = metadata.get("head_indices")
+            if cluster_counts is not None and head_indices is not None:
+                cc = cluster_counts.to(dtype=torch.int64, device="cpu")
+                hi = head_indices.to(dtype=torch.int64, device="cpu")
+                nonzero_heads = int((cc > 0).sum().item())
+                total_clusters = int(cc.sum().item())
+                max_clusters = int(cc.max().item()) if cc.numel() else 0
+                min_clusters = int(cc.min().item()) if cc.numel() else 0
+                sample_counts = cc[: min(8, cc.numel())].tolist()
+                sample_heads = hi[: min(8, hi.numel())].tolist()
+                print(
+                    json.dumps({
+                        "tag": "IMI_META_FINISH",
+                        "layer_idx": int(self.layer_idx),
+                        "nonzero_heads": nonzero_heads,
+                        "total_clusters": total_clusters,
+                        "min_clusters": min_clusters,
+                        "max_clusters": max_clusters,
+                        "sample_heads": sample_heads,
+                        "sample_cluster_counts": sample_counts,
+                    }, ensure_ascii=False),
+                    flush=True,
+                )
         if not self.enable_direct_write:
             reorganized = pipeline.get_reorganize_results()
             for head_idx, head_reorg in enumerate(reorganized):

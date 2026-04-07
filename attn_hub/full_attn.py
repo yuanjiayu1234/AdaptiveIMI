@@ -22,9 +22,6 @@ def full_prefill_attn(
     key_states,
     value_states,
     causal,
-    k_new=None,
-    v_new=None,
-    cache_seqlens=None,
 ):
     attn_out = flash_attn_func(
         q=query_states,

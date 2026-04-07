@@ -80,6 +80,8 @@ def seed_everything(seed):
 
 
 def cleanup_kv_cache(llm):
+    if os.getenv("IMI_DEBUG_SKIP_KV_CLEANUP", "0") == "1":
+        return
     kv_cache = getattr(llm, "kv_cache", None)
     if kv_cache is None:
         return
@@ -140,20 +142,22 @@ class HuggingFaceModel:
         self.estimate_ratio = estimate_ratio
         self.synthetic_len = synthetic_len
         self.subspace_parts = subspace_parts
+        self._generate_lock = threading.Lock()
 
     def __call__(self, prompt: str, answer_prefix: str = "", **kwargs) -> Dict[str, List[str]]:
-        generated_text = get_pred(
-            self.llm,
-            input_text=prompt,
-            max_new_tokens=self.max_new_len,
-            attn_type=self.attn_type,
-            model_name=self.model_name,
-            budget_ratio=self.budget_ratio,
-            estimate_ratio=self.estimate_ratio,
-            synthetic_len=self.synthetic_len,
-            answer_prefix=answer_prefix,
-            subspace_parts=self.subspace_parts,
-        )
+        with self._generate_lock:
+            generated_text = get_pred(
+                self.llm,
+                input_text=prompt,
+                max_new_tokens=self.max_new_len,
+                attn_type=self.attn_type,
+                model_name=self.model_name,
+                budget_ratio=self.budget_ratio,
+                estimate_ratio=self.estimate_ratio,
+                synthetic_len=self.synthetic_len,
+                answer_prefix=answer_prefix,
+                subspace_parts=self.subspace_parts,
+            )
 
         return {'text': [generated_text]}
 
@@ -417,7 +421,7 @@ if __name__ == '__main__':
             help="simplified model name (matches config file names)")
     parser.add_argument("--model_path", type=str, default=None, help="Local path override for HF weights/tokenizer")
     parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                      \
-            choices=["Full_Flash_Attn", "Full_Flash_Attn_Offload", "RetroInfer", "IMI", "AdaptiveIMI"],                                  \
+            choices=["Full_Flash_Attn", "Full_Flash_Attn_Offload", "AdaptiveIMI"],                                  \
             help="Attention method")
     parser.add_argument("--max_len", type=int, default=128000)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")

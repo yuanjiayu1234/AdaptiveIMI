@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional, Tuple
+import json
 import math
 import os
 import queue
@@ -6,8 +7,8 @@ import threading
 import time
 
 import torch
-from library.AdaptiveIMI.kernels import ThreadPool_LRUPlus, WaveBufferCPU_LRUPlus
-from library.AdaptiveIMI.kernels import gather_copy_and_concat, gather_copy_and_concat_retrieval, gather_copy_and_scatter
+from library.AdaptiveIMI.cpp_extensions import AdpIMI_ThreadPool, AdpIMI_Index
+from library.AdaptiveIMI.cpp_extensions import gather_copy_and_concat, gather_copy_and_concat_retrieval, gather_copy_and_scatter
 from weighted_flash_decoding import weighted_flash_decoding
 
 from library.AdaptiveIMI.imi_adapter import IMIPipeline, IMIRuntimeConfig, get_imi_kernels
@@ -86,7 +87,7 @@ class _KmeansScheduler:
                 if self._stop_event.is_set():
                     return
                 self._active_jobs += 1
-            worker_threads = self._total_cores
+            worker_threads = max(1, self._total_cores // max(1, self._max_concurrent))
             thread = threading.Thread(
                 target=self._run_job,
                 args=(fn, worker_threads),
@@ -104,8 +105,8 @@ class _KmeansScheduler:
                 self._cv.notify_all()
 
 
-class retroinfer_cache_imi(KV_Cache):
-    """KV cache using IMI indexing with RetroInfer block cache/gather flow."""
+class adpimi_cache(KV_Cache):
+    """KV cache using IMI indexing with block cache/gather flow."""
 
     def __init__(
         self,
@@ -211,8 +212,8 @@ class retroinfer_cache_imi(KV_Cache):
             self.static_stride = self.input_length + actual_gen_len
         self.will_update_index = False
 
-        self.wave_buffer_cls = WaveBufferCPU_LRUPlus
-        self.thread_pool = ThreadPool_LRUPlus(core)
+        self.adpimi_index_cls = AdpIMI_Index
+        self.thread_pool = AdpIMI_ThreadPool(core)
         self.core = core
         self.attn_func = self.dense_attention
 
@@ -252,24 +253,8 @@ class retroinfer_cache_imi(KV_Cache):
                 ).contiguous()
             )
 
-        self.list_keys = []
-        self.list_values = []
-        if self.build_index_when_prefilling:
-            for _ in range(self.layer_num):
-                self.list_keys.append(
-                    torch.empty(
-                        (self.batch_size, self.kv_head, self.list_stride, self.head_dim),
-                        dtype=self.dtype,
-                        pin_memory=True,
-                    ).contiguous()
-                )
-                self.list_values.append(
-                    torch.empty(
-                        (self.batch_size, self.kv_head, self.list_stride, self.head_dim),
-                        dtype=self.dtype,
-                        pin_memory=True,
-                    ).contiguous()
-                )
+        self.list_keys = [None] * self.layer_num
+        self.list_values = [None] * self.layer_num
 
         self.imi_pipelines = []
         if self.build_index_when_prefilling:
@@ -299,6 +284,7 @@ class retroinfer_cache_imi(KV_Cache):
                             raise ValueError(
                                 f"IMI direct write layer mismatch: expected {ldx}, got {layer_idx}"
                             )
+                        self._ensure_list_storage(ldx)
                         key_storage = self.list_keys[ldx]
                         value_storage = self.list_values[ldx]
                         results = []
@@ -321,7 +307,7 @@ class retroinfer_cache_imi(KV_Cache):
         else:
             self.imi_pipelines = [None] * self.layer_num
 
-        self.wave_buffer = [None] * self.layer_num
+        self.adpimi_index = [None] * self.layer_num
         self.cluster_sizes_cpu = [None] * self.layer_num
         self.cluster_offsets_cpu = [None] * self.layer_num
         self.cluster_sizes_gpu = [None] * self.layer_num
@@ -373,6 +359,7 @@ class retroinfer_cache_imi(KV_Cache):
         self.profile_block_misses = 0
         self.profile_layer_hit_rate_count = 0
         self.profile_cache_stats = os.getenv("IMI_PROFILE_CACHE", "0") == "1"
+        self.decode_debug_step = 0
 
         async_cfg = self.runtime_config.get("async_update") or {}
         self.async_update_enabled = bool(async_cfg.get("enabled", False))
@@ -439,6 +426,8 @@ class retroinfer_cache_imi(KV_Cache):
         self._kmeans_job_lock = threading.Lock()
         self._kmeans_min_threads_per_layer = max(1, self.kv_head * max(self.subspace_parts, 1))
         max_concurrent = _read_int_env("IMI_KMEANS_MAX_CONCURRENT")
+        if max_concurrent is None and self.list_stride >= 65536:
+            max_concurrent = 1
         self._kmeans_scheduler = _KmeansScheduler(
             self._available_cpu_cores,
             self._kmeans_min_threads_per_layer,
@@ -446,9 +435,6 @@ class retroinfer_cache_imi(KV_Cache):
         )
 
         self._metadata_lock = threading.Lock()
-
-    def set_prefill_stream_mode(self, layer_idx: int, enabled: bool):
-        self.prefill_stream_mode[layer_idx] = bool(enabled)
 
     def _estimate_cache_parameters(self) -> Tuple[int, int, int, int]:
         if not self.build_index_when_prefilling:
@@ -517,6 +503,23 @@ class retroinfer_cache_imi(KV_Cache):
         return states[:, start:end, :, :].transpose(1, 2).contiguous()
 
 
+    def _ensure_list_storage(self, layer_idx: int) -> None:
+        if not self.build_index_when_prefilling:
+            return
+        if self.list_keys[layer_idx] is not None and self.list_values[layer_idx] is not None:
+            return
+        self.list_keys[layer_idx] = torch.empty(
+            (self.batch_size, self.kv_head, self.list_stride, self.head_dim),
+            dtype=self.dtype,
+            pin_memory=True,
+        ).contiguous()
+        self.list_values[layer_idx] = torch.empty(
+            (self.batch_size, self.kv_head, self.list_stride, self.head_dim),
+            dtype=self.dtype,
+            pin_memory=True,
+        ).contiguous()
+
+
     def _load_layer_metadata(self, layer_idx: int, metadata: List[Dict[str, object]]):
         self.layer_metadata[layer_idx] = metadata
         self.layer_ready[layer_idx] = True
@@ -548,17 +551,42 @@ class retroinfer_cache_imi(KV_Cache):
             if cluster_count < self.n_centroids:
                 centroids_mask_cpu[head_idx, cluster_count:] = True
 
+        if os.getenv("IMI_DEBUG_INDEX_METADATA", "0") == "1":
+            nonzero_heads = 0
+            total_clusters = 0
+            max_clusters = 0
+            sample_counts = []
+            for head_meta in metadata[: min(8, len(metadata))]:
+                count = int(head_meta["cluster_sizes"].shape[0])
+                sample_counts.append(count)
+            for head_meta in metadata:
+                count = int(head_meta["cluster_sizes"].shape[0])
+                if count > 0:
+                    nonzero_heads += 1
+                    total_clusters += count
+                    max_clusters = max(max_clusters, count)
+            print(
+                json.dumps({
+                    "tag": "IMI_META_LOAD",
+                    "layer_idx": int(layer_idx),
+                    "nonzero_heads": int(nonzero_heads),
+                    "total_clusters": int(total_clusters),
+                    "max_clusters": int(max_clusters),
+                    "sample_cluster_counts": sample_counts,
+                }, ensure_ascii=False),
+                flush=True,
+            )
+
         self.centroids_cpu[layer_idx] = centroids_cpu
         self.centroids_mask_cpu[layer_idx] = centroids_mask_cpu
-        if self.allocated:
-            if self.cluster_sizes_gpu[layer_idx] is not None:
-                self.cluster_sizes_gpu[layer_idx].copy_(cluster_sizes)
-            if self.centroids[layer_idx] is not None:
-                self.centroids[layer_idx].copy_(centroids_cpu)
-            if self.centroids_mask[layer_idx] is not None:
-                self.centroids_mask[layer_idx].copy_(centroids_mask_cpu)
-        if self.wave_buffer[layer_idx] is not None:
-            self.wave_buffer[layer_idx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
+        if self.cluster_sizes_gpu[layer_idx] is not None:
+            self.cluster_sizes_gpu[layer_idx].copy_(cluster_sizes)
+        if self.centroids[layer_idx] is not None:
+            self.centroids[layer_idx].copy_(centroids_cpu)
+        if self.centroids_mask[layer_idx] is not None:
+            self.centroids_mask[layer_idx].copy_(centroids_mask_cpu)
+        if self.adpimi_index[layer_idx] is not None:
+            self.adpimi_index[layer_idx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
 
     def _ensure_metadata_buffers(self) -> None:
         if self.n_centroids <= 0:
@@ -611,9 +639,21 @@ class retroinfer_cache_imi(KV_Cache):
                     )
         
     def _finish_layer_index(self, layer_idx: int):
+        progress = os.getenv("IMI_STREAMING_PROGRESS", "0") == "1"
+        start_ts = time.perf_counter() if progress else None
+        if progress:
+            print(f"[IMI INDEX] layer={layer_idx} phase=start", flush=True)
+        self._ensure_list_storage(layer_idx)
         metadata = self.imi_pipelines[layer_idx].finish_index(
             self.list_keys[layer_idx],
             self.list_values[layer_idx],
+        )
+        placeholder = torch.empty((self.batch_groups, 0, self.head_dim), dtype=self.dtype, pin_memory=True)
+        self.adpimi_index[layer_idx].set_kv(
+            self.list_keys[layer_idx],
+            self.list_values[layer_idx],
+            placeholder,
+            placeholder,
         )
         if os.getenv("IMI_DEBUG_STREAMING_CHECK", "0") == "1":
             expected_len = self._expected_middle_len[layer_idx]
@@ -647,6 +687,9 @@ class retroinfer_cache_imi(KV_Cache):
         with self._metadata_lock:
             self._load_layer_metadata(layer_idx, metadata)
         self._log_index_summary_once(layer_idx)
+        if progress and start_ts is not None:
+            elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+            print(f"[IMI INDEX] layer={layer_idx} phase=done elapsed_ms={elapsed_ms:.2f}", flush=True)
 
     def _log_index_summary_once(self, layer_idx: int) -> None:
         if os.getenv("IMI_DEBUG_INDEX_SUMMARY", "0") != "1":
@@ -819,158 +862,6 @@ class retroinfer_cache_imi(KV_Cache):
         worker.start()
         self.prefill_stream_workers[layer_idx] = worker
 
-    def begin_prefill_stream(self, layer_idx, start_bdx, key_states, value_states, chunk_size):
-        if not self.build_index_when_prefilling:
-            return
-        if self.prefill_stream_started[layer_idx]:
-            return
-
-        _, seq_len, _, _ = key_states.shape
-        valid_start = self.valid_start_list[start_bdx]
-        middle_start = valid_start + self.static_pattern_start
-        middle_end = seq_len - self.static_pattern_end
-        middle_len = max(middle_end - middle_start, 0)
-        if middle_len <= 0:
-            raise ValueError("IMI cache requires a non-empty middle segment.")
-        self._expected_middle_len[layer_idx] = int(middle_len)
-
-        submit_chunk_size = chunk_size if chunk_size and chunk_size > 0 else middle_len
-        self.imi_pipelines[layer_idx].begin_index_stream(middle_len, submit_chunk_size)
-        self.layer_started[layer_idx] = True
-        self.prefill_stream_started[layer_idx] = True
-        self.prefill_stream_chunk_ids[layer_idx] = 0
-        self.prefill_stream_end_submitted[layer_idx] = False
-        self.prefill_stream_expected_chunk_id[layer_idx] = 0
-        self.prefill_stream_expected_token_offset[layer_idx] = 0
-        self.prefill_stream_produced_token_offset[layer_idx] = 0
-        self.prefill_stream_last_chunk_seen[layer_idx] = False
-        self.prefill_stream_done_events[layer_idx].clear()
-        self.prefill_stream_errors[layer_idx] = None
-        self.prefill_stream_copy_streams[layer_idx] = None
-        self.prefill_stream_main_events[layer_idx] = None
-        self.prefill_stream_copy_events[layer_idx] = None
-        self.prefill_stream_stage_keys[layer_idx] = None
-        self.prefill_stream_stage_values[layer_idx] = None
-        self.prefill_stream_free_slots[layer_idx] = None
-        self.prefill_stream_queues[layer_idx] = None
-        self.prefill_stream_workers[layer_idx] = None
-
-    def submit_prefill_stream_chunk(
-        self,
-        layer_idx,
-        start_bdx,
-        key_states,
-        value_states,
-        chunk_start,
-        chunk_end,
-        chunk_keys=None,
-        chunk_values=None,
-    ):
-        if not self.prefill_stream_started[layer_idx] or self.prefill_stream_end_submitted[layer_idx]:
-            return
-        self._raise_prefill_stream_error(layer_idx)
-
-        _, seq_len, _, _ = key_states.shape
-        valid_start = self.valid_start_list[start_bdx]
-        middle_start = valid_start + self.static_pattern_start
-        middle_end = seq_len - self.static_pattern_end
-
-        debug_streaming = os.getenv("IMI_DEBUG_STREAMING_CHECK", "0") == "1"
-
-        if chunk_end <= middle_start or chunk_start >= middle_end:
-            if debug_streaming:
-                print(
-                    "[IMI STREAM CHECK]"
-                    f" layer={layer_idx} middle=[{middle_start},{middle_end})"
-                    f" chunk=[{chunk_start},{chunk_end}) early_return=True",
-                    flush=True,
-                )
-            return
-
-        local_start = max(chunk_start, middle_start)
-        local_end = min(chunk_end, middle_end)
-        if local_end <= local_start:
-            if debug_streaming:
-                print(
-                    "[IMI STREAM CHECK]"
-                    f" layer={layer_idx} middle=[{middle_start},{middle_end})"
-                    f" chunk=[{chunk_start},{chunk_end}) early_return=True",
-                    flush=True,
-                )
-            return
-
-        chunk_len = local_end - local_start
-        middle_offset = local_start - middle_start
-        expected_offset = self.prefill_stream_produced_token_offset[layer_idx]
-        if middle_offset != expected_offset:
-            raise RuntimeError(
-                f"layer {layer_idx}: producer offset mismatch, expected {expected_offset}, got {middle_offset}"
-            )
-
-        if debug_streaming:
-            print(
-                "[IMI STREAM CHECK]"
-                f" layer={layer_idx} middle=[{middle_start},{middle_end})"
-                f" chunk=[{chunk_start},{chunk_end}) early_return=False",
-                flush=True,
-            )
-
-        is_last = local_end == middle_end
-        if is_last and self.static_pattern_end > 0:
-            end_bdx = start_bdx + 1
-            self.steady_zone_keys[layer_idx][
-                start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-            ] = key_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
-            self.steady_zone_values[layer_idx][
-                start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-            ] = value_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
-        chunk_id = self.prefill_stream_chunk_ids[layer_idx]
-        self.prefill_stream_chunk_ids[layer_idx] += 1
-        self.prefill_stream_produced_token_offset[layer_idx] += chunk_len
-        expected_chunk_id = self.prefill_stream_expected_chunk_id[layer_idx]
-        expected_token_offset = self.prefill_stream_expected_token_offset[layer_idx]
-        if chunk_id != expected_chunk_id:
-            raise RuntimeError(
-                f"layer {layer_idx}: chunk_id out of order, expected {expected_chunk_id}, got {chunk_id}"
-            )
-        if middle_offset != expected_token_offset:
-            raise RuntimeError(
-                f"layer {layer_idx}: token_offset out of order, expected {expected_token_offset}, got {middle_offset}"
-            )
-
-        if chunk_keys is not None and chunk_values is not None:
-            chunk_offset = local_start - chunk_start
-            chunk_slice = slice(chunk_offset, chunk_offset + chunk_len)
-            gpu_k = chunk_keys[:, chunk_slice, :, :].transpose(1, 2).contiguous()
-            gpu_v = chunk_values[:, chunk_slice, :, :].transpose(1, 2).contiguous()
-        else:
-            gpu_k = self._prepare_prefill_chunk(key_states, local_start, local_end)
-            gpu_v = self._prepare_prefill_chunk(value_states, local_start, local_end)
-
-        try:
-            self.imi_pipelines[layer_idx].submit_index_stream_chunk(
-                gpu_k,
-                gpu_v,
-                chunk_id=chunk_id,
-                token_offset=middle_offset,
-                is_last=is_last,
-            )
-        except Exception as exc:
-            if self.prefill_stream_errors[layer_idx] is None:
-                self.prefill_stream_errors[layer_idx] = exc
-            self.prefill_stream_done_events[layer_idx].set()
-            raise
-
-        self.prefill_stream_expected_chunk_id[layer_idx] += 1
-        self.prefill_stream_expected_token_offset[layer_idx] += chunk_len
-
-        if is_last:
-            if self.prefill_stream_last_chunk_seen[layer_idx]:
-                raise RuntimeError(f"layer {layer_idx}: duplicate last chunk")
-            self.prefill_stream_last_chunk_seen[layer_idx] = True
-            self.prefill_stream_end_submitted[layer_idx] = True
-            self._schedule_finish_layer_index(layer_idx)
-
     def _shutdown_stream_workers(self):
         for layer_idx in range(self.layer_num):
             worker = self.prefill_stream_workers[layer_idx]
@@ -1043,7 +934,7 @@ class retroinfer_cache_imi(KV_Cache):
 
         # 7. Clear wave buffers and IMI pipelines
         for i in range(self.layer_num):
-            self.wave_buffer[i] = None
+            self.adpimi_index[i] = None
             self.imi_pipelines[i] = None
 
         # 8. Shutdown thread pool
@@ -1075,10 +966,7 @@ class retroinfer_cache_imi(KV_Cache):
                 raise ValueError("IMI cache requires a non-empty middle segment.")
             self._expected_middle_len[layer_idx] = int(middle_len)
 
-            if self.prefill_stream_mode[layer_idx]:
-                if not self.prefill_stream_started[layer_idx]:
-                    self.begin_prefill_stream(layer_idx, start_bdx, key_states, value_states, self.prefill_chunk_size)
-            elif not self.layer_started[layer_idx]:
+            if not self.layer_started[layer_idx]:
                 if self.prefill_chunk_size > 0 and middle_len > self.prefill_chunk_size:
                     self.imi_pipelines[layer_idx].start_index_chunked(
                         key_states,
@@ -1104,21 +992,12 @@ class retroinfer_cache_imi(KV_Cache):
                 value_states[:, valid_start : valid_start + self.static_pattern_start, :, :].transpose(1, 2)
             )
 
-            if self.prefill_stream_mode[layer_idx]:
-                if self.prefill_stream_end_submitted[layer_idx]:
-                    self.steady_zone_keys[layer_idx][
-                        start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-                    ] = key_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
-                    self.steady_zone_values[layer_idx][
-                        start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-                    ] = value_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
-            else:
-                self.steady_zone_keys[layer_idx][
-                    start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-                ] = key_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
-                self.steady_zone_values[layer_idx][
-                    start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-                ] = value_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
+            self.steady_zone_keys[layer_idx][
+                start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
+            ] = key_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
+            self.steady_zone_values[layer_idx][
+                start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
+            ] = value_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
         else:
             end_bdx = start_bdx + bsz
             self.steady_zone_keys[layer_idx][start_bdx:end_bdx, :, :seq_len, :].copy_(
@@ -1234,7 +1113,7 @@ class retroinfer_cache_imi(KV_Cache):
 
         thread_pool_pointer = self.thread_pool.get()
         for ldx in range(self.layer_num):
-            self.wave_buffer[ldx] = self.wave_buffer_cls(
+            self.adpimi_index[ldx] = self.adpimi_index_cls(
                 self.batch_size,
                 self.kv_head,
                 self.head_dim,
@@ -1249,7 +1128,7 @@ class retroinfer_cache_imi(KV_Cache):
             )
 
         if profile_prepare:
-            log_step("wave_buffer")
+            log_step("adpimi_index")
 
         if self.async_update_enabled and not self.allocated:
             self.async_update_enabled = False
@@ -1360,9 +1239,10 @@ class retroinfer_cache_imi(KV_Cache):
             log_step("cpu_buffers")
 
         placeholder = torch.empty((self.batch_groups, 0, self.head_dim), dtype=self.dtype, pin_memory=True)
+        placeholder_list = placeholder.unsqueeze(0)
 
         for ldx in range(self.layer_num):
-            self.wave_buffer[ldx].set_indices(
+            self.adpimi_index[ldx].set_indices(
                 self.hit_unit_idices[ldx],
                 self.hit_unit_sizes[ldx],
                 self.hit_unit_sizes_cumsum[ldx],
@@ -1377,9 +1257,11 @@ class retroinfer_cache_imi(KV_Cache):
                 self.update_num_units[ldx],
                 self.cluster_ids[ldx],
             )
-            self.wave_buffer[ldx].set_kv(
-                self.list_keys[ldx],
-                self.list_values[ldx],
+            list_keys = self.list_keys[ldx] if self.list_keys[ldx] is not None else placeholder_list
+            list_values = self.list_values[ldx] if self.list_values[ldx] is not None else placeholder_list
+            self.adpimi_index[ldx].set_kv(
+                list_keys,
+                list_values,
                 placeholder,
                 placeholder,
             )
@@ -1427,7 +1309,30 @@ class retroinfer_cache_imi(KV_Cache):
             if centroids_mask_cpu is not None:
                 self.centroids_mask[ldx].copy_(centroids_mask_cpu)
 
-            self.wave_buffer[ldx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
+            if os.getenv("IMI_DEBUG_INDEX_METADATA", "0") == "1":
+                nonzero_clusters = int((cluster_sizes > 0).sum().item()) if cluster_sizes is not None else 0
+                unmasked_clusters = int((~self.centroids_mask[ldx]).sum().item()) if self.centroids_mask[ldx] is not None else 0
+                print(
+                    json.dumps({
+                        "tag": "IMI_META_PREPARE",
+                        "layer_idx": int(ldx),
+                        "nonzero_clusters": nonzero_clusters,
+                        "unmasked_clusters": unmasked_clusters,
+                        "n_centroids": int(self.n_centroids),
+                    }, ensure_ascii=False),
+                    flush=True,
+                )
+
+            if cluster_sizes is not None and self.centroids_mask[ldx] is not None:
+                nonzero_clusters = int((cluster_sizes > 0).sum().item())
+                unmasked_clusters = int((~self.centroids_mask[ldx]).sum().item())
+                if self.layer_metadata[ldx] is not None and len(self.layer_metadata[ldx]) > 0 and nonzero_clusters == 0 and unmasked_clusters == 0:
+                    raise RuntimeError(
+                        f"AdaptiveIMI invalid decode metadata on layer {ldx}: "
+                        "CPU metadata exists but GPU metadata remains empty."
+                    )
+
+            self.adpimi_index[ldx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
 
         if profile_prepare:
             log_step("centroids")
@@ -1501,6 +1406,9 @@ class retroinfer_cache_imi(KV_Cache):
     def decode_update_kv_cache(self, key_states, value_states, layer_idx):
         self.steady_zone_keys[layer_idx][:, :, self.static_pattern_total, :] = key_states[:, 0, :, :]
         self.steady_zone_values[layer_idx][:, :, self.static_pattern_total, :] = value_states[:, 0, :, :]
+
+        if layer_idx == 0:
+            self.decode_debug_step += 1
 
         if self.async_update_enabled:
             self._schedule_async_update(layer_idx, key_states, value_states)
@@ -1795,14 +1703,14 @@ class retroinfer_cache_imi(KV_Cache):
             lookup_start = time.perf_counter()
 
         self._set_cluster_ids(layer_idx, tile_cluster_ids)
-        self.wave_buffer[layer_idx].batch_access()
+        self.adpimi_index[layer_idx].batch_access()
 
         if profile_decode:
             torch.cuda.synchronize(device)
             lookup_end = time.perf_counter()
 
         if self.profile_block_hit_rate:
-            hit_blocks, miss_blocks = self.wave_buffer[layer_idx].get_last_block_stats()
+            hit_blocks, miss_blocks = self.adpimi_index[layer_idx].get_last_block_stats()
             self.profile_block_hits += hit_blocks
             self.profile_block_misses += miss_blocks
             self.profile_layer_hit_rate_count += 1
@@ -1838,7 +1746,7 @@ class retroinfer_cache_imi(KV_Cache):
             torch.cuda.synchronize(device)
             h2d_start = time.perf_counter()
 
-        self.wave_buffer[layer_idx].sync()
+        self.adpimi_index[layer_idx].sync()
 
         if profile_decode:
             torch.cuda.synchronize(device)
@@ -1886,14 +1794,14 @@ class retroinfer_cache_imi(KV_Cache):
             lookup_start = time.perf_counter()
 
         self._set_cluster_ids(layer_idx, cluster_ids)
-        self.wave_buffer[layer_idx].batch_access()
+        self.adpimi_index[layer_idx].batch_access()
 
         if profile_decode:
             torch.cuda.synchronize(device)
             lookup_end = time.perf_counter()
 
         if self.profile_block_hit_rate:
-            hit_blocks, miss_blocks = self.wave_buffer[layer_idx].get_last_block_stats()
+            hit_blocks, miss_blocks = self.adpimi_index[layer_idx].get_last_block_stats()
             self.profile_block_hits += hit_blocks
             self.profile_block_misses += miss_blocks
             self.profile_layer_hit_rate_count += 1
@@ -1933,7 +1841,7 @@ class retroinfer_cache_imi(KV_Cache):
             torch.cuda.synchronize(device)
             h2d_start = time.perf_counter()
 
-        self.wave_buffer[layer_idx].sync()
+        self.adpimi_index[layer_idx].sync()
 
         if profile_decode:
             torch.cuda.synchronize(device)
@@ -2060,7 +1968,7 @@ class retroinfer_cache_imi(KV_Cache):
         if debug_decode and layer_idx == 0:
             print(
                 "[IMI DECODE]"
-                f" layer={layer_idx} static_len={static_len}"
+                f" step={self.decode_debug_step} layer={layer_idx} static_len={static_len}"
                 f" list_stride={self.list_stride} static_stride={self.static_stride}"
                 f" nprobe={self.nprobe}",
                 flush=True,
@@ -2095,9 +2003,11 @@ class retroinfer_cache_imi(KV_Cache):
         selected = self._select_clusters(layer_idx, similarities)
         if debug_decode and layer_idx == 0:
             selected_count = int((selected != self.padding_cluster_id).sum().item())
+            selected_sample = selected[0, : min(16, selected.shape[1])].tolist()
             print(
                 "[IMI DECODE]"
-                f" layer={layer_idx} selected_clusters={selected_count}",
+                f" step={self.decode_debug_step} layer={layer_idx} selected_clusters={selected_count}"
+                f" selected_sample={selected_sample}",
                 flush=True,
             )
         max_tiles = int(os.getenv("IMI_MAX_TILES", "0"))
@@ -2148,9 +2058,10 @@ class retroinfer_cache_imi(KV_Cache):
                 valid_lengths = self.valid_lengths_dict[device]
                 max_len = int(valid_lengths.max().item()) if valid_lengths.numel() else 0
                 min_len = int(valid_lengths.min().item()) if valid_lengths.numel() else 0
+                mean_len = float(valid_lengths.float().mean().item()) if valid_lengths.numel() else 0.0
                 print(
                     "[IMI DECODE]"
-                    f" layer={layer_idx} valid_lengths[min,max]=[{min_len},{max_len}]",
+                    f" step={self.decode_debug_step} layer={layer_idx} valid_lengths[min,max,mean]=[{min_len},{max_len},{mean_len:.1f}]",
                     flush=True,
                 )
 
@@ -2195,6 +2106,17 @@ class retroinfer_cache_imi(KV_Cache):
 
             acc_out, acc_lse = static_out, static_lse
 
+            if debug_decode and layer_idx == 0:
+                static_lengths = self.static_lengths_dict[device]
+                static_min = int(static_lengths.min().item()) if static_lengths.numel() else 0
+                static_max = int(static_lengths.max().item()) if static_lengths.numel() else 0
+                print(
+                    "[IMI DECODE]"
+                    f" step={self.decode_debug_step} layer={layer_idx} static_lengths[min,max]=[{static_min},{static_max}]"
+                    f" num_tiles={len(tiles)}",
+                    flush=True,
+                )
+
             for tile_idx, tile_cluster_ids in enumerate(tiles):
                 # 重置 valid_lengths 为 0，确保每个 tile 独立处理
                 self.valid_lengths_dict[device].zero_()
@@ -2210,6 +2132,19 @@ class retroinfer_cache_imi(KV_Cache):
                     lookup_ms += retrieval_timing["lookup_ms"]
                     h2d_ms += retrieval_timing["h2d_ms"]
                     gather_ms += retrieval_timing["gather_ms"]
+
+                if debug_decode and layer_idx == 0:
+                    valid_lengths = self.valid_lengths_dict[device]
+                    max_len = int(valid_lengths.max().item()) if valid_lengths.numel() else 0
+                    min_len = int(valid_lengths.min().item()) if valid_lengths.numel() else 0
+                    mean_len = float(valid_lengths.float().mean().item()) if valid_lengths.numel() else 0.0
+                    tile_size = int((tile_cluster_ids != self.padding_cluster_id).sum().item())
+                    print(
+                        "[IMI DECODE]"
+                        f" step={self.decode_debug_step} layer={layer_idx} tile={tile_idx} tile_selected={tile_size}"
+                        f" valid_lengths[min,max,mean]=[{min_len},{max_len},{mean_len:.1f}]",
+                        flush=True,
+                    )
 
                 self._append_delta_to_execution(layer_idx, device, tile_cluster_ids)
 

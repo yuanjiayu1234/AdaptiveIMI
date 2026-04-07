@@ -31,7 +31,6 @@ class LLM:
         self.prefill_chunk_size = 65536
         self.prefill_attn_chunk_size = self.prefill_chunk_size
         self.enable_prefill_attn_chunk = True
-        self.streaming_prefill_threshold = 98304
         self.profile_prefill_gpu = os.getenv("IMI_PROFILE_PREFILL_GPU", "0") == "1"
         self.prefill_gpu_layer_rows = []
         self._prefill_gpu_attn_events = {}
@@ -46,7 +45,7 @@ class LLM:
             if hasattr(self, "attention_type") and self.attention_type:
                 attn_cfg = model_config.get(self.attention_type)
             if attn_cfg is None:
-                attn_cfg = model_config.get("AdaptiveIMI") or model_config.get("RetroInfer")
+                attn_cfg = model_config.get("AdaptiveIMI")
             if isinstance(attn_cfg, dict):
                 prefill_cfg = attn_cfg.get("prefill") or {}
         if not isinstance(prefill_cfg, dict):
@@ -61,12 +60,6 @@ class LLM:
 
         if "enable_prefill_attn_chunk" in prefill_cfg:
             self.enable_prefill_attn_chunk = bool(prefill_cfg.get("enable_prefill_attn_chunk"))
-
-        streaming_prefill_threshold = prefill_cfg.get("streaming_prefill_threshold")
-        if streaming_prefill_threshold is not None:
-            streaming_prefill_threshold = int(streaming_prefill_threshold)
-            if streaming_prefill_threshold >= 0:
-                self.streaming_prefill_threshold = streaming_prefill_threshold
 
     def _reset_prefill_gpu_profile(self):
         self.prefill_gpu_layer_rows = []
@@ -127,258 +120,53 @@ class LLM:
         pre_attn_total_start = self._start_prefill_gpu_segment()
         temp_hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
 
-        use_prefill_attn_chunk = (
-            self.enable_prefill_attn_chunk
-            and self.prefill_method == "full"
-        )
+        query_states, key_states, value_states = self.wqkv(temp_hidden_states, layer)
+        query_states, key_states = self.position_embedd(query_states, key_states)
 
-        use_imi_streaming_prefill = (
-            use_prefill_attn_chunk
-            and self.attention_type == "AdaptiveIMI"
-            and hasattr(self.kv_cache, "set_prefill_stream_mode")
-            and hasattr(self.kv_cache, "begin_prefill_stream")
-            and hasattr(self.kv_cache, "submit_prefill_stream_chunk")
-        )
+        query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
 
-        if hasattr(self.kv_cache, "set_prefill_stream_mode"):
-            self.kv_cache.set_prefill_stream_mode(layer_idx, use_imi_streaming_prefill)
-
-        attn_chunk_size = self.prefill_attn_chunk_size if use_prefill_attn_chunk else None
-        if use_imi_streaming_prefill and attn_chunk_size is not None:
-            imi_chunk_size = getattr(self.kv_cache, "prefill_chunk_size", None)
-            if imi_chunk_size:
-                attn_chunk_size = min(attn_chunk_size, imi_chunk_size)
-
-        if use_imi_streaming_prefill and attn_chunk_size is not None:
-            self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
-            valid_start = self.kv_cache.valid_start_list[start_bdx]
-            debug_align = os.getenv("IMI_DEBUG_PREFILL_ALIGN", "0") == "1"
-            kv_dtype = temp_hidden_states.dtype
-            key_states = torch.empty(
-                (bsz, seq_len, self.num_key_value_heads, self.head_dim),
-                dtype=kv_dtype,
-                device=temp_hidden_states.device,
-            )
-            value_states = torch.empty_like(key_states)
-
-            self.kv_cache.begin_prefill_stream(
-                layer_idx,
-                start_bdx,
+        if self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI":
+            valid_start = 0
+            if hasattr(self.kv_cache, "valid_start_list"):
+                valid_start = int(self.kv_cache.valid_start_list[start_bdx])
+            key_states = key_states[:, valid_start:, :, :]
+            value_states = value_states[:, valid_start:, :, :]
+        else:
+            key_states, value_states = self.kv_cache.prefill_update_kv_cache(
+                query_states,
                 key_states,
                 value_states,
-                attn_chunk_size,
+                layer_idx,
+                start_bdx,
             )
 
-            for chunk_start in range(0, seq_len, attn_chunk_size):
-                chunk_end = min(seq_len, chunk_start + attn_chunk_size)
-                hidden_chunk = temp_hidden_states[:, chunk_start:chunk_end, :]
+        attn_total_start = self._start_prefill_gpu_segment()
+        start_event = None
+        end_event = None
+        if self.profile_prefill_gpu:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        temp_attn_out = self.prefill_attention(
+            query_states,
+            key_states,
+            value_states,
+            layer_idx,
+        )
+        if self.profile_prefill_gpu:
+            end_event.record()
+            self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
+        hidden_states += self.wo(temp_attn_out, layer, bsz, seq_len, dim)
+        del temp_attn_out
+        self._finish_prefill_gpu_total_segment(layer_idx, attn_total_start)
 
-                qkv_total_start = self._start_prefill_gpu_segment()
-                query_chunk, key_chunk, value_chunk = self.wqkv(hidden_chunk, layer)
-
-                position_ids = self.position_ids[
-                    self.kv_cache.context + chunk_start : self.kv_cache.context + chunk_end
-                ].unsqueeze(0).repeat(bsz, 1)
-                query_chunk, key_chunk = self.apply_rotary_pos_emb(query_chunk, key_chunk, position_ids)
-
-                query_chunk = query_chunk.view(bsz, chunk_end - chunk_start, self.num_heads, self.head_dim)
-                key_chunk = key_chunk.view(bsz, chunk_end - chunk_start, self.num_key_value_heads, self.head_dim)
-                value_chunk = value_chunk.view(bsz, chunk_end - chunk_start, self.num_key_value_heads, self.head_dim)
-
-                key_states[:, chunk_start:chunk_end, :, :].copy_(key_chunk)
-                value_states[:, chunk_start:chunk_end, :, :].copy_(value_chunk)
-                self._finish_prefill_gpu_total_segment(layer_idx, qkv_total_start)
-
-                self.kv_cache.submit_prefill_stream_chunk(
-                    layer_idx,
-                    start_bdx,
-                    key_states,
-                    value_states,
-                    chunk_start,
-                    chunk_end,
-                    chunk_keys=key_chunk,
-                    chunk_values=value_chunk,
-                )
-                torch.cuda.synchronize()
-
-                q_valid_start = max(valid_start, chunk_start)
-                if q_valid_start < chunk_end:
-                    if debug_align and layer_idx == 0:
-                        q_len = int(chunk_end - q_valid_start)
-                        k_len = int(chunk_end - valid_start)
-                        q_offset = int(q_valid_start - valid_start)
-                        print(
-                            "[IMI PREFILL ALIGN]"
-                            f" layer={layer_idx} valid_start={valid_start}"
-                            f" chunk=[{chunk_start},{chunk_end})"
-                            f" q_valid_start={q_valid_start}"
-                            f" q_len={q_len} k_len={k_len} q_offset={q_offset}",
-                            flush=True,
-                        )
-                    attn_total_start = self._start_prefill_gpu_segment()
-                    q_local_start = q_valid_start - chunk_start
-                    q_chunk = query_chunk[:, q_local_start:, :, :]
-                    k_cache = key_states[:, valid_start:chunk_end, :, :]
-                    v_cache = value_states[:, valid_start:chunk_end, :, :]
-                    k_new = key_chunk[:, q_local_start:, :, :]
-                    v_new = value_chunk[:, q_local_start:, :, :]
-                    if not q_chunk.is_contiguous():
-                        q_chunk = q_chunk.contiguous()
-                    if not k_cache.is_contiguous():
-                        k_cache = k_cache.contiguous()
-                    if not v_cache.is_contiguous():
-                        v_cache = v_cache.contiguous()
-                    if not k_new.is_contiguous():
-                        k_new = k_new.contiguous()
-                    if not v_new.is_contiguous():
-                        v_new = v_new.contiguous()
-                    start_event = None
-                    end_event = None
-                    if self.profile_prefill_gpu:
-                        start_event = torch.cuda.Event(enable_timing=True)
-                        end_event = torch.cuda.Event(enable_timing=True)
-                        start_event.record()
-                    cache_seqlens = torch.full(
-                        (bsz,),
-                        int(q_valid_start - valid_start),
-                        device=q_chunk.device,
-                        dtype=torch.int32,
-                    )
-                    attn_chunk = self.prefill_attention(
-                        q_chunk,
-                        k_cache,
-                        v_cache,
-                        layer_idx,
-                        k_new=k_new,
-                        v_new=v_new,
-                        cache_seqlens=cache_seqlens,
-                    )
-                    if debug_align and layer_idx == 0:
-                        q_len = q_chunk.shape[1]
-                        k_len = k_cache.shape[1]
-                        if k_len > q_len:
-                            pad_len = k_len - q_len
-                            q_pad = torch.zeros(
-                                (bsz, pad_len, q_chunk.shape[2], q_chunk.shape[3]),
-                                device=q_chunk.device,
-                                dtype=q_chunk.dtype,
-                            )
-                            q_ref = torch.cat([q_pad, q_chunk], dim=1)
-                            ref_out = self.prefill_attention(
-                                q_ref,
-                                k_cache,
-                                v_cache,
-                                layer_idx,
-                            )
-                            ref_tail = ref_out[:, -q_len:, :, :]
-                            diff = (ref_tail - attn_chunk).abs()
-                            print(
-                                "[IMI PREFILL DIFF]"
-                                f" layer={layer_idx} chunk_start={chunk_start}"
-                                f" max={diff.max().item():.6f} mean={diff.mean().item():.6f}",
-                                flush=True,
-                            )
-                            del q_pad, q_ref, ref_out, ref_tail, diff
-                    if self.profile_prefill_gpu:
-                        end_event.record()
-                        self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
-                    hidden_states[:, q_valid_start:chunk_end, :] += self.wo(
-                        attn_chunk,
-                        layer,
-                        bsz,
-                        chunk_end - q_valid_start,
-                        dim,
-                    )
-                    self._finish_prefill_gpu_total_segment(layer_idx, attn_total_start)
-                    del attn_chunk, q_chunk, k_cache, v_cache, k_new, v_new, cache_seqlens
-
-                del query_chunk, key_chunk, value_chunk
-
-            self.kv_cache.prefill_update_kv_cache(key_states, key_states, value_states, layer_idx, start_bdx)
+        if not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI"):
             self.kv_cache.sync(layer_idx, start_bdx)
-            del key_states, value_states
-        else:
-            query_states, key_states, value_states = self.wqkv(temp_hidden_states, layer)
-            query_states, key_states = self.position_embedd(query_states, key_states)
+        del query_states, key_states, value_states
 
-            query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim) # reshape [bs, seq_len, dim] => [bs, seq_len, head, head_dim]
-            key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-            value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-            self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
-
-            key_states, value_states = self.kv_cache.prefill_update_kv_cache(query_states, key_states, value_states, layer_idx, start_bdx)
-
-            attn_total_start = self._start_prefill_gpu_segment()
-            if use_prefill_attn_chunk and attn_chunk_size is not None:
-                key_seq_len = key_states.shape[1]
-                key_offset = max(seq_len - key_seq_len, 0)
-                for chunk_start in range(0, seq_len, attn_chunk_size):
-                    chunk_end = min(seq_len, chunk_start + attn_chunk_size)
-                    q_valid_start = max(chunk_start, key_offset)
-                    if q_valid_start >= chunk_end:
-                        continue
-                    prefix_end = min(key_seq_len, chunk_end - key_offset)
-                    if prefix_end <= 0:
-                        continue
-
-                    q_chunk = query_states[:, q_valid_start:chunk_end, :, :]
-                    k_prefix = key_states[:, :prefix_end, :, :]
-                    v_prefix = value_states[:, :prefix_end, :, :]
-                    if not q_chunk.is_contiguous():
-                        q_chunk = q_chunk.contiguous()
-                    if not k_prefix.is_contiguous():
-                        k_prefix = k_prefix.contiguous()
-                    if not v_prefix.is_contiguous():
-                        v_prefix = v_prefix.contiguous()
-                    start_event = None
-                    end_event = None
-                    if self.profile_prefill_gpu:
-                        start_event = torch.cuda.Event(enable_timing=True)
-                        end_event = torch.cuda.Event(enable_timing=True)
-                        start_event.record()
-                    attn_chunk = self.prefill_attention(
-                        q_chunk,
-                        k_prefix,
-                        v_prefix,
-                        layer_idx,
-                    )
-                    if self.profile_prefill_gpu:
-                        end_event.record()
-                        self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
-                    hidden_states[:, q_valid_start:chunk_end, :] += self.wo(
-                        attn_chunk,
-                        layer,
-                        bsz,
-                        chunk_end - q_valid_start,
-                        dim,
-                    )
-                    del attn_chunk, q_chunk, k_prefix, v_prefix
-            else:
-                start_event = None
-                end_event = None
-                if self.profile_prefill_gpu:
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                temp_attn_out = self.prefill_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    layer_idx,
-                    chunk_size=attn_chunk_size,
-                )
-                if self.profile_prefill_gpu:
-                    end_event.record()
-                    self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
-                hidden_states += self.wo(temp_attn_out, layer, bsz, seq_len, dim)
-                del temp_attn_out
-            self._finish_prefill_gpu_total_segment(layer_idx, attn_total_start)
-
-            self.kv_cache.sync(layer_idx, start_bdx)
-            del query_states, key_states, value_states
-
-        if hasattr(self.kv_cache, "set_prefill_stream_mode"):
-            self.kv_cache.set_prefill_stream_mode(layer_idx, False)
         del temp_hidden_states
 
         post_attn_total_start = self._start_prefill_gpu_segment()
@@ -429,39 +217,184 @@ class LLM:
         return hidden_states
 
 
-    def _should_stream_prefill(self, seq_len: int, bsz: int) -> bool:
-        if bsz != 1:
-            return False
-        if self.attention_type == "AdaptiveIMI":
-            if self.num_gpus > 1:
-                return False
-            threshold = int(getattr(self, "streaming_prefill_threshold", 98304))
-            if seq_len >= threshold:
-                return True
-            return not getattr(self.kv_cache, "allocated", True)
-        # For Full_Flash_Attn: stream prefill when KV cache is not pre-allocated on GPU
-        if self.attention_type in ("Full_Flash_Attn", "Full_Flash_Attn_Offload"):
-            return not getattr(self.kv_cache, "allocated", True)
-        return False
+    def _should_pin_streaming_hidden(self, bsz: int, seq_len: int) -> bool:
+        max_pinned_gb = float(os.getenv("IMI_STREAMING_HIDDEN_PINNED_GB", "1.0"))
+        required_gb = (
+            float(bsz) * float(seq_len) * float(self.hidden_size) * float(torch.tensor([], dtype=self.dtype).element_size())
+        ) / (1024 ** 3)
+        return required_gb <= max_pinned_gb
 
 
-    def layer_prefill_streaming(self, layer_idx, start_bdx, hidden_cpu, output_cpu, seq_len, chunk_size):
+    def _streaming_progress_enabled(self) -> bool:
+        return os.getenv("IMI_STREAMING_PROGRESS", "0") == "1"
+
+
+    def _debug_stop_after_prefill(self) -> bool:
+        return os.getenv("IMI_DEBUG_STOP_AFTER_PREFILL", "0") == "1"
+
+
+    def _debug_skip_prefill_kv_update(self) -> bool:
+        return os.getenv("IMI_DEBUG_SKIP_PREFILL_KV_UPDATE", "0") == "1"
+
+
+    def _debug_max_decode_steps(self):
+        value = int(os.getenv("IMI_DEBUG_MAX_DECODE_STEPS", "0"))
+        return value if value > 0 else None
+
+
+    def _debug_print_token_ids(self) -> bool:
+        return os.getenv("IMI_DEBUG_PRINT_TOKEN_IDS", "0") == "1"
+
+
+    def _debug_log_token_ids(self, stage: str, token_ids: torch.Tensor) -> None:
+        if not self._debug_print_token_ids():
+            return
+        print(colored(f"IMI debug: {stage}_token_ids = {token_ids.tolist()}", 'yellow'))
+
+
+    def _log_streaming_progress(self, message: str) -> None:
+        if self._streaming_progress_enabled():
+            print(message, flush=True)
+
+
+    def _streaming_build_kv_chunk(
+        self,
+        hidden_cpu,
+        chunk_start,
+        chunk_end,
+        layer,
+        layer_idx,
+        key_states,
+        value_states,
+    ):
+        bsz = hidden_cpu.shape[0]
+        device = layer.device
+        chunk_len = chunk_end - chunk_start
+
+        hidden_chunk = hidden_cpu[:, chunk_start:chunk_end, :].to(device, non_blocking=False)
+
+        pre_attn_total_start = self._start_prefill_gpu_segment()
+        temp_hidden_states = self.layernorm(
+            hidden_chunk,
+            layer.input_layernorm_variance_epsilon,
+            layer.input_layernorm_weight,
+        )
+        query_chunk, key_chunk, value_chunk = self.wqkv(temp_hidden_states, layer)
+
+        position_ids = self.position_ids[
+            self.kv_cache.context + chunk_start : self.kv_cache.context + chunk_end
+        ].unsqueeze(0).repeat(bsz, 1)
+        query_chunk, key_chunk = self.apply_rotary_pos_emb(query_chunk, key_chunk, position_ids)
+
+        query_chunk = query_chunk.view(bsz, chunk_len, self.num_heads, self.head_dim)
+        key_chunk = key_chunk.view(bsz, chunk_len, self.num_key_value_heads, self.head_dim)
+        value_chunk = value_chunk.view(bsz, chunk_len, self.num_key_value_heads, self.head_dim)
+
+        key_states[:, chunk_start:chunk_end, :, :].copy_(key_chunk)
+        value_states[:, chunk_start:chunk_end, :, :].copy_(value_chunk)
+        self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
+
+        return hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk
+
+
+    def _streaming_finish_chunk(
+        self,
+        layer,
+        layer_idx,
+        hidden_chunk,
+        temp_hidden_states,
+        query_chunk,
+        key_chunk,
+        value_chunk,
+        key_states,
+        value_states,
+        valid_start,
+        chunk_start,
+        chunk_end,
+        output_cpu,
+        debug_align,
+    ):
+        bsz = hidden_chunk.shape[0]
+
+        q_valid_start = max(valid_start, chunk_start)
+        if q_valid_start < chunk_end:
+            q_local_start = q_valid_start - chunk_start
+            q_sub = query_chunk[:, q_local_start:, :, :]
+            k_prefix = key_states[:, valid_start:chunk_end, :, :]
+            v_prefix = value_states[:, valid_start:chunk_end, :, :]
+
+            if not q_sub.is_contiguous():
+                q_sub = q_sub.contiguous()
+            if not k_prefix.is_contiguous():
+                k_prefix = k_prefix.contiguous()
+            if not v_prefix.is_contiguous():
+                v_prefix = v_prefix.contiguous()
+
+            start_event = None
+            end_event = None
+            if self.profile_prefill_gpu:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+
+            attn_chunk = self.prefill_attention(
+                q_sub,
+                k_prefix,
+                v_prefix,
+                layer_idx,
+            )
+
+            if debug_align and layer_idx == 0:
+                q_len = int(q_sub.shape[1])
+                k_len = int(k_prefix.shape[1])
+                q_offset = int(q_valid_start - valid_start)
+                print(
+                    "[IMI PREFILL ALIGN]"
+                    f" layer={layer_idx} valid_start={valid_start}"
+                    f" chunk=[{chunk_start},{chunk_end})"
+                    f" q_valid_start={q_valid_start}"
+                    f" q_len={q_len} k_len={k_len} q_offset={q_offset}",
+                    flush=True,
+                )
+
+            if self.profile_prefill_gpu:
+                end_event.record()
+                self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
+
+            hidden_chunk[:, q_local_start:, :] += self.wo(
+                attn_chunk,
+                layer,
+                bsz,
+                chunk_end - q_valid_start,
+                self.hidden_size,
+            )
+            del attn_chunk, q_sub, k_prefix, v_prefix
+
+        post_attn_total_start = self._start_prefill_gpu_segment()
+        hidden_states_norm = self.layernorm(
+            hidden_chunk,
+            layer.post_attention_layernorm_variance_epsilon,
+            layer.post_attention_layernorm_weight,
+        )
+        mlp_out = self.mlp(hidden_states_norm, layer)
+        hidden_chunk = hidden_chunk + mlp_out
+        self._finish_prefill_gpu_total_segment(layer_idx, post_attn_total_start)
+
+        output_cpu[:, chunk_start:chunk_end, :].copy_(hidden_chunk, non_blocking=False)
+        del hidden_chunk, hidden_states_norm, mlp_out, temp_hidden_states, query_chunk, key_chunk, value_chunk
+
+
+    def layer_prefill_chunked(self, layer_idx, start_bdx, hidden_cpu, output_cpu, seq_len, chunk_size):
         bsz = hidden_cpu.shape[0]
         layer = self.layers[layer_idx]
         device = layer.device
-        debug_align = os.getenv("IMI_DEBUG_PREFILL_ALIGN", "0") == "1"
-
         kv_cache = getattr(self, "kv_cache", None)
-        use_imi_streaming_prefill = (
-            kv_cache is not None
-            and self.attention_type == "AdaptiveIMI"
-            and hasattr(kv_cache, "set_prefill_stream_mode")
-            and hasattr(kv_cache, "begin_prefill_stream")
-            and hasattr(kv_cache, "submit_prefill_stream_chunk")
-        )
+        debug_align = os.getenv("IMI_DEBUG_PREFILL_ALIGN", "0") == "1"
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
 
-        if hasattr(kv_cache, "set_prefill_stream_mode"):
-            kv_cache.set_prefill_stream_mode(layer_idx, use_imi_streaming_prefill)
+        self._log_streaming_progress(
+            f"[IMI STREAM] layer={layer_idx} phase=start seq_len={seq_len} chunk_size={chunk_size} chunks={num_chunks}"
+        )
 
         key_states = torch.empty(
             (bsz, seq_len, self.num_key_value_heads, self.head_dim),
@@ -470,194 +403,103 @@ class LLM:
         )
         value_states = torch.empty_like(key_states)
 
-        if use_imi_streaming_prefill:
-            kv_cache.begin_prefill_stream(layer_idx, start_bdx, key_states, value_states, chunk_size)
-
         valid_start = 0
         if kv_cache is not None and hasattr(kv_cache, "valid_start_list"):
             valid_start = int(kv_cache.valid_start_list[start_bdx])
 
         for chunk_start in range(0, seq_len, chunk_size):
             chunk_end = min(seq_len, chunk_start + chunk_size)
-            chunk_len = chunk_end - chunk_start
-
-            hidden_chunk = hidden_cpu[:, chunk_start:chunk_end, :].to(device, non_blocking=True)
-            total_start_event = self._start_prefill_gpu_segment()
-            temp_hidden_states = self.layernorm(
-                hidden_chunk,
-                layer.input_layernorm_variance_epsilon,
-                layer.input_layernorm_weight,
+            chunk_idx = chunk_start // chunk_size
+            chunk_t0 = time.perf_counter() if self._streaming_progress_enabled() else None
+            hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk = self._streaming_build_kv_chunk(
+                hidden_cpu,
+                chunk_start,
+                chunk_end,
+                layer,
+                layer_idx,
+                key_states,
+                value_states,
             )
-
-            query_chunk, key_chunk, value_chunk = self.wqkv(temp_hidden_states, layer)
-
-            position_ids = self.position_ids[
-                kv_cache.context + chunk_start : kv_cache.context + chunk_end
-            ].unsqueeze(0).repeat(bsz, 1)
-            query_chunk, key_chunk = self.apply_rotary_pos_emb(query_chunk, key_chunk, position_ids)
-
-            query_chunk = query_chunk.view(bsz, chunk_len, self.num_heads, self.head_dim)
-            key_chunk = key_chunk.view(bsz, chunk_len, self.num_key_value_heads, self.head_dim)
-            value_chunk = value_chunk.view(bsz, chunk_len, self.num_key_value_heads, self.head_dim)
-
-            key_states[:, chunk_start:chunk_end, :, :].copy_(key_chunk)
-            value_states[:, chunk_start:chunk_end, :, :].copy_(value_chunk)
-            self._finish_prefill_gpu_total_segment(layer_idx, total_start_event)
-
-            if use_imi_streaming_prefill:
-                kv_cache.submit_prefill_stream_chunk(
-                    layer_idx,
-                    start_bdx,
-                    key_states,
-                    value_states,
-                    chunk_start,
-                    chunk_end,
-                    chunk_keys=key_chunk,
-                    chunk_values=value_chunk,
-                )
-
-            total_start_event = self._start_prefill_gpu_segment()
-            q_valid_start = max(valid_start, chunk_start)
-            if q_valid_start < chunk_end:
-                if debug_align and layer_idx == 0:
-                    q_len = int(chunk_end - q_valid_start)
-                    k_len = int(chunk_end - valid_start)
-                    q_offset = int(q_valid_start - valid_start)
-                    print(
-                        "[IMI PREFILL ALIGN]"
-                        f" layer={layer_idx} valid_start={valid_start}"
-                        f" chunk=[{chunk_start},{chunk_end})"
-                        f" q_valid_start={q_valid_start}"
-                        f" q_len={q_len} k_len={k_len} q_offset={q_offset}",
-                        flush=True,
-                    )
-                q_local_start = q_valid_start - chunk_start
-                q_chunk = query_chunk[:, q_local_start:, :, :]
-                k_cache = key_states[:, valid_start:chunk_end, :, :]
-                v_cache = value_states[:, valid_start:chunk_end, :, :]
-                k_new = key_chunk[:, q_local_start:, :, :]
-                v_new = value_chunk[:, q_local_start:, :, :]
-                if not q_chunk.is_contiguous():
-                    q_chunk = q_chunk.contiguous()
-                if not k_cache.is_contiguous():
-                    k_cache = k_cache.contiguous()
-                if not v_cache.is_contiguous():
-                    v_cache = v_cache.contiguous()
-                if not k_new.is_contiguous():
-                    k_new = k_new.contiguous()
-                if not v_new.is_contiguous():
-                    v_new = v_new.contiguous()
-                start_event = None
-                end_event = None
-                if self.profile_prefill_gpu:
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                cache_seqlens = torch.full(
-                    (bsz,),
-                    int(q_valid_start - valid_start),
-                    device=q_chunk.device,
-                    dtype=torch.int32,
-                )
-                attn_chunk = self.prefill_attention(
-                    q_chunk,
-                    k_cache,
-                    v_cache,
-                    layer_idx,
-                    k_new=k_new,
-                    v_new=v_new,
-                    cache_seqlens=cache_seqlens,
-                )
-                if debug_align and layer_idx == 0:
-                    q_len = q_chunk.shape[1]
-                    k_len = k_cache.shape[1]
-                    if k_len > q_len:
-                        pad_len = k_len - q_len
-                        q_pad = torch.zeros(
-                            (bsz, pad_len, q_chunk.shape[2], q_chunk.shape[3]),
-                            device=q_chunk.device,
-                            dtype=q_chunk.dtype,
-                        )
-                        q_ref = torch.cat([q_pad, q_chunk], dim=1)
-                        ref_out = self.prefill_attention(
-                            q_ref,
-                            k_cache,
-                            v_cache,
-                            layer_idx,
-                        )
-                        ref_tail = ref_out[:, -q_len:, :, :]
-                        diff = (ref_tail - attn_chunk).abs()
-                        print(
-                            "[IMI PREFILL DIFF]"
-                            f" layer={layer_idx} chunk_start={chunk_start}"
-                            f" max={diff.max().item():.6f} mean={diff.mean().item():.6f}",
-                            flush=True,
-                        )
-                        del q_pad, q_ref, ref_out, ref_tail, diff
-                if self.profile_prefill_gpu:
-                    end_event.record()
-                    self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
-                hidden_chunk[:, q_local_start:, :] += self.wo(
-                    attn_chunk,
-                    layer,
-                    bsz,
-                    chunk_end - q_valid_start,
-                    self.hidden_size,
-                )
-                del attn_chunk, q_chunk, k_cache, v_cache, k_new, v_new, cache_seqlens
-
-            hidden_states_norm = self.layernorm(
+            self._streaming_finish_chunk(
+                layer,
+                layer_idx,
                 hidden_chunk,
-                layer.post_attention_layernorm_variance_epsilon,
-                layer.post_attention_layernorm_weight,
+                temp_hidden_states,
+                query_chunk,
+                key_chunk,
+                value_chunk,
+                key_states,
+                value_states,
+                valid_start,
+                chunk_start,
+                chunk_end,
+                output_cpu,
+                debug_align,
             )
-            mlp_out = self.mlp(hidden_states_norm, layer)
-            hidden_chunk = hidden_chunk + mlp_out
-            self._finish_prefill_gpu_total_segment(layer_idx, total_start_event)
-            output_cpu[:, chunk_start:chunk_end, :].copy_(hidden_chunk, non_blocking=True)
-            del hidden_chunk, hidden_states_norm, mlp_out, temp_hidden_states
+            if chunk_t0 is not None:
+                elapsed_ms = (time.perf_counter() - chunk_t0) * 1000.0
+                self._log_streaming_progress(
+                    f"[IMI STREAM] layer={layer_idx} chunk={chunk_idx + 1}/{num_chunks} range=[{chunk_start},{chunk_end}) elapsed_ms={elapsed_ms:.2f}"
+                )
 
-        if kv_cache is not None:
-            kv_cache.prefill_update_kv_cache(key_states, key_states, value_states, layer_idx, start_bdx)
+        if kv_cache is not None and not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI"):
+            finalize_t0 = time.perf_counter() if self._streaming_progress_enabled() else None
+            kv_cache.prefill_update_kv_cache(None, key_states, value_states, layer_idx, start_bdx)
             kv_cache.sync(layer_idx, start_bdx)
+            if finalize_t0 is not None:
+                elapsed_ms = (time.perf_counter() - finalize_t0) * 1000.0
+                self._log_streaming_progress(
+                    f"[IMI STREAM] layer={layer_idx} phase=finalize_kv elapsed_ms={elapsed_ms:.2f}"
+                )
 
-        if hasattr(kv_cache, "set_prefill_stream_mode"):
-            kv_cache.set_prefill_stream_mode(layer_idx, False)
+        del key_states, value_states
 
         self._flush_prefill_gpu_layer_events(layer_idx)
         torch.cuda.synchronize(device)
-        del key_states, value_states
+        self._log_streaming_progress(f"[IMI STREAM] layer={layer_idx} phase=done")
 
 
-    def prefill_forward_streaming(self, inputs_ids):
+    def prefill_forward_chunked(self, inputs_ids):
         self._reset_prefill_gpu_profile()
         bsz, seq_len = inputs_ids.shape
         device = self.layers[0].device
-        chunk_size = max(int(self.prefill_chunk_size), 1)
+        chunk_size = max(int(self.prefill_attn_chunk_size), 1)
+        pin_hidden = self._should_pin_streaming_hidden(bsz, seq_len)
+
+        self._log_streaming_progress(
+            f"[IMI STREAM] prefill_start seq_len={seq_len} chunk_size={chunk_size} pin_hidden={int(pin_hidden)}"
+        )
 
         hidden_cpu = torch.empty(
             (bsz, seq_len, self.hidden_size),
             dtype=self.dtype,
-            pin_memory=True,
+            pin_memory=pin_hidden,
         )
-        next_cpu = torch.empty_like(hidden_cpu)
+        next_cpu = torch.empty(
+            (bsz, seq_len, self.hidden_size),
+            dtype=self.dtype,
+            pin_memory=pin_hidden,
+        )
 
         for chunk_start in range(0, seq_len, chunk_size):
             chunk_end = min(seq_len, chunk_start + chunk_size)
             ids_chunk = inputs_ids[:, chunk_start:chunk_end].to(device, non_blocking=True)
             embed_chunk = self.word_embedding(ids_chunk)
-            hidden_cpu[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=True)
+            hidden_cpu[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=False)
         torch.cuda.synchronize(device)
+        self._log_streaming_progress("[IMI STREAM] embedding_done")
 
         for ldx in range(self.num_layers):
-            self.layer_prefill_streaming(ldx, 0, hidden_cpu, next_cpu, seq_len, chunk_size)
+            self.layer_prefill_chunked(ldx, 0, hidden_cpu, next_cpu, seq_len, chunk_size)
             hidden_cpu, next_cpu = next_cpu, hidden_cpu
             if self.num_gpus > 1:
                 next_device = self.layer_mapping[str(ldx + 1)] if str(ldx + 1) in self.layer_mapping else self.layer_mapping[str(0)]
                 self.position_ids = self.position_ids.to(next_device)
                 self.cos_sin_cache = self.cos_sin_cache.to(next_device)
 
-        last_hidden = hidden_cpu[:, -1:, :].to(device, non_blocking=True)
+        self._log_streaming_progress("[IMI STREAM] all_layers_done")
+
+        last_hidden = hidden_cpu[:, -1:, :].to(device, non_blocking=False)
         last_hidden = self.layernorm(last_hidden, self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(last_hidden)
         return logits
@@ -668,8 +510,8 @@ class LLM:
         bsz, seq_len = inputs_ids.shape
         device = inputs_ids.device
 
-        if self._should_stream_prefill(seq_len, bsz):
-            return self.prefill_forward_streaming(inputs_ids)
+        if self.enable_prefill_attn_chunk:
+            return self.prefill_forward_chunked(inputs_ids)
 
         last_hidden_states = torch.empty((bsz, 1, self.hidden_size), dtype=self.dtype, device=device).contiguous()
         for start_bdx in range(0, bsz, self.prefill_bsz):
@@ -761,6 +603,15 @@ class LLM:
         logits = self.prefill_forward(inputs_ids=inputs_ids)
         output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
         outputs_ids.append(output_ids)
+        self._debug_log_token_ids("prefill", output_ids)
+
+        if self._debug_stop_after_prefill():
+            torch.cuda.synchronize()
+            prefill_end = time.time()
+            self.prefill_latency_s = prefill_end - prefill_start
+            print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
+            return torch.cat(outputs_ids, dim=-1).tolist()
+
         self.move()
 
         torch.cuda.synchronize()
@@ -769,7 +620,7 @@ class LLM:
         print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
 
         # CUDAGraph Capture (if enabled)
-        if self.attention_type in ("RetroInfer", "AdaptiveIMI"):
+        if self.attention_type == "AdaptiveIMI":
             self.kv_cache.capture_cuda_graph()
         
         stop_tokens = None
@@ -791,6 +642,8 @@ class LLM:
         decode_start = time.time()
         self.decode_latency_s = 0.0
         self.decode_steps = 0
+        debug_max_decode_steps = self._debug_max_decode_steps()
+        debug_decode_steps = 0
 
         if end_of_text is not None and end_of_text.all():
             print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
@@ -798,12 +651,17 @@ class LLM:
             for _ in range(self.max_new_length-1):
                 logits = self.decode_forward(inputs_ids=output_ids)
                 output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                debug_decode_steps += 1
+                self._debug_log_token_ids(f"decode_step_{debug_decode_steps}", output_ids)
                 if end_of_text is not None:
                     end_of_text |= (output_ids.unsqueeze(-1) == stop_tokens).any(-1)
                     if end_of_text.all():
                         print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
+                        outputs_ids.append(output_ids)
                         break
                 outputs_ids.append(output_ids)
+                if debug_max_decode_steps is not None and debug_decode_steps >= debug_max_decode_steps:
+                    break
 
         decode_end = time.time()
         self.decode_latency_s = decode_end - decode_start
@@ -834,7 +692,7 @@ class LLM:
                  prefill_bsz=1, prefill_method="full"):
         """ LLM Inference.
         Args:
-            attention_type: str, Full_Flash_Attn or RetroInfer
+            attention_type: str, Full_Flash_Attn or AdaptiveIMI
             input_ids (torch.tensor): The input of LLM.
             attention_masks (torch.tensor): The attention masks of LLM.
             max_new_length (int): The maximum length of generated sequences.

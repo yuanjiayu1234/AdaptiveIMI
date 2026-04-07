@@ -1,9 +1,12 @@
 """
-统一构建脚本 - 编译两个C++/CUDA扩展模块
+统一构建脚本 - 编译 C++/CUDA 扩展模块
 
 模块:
 1. gpu_cluster_manager_cpp - IMI decode kernels
 2. ultra_layer_pipeline_cpp - 32层并行K-means管道
+3. library.AdaptiveIMI.cpp_extensions.AdpIMI_Index - AdpIMI CPU index manager
+4. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
+5. library.AdaptiveIMI.cpp_extensions.gemm_softmax - CUTLASS batch gemm softmax
 
 使用方法:
     cd cpp_extensions
@@ -13,16 +16,18 @@
 """
 
 import os
-import sys
 import subprocess
 import re
 import shutil
 from pathlib import Path
-from setuptools import setup, Extension
+from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
 
 # 获取当前目录
 HERE = Path(__file__).parent.absolute()
+REPO_ROOT = HERE.parents[2]
+LIBRARY_ROOT = REPO_ROOT / 'library'
+CUTLASS_DIR = LIBRARY_ROOT / 'cutlass'
 
 # 获取 PyTorch 和 pybind11 的 include 路径
 import torch
@@ -96,6 +101,7 @@ def _parse_arch_list(arch_list_str):
             seen.add(item)
     return unique
 
+
 # 检测 CUDA 架构
 def get_cuda_arch_flags():
     """自动检测 GPU 架构"""
@@ -127,7 +133,7 @@ def get_cuda_arch_flags():
                         unique_caps.append(item)
                         seen.add(item)
                 return unique_caps
-    except:
+    except Exception:
         pass
 
     # 2) Try torch runtime (works even when nvidia-smi is unavailable)
@@ -146,7 +152,7 @@ def get_cuda_arch_flags():
                         unique_caps.append(item)
                         seen.add(item)
                 return unique_caps
-    except:
+    except Exception:
         pass
 
     # 3) Fallback: default common architectures
@@ -158,6 +164,7 @@ def get_cuda_arch_flags():
         '-gencode=arch=compute_89,code=sm_89',  # RTX 4090
         '-gencode=arch=compute_90,code=sm_90',  # H100/H800
     ]
+
 
 CUDA_ARCH_FLAGS = get_cuda_arch_flags()
 
@@ -184,7 +191,7 @@ gpu_cluster_manager_ext = CUDAExtension(
 # 模块 2: ultra_layer_pipeline_cpp (纯 C++，依赖 CUDA Runtime)
 # ============================================================================
 ultra_layer_pipeline_sources = [
-    str(HERE / 'src' / 'pipeline_bindings.cpp'),  # 重命名避免冲突
+    str(HERE / 'src' / 'pipeline_bindings.cpp'),
     str(HERE / 'src' / 'layer_pipeline.cpp'),
     str(HERE / 'src' / 'kmeans_core.cpp'),
     str(HERE / 'src' / 'reorganize_core.cpp'),
@@ -202,6 +209,53 @@ ultra_layer_pipeline_ext = CppExtension(
     extra_link_args=['-fopenmp'],
 )
 
+# ============================================================================
+# 模块 3: AdpIMI_Index (纯 C++)
+# ============================================================================
+adpimi_index_ext = CppExtension(
+    name='library.AdaptiveIMI.cpp_extensions.AdpIMI_Index',
+    sources=[str(HERE / 'src' / 'wave_buffer_cpu_hotcold.cpp')],
+    include_dirs=[str(HERE / 'include'), CUDA_INCLUDE] + TORCH_INCLUDE,
+    extra_compile_args={
+        'cxx': COMMON_CXX_FLAGS,
+    },
+    extra_link_args=['-fopenmp'],
+    language='c++',
+)
+
+# ============================================================================
+# 模块 4: Copy (CUDA)
+# ============================================================================
+copy_ext = CUDAExtension(
+    name='library.AdaptiveIMI.cpp_extensions.Copy',
+    sources=[str(HERE / 'cuda' / 'gather_copy.cu')],
+    include_dirs=[str(HERE / 'include'), CUDA_INCLUDE] + TORCH_INCLUDE,
+    extra_compile_args={
+        'cxx': COMMON_CXX_FLAGS,
+        'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
+    },
+    extra_link_args=['-lcuda', '-lcudart'],
+)
+
+# ============================================================================
+# 模块 5: gemm_softmax (CUDA + CUTLASS)
+# ============================================================================
+gemm_softmax_ext = CUDAExtension(
+    name='library.AdaptiveIMI.cpp_extensions.gemm_softmax',
+    sources=[str(HERE / 'cuda' / 'batch_gemm_softmax.cu')],
+    include_dirs=[
+        str(HERE / 'include'),
+        str(CUTLASS_DIR / 'include'),
+        str(CUTLASS_DIR / 'examples' / 'common'),
+        str(CUTLASS_DIR / 'tools' / 'util' / 'include'),
+        CUDA_INCLUDE,
+    ] + TORCH_INCLUDE,
+    extra_compile_args={
+        'cxx': COMMON_CXX_FLAGS,
+        'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
+    },
+    extra_link_args=['-lcuda', '-lcudart'],
+)
 
 # ============================================================================
 # Setup
@@ -209,10 +263,15 @@ ultra_layer_pipeline_ext = CppExtension(
 setup(
     name='imi_cpp_extensions',
     version='1.0.0',
+    packages=['library', 'library.AdaptiveIMI', 'library.AdaptiveIMI.cpp_extensions'],
+    package_dir={'': str(REPO_ROOT)},
     description='IMI Cache C++/CUDA Extensions',
     ext_modules=[
         gpu_cluster_manager_ext,
         ultra_layer_pipeline_ext,
+        adpimi_index_ext,
+        copy_ext,
+        gemm_softmax_ext,
     ],
     cmdclass={
         'build_ext': BuildExtension,

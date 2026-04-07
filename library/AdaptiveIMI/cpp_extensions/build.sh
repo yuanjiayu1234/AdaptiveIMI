@@ -4,9 +4,11 @@
 # ============================================================================
 #
 # 模块:
-#   1. cluster_manager_cpp - CPU端元数据和位置管理
-#   2. gpu_cluster_manager_cpp - GPU端存储和计算
-#   3. ultra_layer_pipeline_cpp - 32层并行K-means管道
+#   1. gpu_cluster_manager_cpp - GPU端存储和计算
+#   2. ultra_layer_pipeline_cpp - 32层并行K-means管道
+#   3. library.AdaptiveIMI.cpp_extensions.AdpIMI_Index - AdpIMI CPU index manager
+#   4. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
+#   5. library.AdaptiveIMI.cpp_extensions.gemm_softmax - CUTLASS batch gemm softmax
 #
 # 使用方法:
 #   cd cpp_extensions
@@ -77,13 +79,6 @@ echo "=============================================="
 
 BUILD_SUCCESS=true
 
-if [ -f "cluster_manager_cpp.cpython-"*".so" ]; then
-    echo "✅ cluster_manager_cpp: $(ls cluster_manager_cpp.cpython-*.so)"
-else
-    echo "❌ cluster_manager_cpp: FAILED"
-    BUILD_SUCCESS=false
-fi
-
 if [ -f "gpu_cluster_manager_cpp.cpython-"*".so" ]; then
     echo "✅ gpu_cluster_manager_cpp: $(ls gpu_cluster_manager_cpp.cpython-*.so)"
 else
@@ -95,6 +90,27 @@ if [ -f "ultra_layer_pipeline_cpp.cpython-"*".so" ]; then
     echo "✅ ultra_layer_pipeline_cpp: $(ls ultra_layer_pipeline_cpp.cpython-*.so)"
 else
     echo "❌ ultra_layer_pipeline_cpp: FAILED"
+    BUILD_SUCCESS=false
+fi
+
+if [ -f "AdpIMI_Index.cpython-"*".so" ]; then
+    echo "✅ library.AdaptiveIMI.cpp_extensions.AdpIMI_Index: $(ls AdpIMI_Index.cpython-*.so)"
+else
+    echo "❌ library.AdaptiveIMI.cpp_extensions.AdpIMI_Index: FAILED"
+    BUILD_SUCCESS=false
+fi
+
+if [ -f "Copy.cpython-"*".so" ]; then
+    echo "✅ library.AdaptiveIMI.cpp_extensions.Copy: $(ls Copy.cpython-*.so)"
+else
+    echo "❌ library.AdaptiveIMI.cpp_extensions.Copy: FAILED"
+    BUILD_SUCCESS=false
+fi
+
+if [ -f "gemm_softmax.cpython-"*".so" ]; then
+    echo "✅ library.AdaptiveIMI.cpp_extensions.gemm_softmax: $(ls gemm_softmax.cpython-*.so)"
+else
+    echo "❌ library.AdaptiveIMI.cpp_extensions.gemm_softmax: FAILED"
     BUILD_SUCCESS=false
 fi
 
@@ -112,12 +128,14 @@ if [ "$BUILD_SUCCESS" = true ]; then
     export LD_LIBRARY_PATH="${TORCH_LIB_PATH}:${LD_LIBRARY_PATH}"
 
     python -c "
-import cluster_manager_cpp as cm
 import gpu_cluster_manager_cpp as gmc
 import ultra_layer_pipeline_cpp as ulp
-print('  cluster_manager_cpp:', dir(cm)[:3], '...')
+from library.AdaptiveIMI.cpp_extensions import AdpIMI_Index, gather_copy_and_concat, batch_gemm_softmax
 print('  gpu_cluster_manager_cpp:', dir(gmc)[:3], '...')
 print('  ultra_layer_pipeline_cpp:', dir(ulp)[:3], '...')
+print('  AdpIMI_Index:', AdpIMI_Index)
+print('  gather_copy_and_concat:', gather_copy_and_concat)
+print('  batch_gemm_softmax:', batch_gemm_softmax)
 print('✅ All imports successful!')
 "
 else

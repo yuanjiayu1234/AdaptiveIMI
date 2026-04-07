@@ -3,9 +3,7 @@ from importlib import import_module
 
 __all__ = [
     "flash_attn_cache",
-    "retroinfer_cache",
-    "retroinfer_cache_imi",
-    "retroinfer_cache_gpu",
+    "adpimi_cache",
 ]
 
 

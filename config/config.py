@@ -1,5 +1,5 @@
 import copy
-import os, json, math
+import os, json
 from pathlib import Path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -23,16 +23,13 @@ def add_config_args(parser):
     parser.add_argument(
         "--attn_type",
         type=str,
-        default="RetroInfer",
-        choices=["Full_Flash_Attn", "Full_Flash_Attn_Offload", "RetroInfer", "AdaptiveIMI"],
+        default="AdaptiveIMI",
+        choices=["Full_Flash_Attn", "Full_Flash_Attn_Offload", "AdaptiveIMI"],
         help="Attention method",
     )
     parser.add_argument("--retrieval_budget", type=float, default=0.018, help="Retrieval budget")
-    parser.add_argument("--estimation_budget", type=float, default=0.232, help="Estimation budget for RetroInfer")
-    parser.add_argument("--cache_ratio", type=float, default=0.0, help="Cache ratio for RetroInfer")
-    parser.add_argument("--index_type", type=str, default="kmeans", help="Index type for RetroInfer")
-    parser.add_argument("--use_cuda_graph", action='store_true', help="Use CUDA graph for inference")
-    parser.add_argument("--gpu_only", action='store_true', help="Whether to use GPU-only mode for RetroInfer")
+    parser.add_argument("--cache_ratio", type=float, default=0.0, help="Cache ratio for AdaptiveIMI")
+    parser.add_argument("--gpu_only", action='store_true', help="Whether to use GPU-only mode for AdaptiveIMI")
     parser.add_argument("--subspace_parts", type=int, default=2, help="IMI subspace parts (0, 2 or 4)")
     return parser
 
@@ -106,8 +103,8 @@ def _clone_attn_config_section(section):
 
 def generate_config(
     model_name, context_len, attn_type, 
-    retrieval_budget=0.018, estimation_budget=0.232, cache_ratio=0.0, index_type="kmeans",
-    use_cuda_graph=False, gpu_only=False, subspace_parts=2
+    retrieval_budget=0.018, cache_ratio=0.0,
+    gpu_only=False, subspace_parts=2
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     model_config_name = resolve_config_name(model_name)
@@ -115,71 +112,27 @@ def generate_config(
     with open(CONFIG_FILE, "r") as f:
         _config = json.load(f)
     
-    avg_cluster_size = 16
-    n_segments = max(round(context_len/8192), 1)
-    
-    # compute the nearest multiple of lcm(8, n_segments) due to the kernel limitation
-    n_factor = math.lcm(8, n_segments)
-    n_clusters = max(round(context_len/avg_cluster_size), n_factor)
-    lower = (n_clusters // n_factor) * n_factor
-    upper = lower + n_factor
-    n_clusters = lower if abs(n_clusters - lower) <= abs(n_clusters - upper) else upper
-
-    base_key = attn_type
     if attn_type == "AdaptiveIMI":
-        if "AdaptiveIMI" in _config:
-            base_key = "AdaptiveIMI"
-        else:
-            base_key = "RetroInfer"
-
-    base_config_defaults = _config.get(base_key, {}) if isinstance(_config, dict) else {}
-    if retrieval_budget is None:
-        retrieval_budget = base_config_defaults.get("retrieval_budget", 0.018)
-    if estimation_budget is None:
-        estimation_budget = base_config_defaults.get("estimation_budget", 0.232)
-    if cache_ratio is None:
-        cache_ratio = base_config_defaults.get("cache_ratio", 0.0)
-
-    if base_key == 'RetroInfer':
         if subspace_parts not in (0, 2, 4):
             raise ValueError("subspace_parts must be 0, 2 or 4")
-        base_config = _clone_attn_config_section(_config[base_key])
-        base_config['core'] = get_numa_node_core_count(0)
-        base_config['n_centroids'] = n_clusters
-        base_config['n_segment'] = n_segments
-        base_config['pages_per_cluster'] = round(avg_cluster_size / 8) # default page size is 8 vectors
-        base_config['retrieval_budget'] = retrieval_budget
-        base_config['estimation_budget'] = estimation_budget
-        base_config['cache_ratio'] = cache_ratio
-        base_config['index_type'] = index_type
-        if attn_type == "AdaptiveIMI":
-            base_config['index_type'] = "imi"
-            base_config['subspace_parts'] = subspace_parts
-        if context_len <= 4096: # increase buffer size for small context
-            base_config['buffer_cluster_num'] = 150
-        base_config['use_cuda_graph'] = use_cuda_graph
-        base_config['gpu_only'] = gpu_only
-        _config[base_key] = base_config
-    elif base_key == "AdaptiveIMI":
-        if subspace_parts not in (0, 2, 4):
-            raise ValueError("subspace_parts must be 0, 2 or 4")
-        base_config = _clone_attn_config_section(_config[base_key])
-        base_config['core'] = get_numa_node_core_count(0)
-        base_config['pages_per_cluster'] = round(avg_cluster_size / 8)
-        base_config['retrieval_budget'] = retrieval_budget
-        base_config['cache_ratio'] = cache_ratio
-        base_config['index_type'] = "imi"
-        base_config['subspace_parts'] = subspace_parts
+
+        base_config = _clone_attn_config_section(_config.get("AdaptiveIMI"))
+        if retrieval_budget is None:
+            retrieval_budget = base_config.get("retrieval_budget", 0.018)
+        if cache_ratio is None:
+            cache_ratio = base_config.get("cache_ratio", 0.0)
+
+        base_config["core"] = get_numa_node_core_count(0)
+        base_config["pages_per_cluster"] = round(16 / 8)
+        base_config["retrieval_budget"] = retrieval_budget
+        base_config["cache_ratio"] = cache_ratio
+        base_config["subspace_parts"] = subspace_parts
+        base_config["gpu_only"] = gpu_only
         if context_len <= 4096:
-            base_config['buffer_cluster_num'] = 150
-        base_config['use_cuda_graph'] = use_cuda_graph
-        base_config['gpu_only'] = gpu_only
-        _config[base_key] = base_config
-
-    if attn_type != base_key:
-        _config[attn_type] = _clone_attn_config_section(_config[base_key])
+            base_config["buffer_cluster_num"] = 150
+        _config["AdaptiveIMI"] = base_config
 
     if attn_type not in ("Full_Flash_Attn", "Full_Flash_Attn_Offload"):
-        print(_config[base_key])
+        print(_config.get(attn_type, {}))
     
     return _config

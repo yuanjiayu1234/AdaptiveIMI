@@ -6,8 +6,8 @@ import torch.nn.functional as F
 import flashinfer
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
 from .LLM import LLM
-from attn_hub import full_decode_attn, retroinfer_decode_attn, \
-                     full_prefill_attn, full_prefill_attn_chunked, prefill_xattn, prefill_minfer, full_decode_attn_offload
+from attn_hub import full_decode_attn, imi_decode_attn, \
+                     full_prefill_attn, prefill_xattn, prefill_minfer, full_decode_attn_offload
 from .xattn_thresholds import llama_31_8b_8_thresholds, llama_3_8b_8_thresholds
 from .minfer_patterns import llama_31_8b_best_patterns, llama_3_8b_best_patterns
 
@@ -70,8 +70,6 @@ class LlamaModel(LLM):
         self.max_position_embeddings = self.config.max_position_embeddings
         self.vocab_size = self.config.vocab_size
         self.eos_tokens = [self.config.eos_token_id]
-        self.uses_retroinfer_gpu_cache = False
-
         self.init_model()
 
 
@@ -190,7 +188,6 @@ class LlamaModel(LLM):
         if self.attention_type == 'Full_Flash_Attn':
             from cache_hub.flash_attn_cache import flash_attn_cache
 
-            self.uses_retroinfer_gpu_cache = False
             self.kv_cache = flash_attn_cache(
                 valid_start = valid_start,
                 layer_num = self.num_layers,
@@ -208,7 +205,6 @@ class LlamaModel(LLM):
         elif self.attention_type == 'Full_Flash_Attn_Offload':
             from cache_hub.flash_attn_cache_offload import flash_attn_cache_offload
 
-            self.uses_retroinfer_gpu_cache = False
             self.kv_cache = flash_attn_cache_offload(
                 valid_start = valid_start,
                 layer_num = self.num_layers,
@@ -223,115 +219,52 @@ class LlamaModel(LLM):
                 num_gpus = self.num_gpus,
                 model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
             )
-        elif self.attention_type in ('RetroInfer', 'AdaptiveIMI'):
-            if self.attention_type == "AdaptiveIMI":
-                retroinfer_config = llama_config.get("AdaptiveIMI")
-            else:
-                retroinfer_config = llama_config.get('RetroInfer', llama_config.get(self.attention_type))
+        elif self.attention_type == "AdaptiveIMI":
+            imi_config = llama_config.get("AdaptiveIMI")
+            if imi_config is None:
+                raise ValueError("AdaptiveIMI config is missing for this model.")
 
-            if self.attention_type == "AdaptiveIMI" and retroinfer_config is not None:
-                streaming_cfg = retroinfer_config.setdefault("streaming", {})
-                streaming_cfg["prefill_chunk_size"] = self.prefill_attn_chunk_size
+            streaming_cfg = imi_config.setdefault("streaming", {})
+            streaming_cfg["prefill_chunk_size"] = self.prefill_attn_chunk_size
 
-            if retroinfer_config['gpu_only'] == True:   # GPU-only version
-                from cache_hub.retroinfer_cache_gpu import retroinfer_cache_gpu
+            if imi_config.get("gpu_only"):
+                raise ValueError("AdaptiveIMI gpu_only mode is not supported.")
 
-                self.uses_retroinfer_gpu_cache = True
-                self.kv_cache = retroinfer_cache_gpu(
-                    valid_start = valid_start,
-                    layer_num = self.num_layers,
-                    batch_size = self.batch_size,
-                    max_length = self.max_new_length + self.input_length,
-                    num_key_value_heads = self.num_key_value_heads,
-                    num_heads = self.num_heads,
-                    head_dim = self.head_dim,
-                    dtype = self.dtype,
-                    layer_mapping = self.layer_mapping,
-                    max_new_length = self.max_new_length,
-                    static_pattern_start = retroinfer_config["static_pattern_start"],
-                    static_pattern_end = retroinfer_config["static_pattern_end"],
-                    core = retroinfer_config["core"],
-                    n_centroids = retroinfer_config["n_centroids"],
-                    n_segment = retroinfer_config["n_segment"],
-                    pages_per_cluster = retroinfer_config["pages_per_cluster"],
-                    retrieval_budget = retroinfer_config["retrieval_budget"],
-                    estimation_budget = retroinfer_config["estimation_budget"],
-                    buffer_cluster_num = retroinfer_config["buffer_cluster_num"],
-                    prefill_bsz = self.prefill_bsz,
-                    num_gpus = self.num_gpus,
-                    model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
-                )
-            else:   # Offload version
-                index_type = retroinfer_config.get("index_type", "kmeans")
-                if self.attention_type == 'AdaptiveIMI':
-                    index_type = "imi"
-                if index_type == "imi":
-                    from cache_hub.retroinfer_cache_imi import retroinfer_cache_imi
+            from cache_hub.adpimi_cache import adpimi_cache
 
-                    self.uses_retroinfer_gpu_cache = False
-                    self.kv_cache = retroinfer_cache_imi(
-                        valid_start = valid_start,
-                        layer_num = self.num_layers,
-                        batch_size = self.batch_size,
-                        max_length = self.max_new_length + self.input_length,
-                        num_key_value_heads = self.num_key_value_heads,
-                        num_heads = self.num_heads,
-                        head_dim = self.head_dim,
-                        dtype = self.dtype,
-                        layer_mapping = self.layer_mapping,
-                        max_new_length = self.max_new_length,
-                        input_length = self.input_length,
-                        static_pattern_start = retroinfer_config["static_pattern_start"],
-                        static_pattern_end = retroinfer_config["static_pattern_end"],
-                        core = retroinfer_config["core"],
-                        pages_per_cluster = retroinfer_config["pages_per_cluster"],
-                        retrieval_budget = retroinfer_config["retrieval_budget"],
-                        cache_ratio = retroinfer_config.get("cache_ratio", 0.0),
-                        buffer_cluster_num = retroinfer_config["buffer_cluster_num"],
-                        prefill_bsz = self.prefill_bsz,
-                        num_gpus = self.num_gpus,
-                        model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
-                        subspace_parts = retroinfer_config.get("subspace_parts", 2),
-                        runtime_config = {
-                            "cpu_threads": retroinfer_config.get("cpu_threads"),
-                            "pipeline": retroinfer_config.get("pipeline", {}),
-                            "kmeans": retroinfer_config.get("kmeans", {}),
-                            "prefetch": retroinfer_config.get("prefetch", {}),
-                            "prefill": retroinfer_config.get("prefill", {}),
-                            "streaming": retroinfer_config.get("streaming", {}),
-                            "async_update": retroinfer_config.get("async_update", {}),
-                        },
-                    )
-                else:
-                    from cache_hub.retroinfer_cache import retroinfer_cache
-
-                    self.uses_retroinfer_gpu_cache = False
-                    self.kv_cache = retroinfer_cache(
-                        valid_start = valid_start,
-                        layer_num = self.num_layers,
-                        batch_size = self.batch_size,
-                        max_length = self.max_new_length + self.input_length,
-                        num_key_value_heads = self.num_key_value_heads,
-                        num_heads = self.num_heads,
-                        head_dim = self.head_dim,
-                        dtype = self.dtype,
-                        layer_mapping = self.layer_mapping,
-                        max_new_length = self.max_new_length,
-                        static_pattern_start = retroinfer_config["static_pattern_start"],
-                        static_pattern_end = retroinfer_config["static_pattern_end"],
-                        core = retroinfer_config["core"],
-                        n_centroids = retroinfer_config["n_centroids"],
-                        n_segment = retroinfer_config["n_segment"],
-                        pages_per_cluster = retroinfer_config["pages_per_cluster"],
-                        retrieval_budget = retroinfer_config["retrieval_budget"],
-                        estimation_budget = retroinfer_config["estimation_budget"],
-                        cache_ratio = retroinfer_config["cache_ratio"],
-                        buffer_cluster_num = retroinfer_config["buffer_cluster_num"],
-                        use_cuda_graph = retroinfer_config["use_cuda_graph"],
-                        prefill_bsz = self.prefill_bsz,
-                        num_gpus = self.num_gpus,
-                        model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
-                    )
+            self.kv_cache = adpimi_cache(
+                valid_start = valid_start,
+                layer_num = self.num_layers,
+                batch_size = self.batch_size,
+                max_length = self.max_new_length + self.input_length,
+                num_key_value_heads = self.num_key_value_heads,
+                num_heads = self.num_heads,
+                head_dim = self.head_dim,
+                dtype = self.dtype,
+                layer_mapping = self.layer_mapping,
+                max_new_length = self.max_new_length,
+                input_length = self.input_length,
+                static_pattern_start = imi_config["static_pattern_start"],
+                static_pattern_end = imi_config["static_pattern_end"],
+                core = imi_config["core"],
+                pages_per_cluster = imi_config["pages_per_cluster"],
+                retrieval_budget = imi_config["retrieval_budget"],
+                cache_ratio = imi_config.get("cache_ratio", 0.0),
+                buffer_cluster_num = imi_config["buffer_cluster_num"],
+                prefill_bsz = self.prefill_bsz,
+                num_gpus = self.num_gpus,
+                model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1)),
+                subspace_parts = imi_config.get("subspace_parts", 2),
+                runtime_config = {
+                    "cpu_threads": imi_config.get("cpu_threads"),
+                    "pipeline": imi_config.get("pipeline", {}),
+                    "kmeans": imi_config.get("kmeans", {}),
+                    "prefetch": imi_config.get("prefetch", {}),
+                    "prefill": imi_config.get("prefill", {}),
+                    "streaming": imi_config.get("streaming", {}),
+                    "async_update": imi_config.get("async_update", {}),
+                },
+            )
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
 
@@ -340,7 +273,7 @@ class LlamaModel(LLM):
         torch.cuda.empty_cache()
         if self.attention_type in ('Full_Flash_Attn', 'Full_Flash_Attn_Offload'):
             self.kv_cache.move_gpu()
-        elif self.attention_type in ('RetroInfer', 'AdaptiveIMI'):
+        elif self.attention_type == "AdaptiveIMI":
             self.kv_cache.prepare_cache()
         torch.cuda.empty_cache()
 
@@ -375,34 +308,18 @@ class LlamaModel(LLM):
         layer_idx,
         chunk_size=None,
         chunk_callback=None,
-        k_new=None,
-        v_new=None,
-        cache_seqlens=None,
     ):
         if self.prefill_method == "xattn":
             attn_out = prefill_xattn(query_states, key_states, value_states, self.thresholds[layer_idx], causal=True)
         elif self.prefill_method == "minfer":
             attn_out = prefill_minfer(query_states, key_states, value_states, self.best_patterns[layer_idx])
         else:   # default use full attention
-            if chunk_size is not None and chunk_size > 0:
-                attn_out = full_prefill_attn_chunked(
-                    query_states,
-                    key_states,
-                    value_states,
-                    causal=True,
-                    chunk_size=chunk_size,
-                    chunk_callback=chunk_callback,
-                )
-            else:
-                attn_out = full_prefill_attn(
-                    query_states,
-                    key_states,
-                    value_states,
-                    causal=True,
-                    k_new=k_new,
-                    v_new=v_new,
-                    cache_seqlens=cache_seqlens,
-                )
+            attn_out = full_prefill_attn(
+                query_states,
+                key_states,
+                value_states,
+                causal=True,
+            )
         return attn_out
     
 
@@ -411,8 +328,8 @@ class LlamaModel(LLM):
             attn_out = full_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'Full_Flash_Attn_Offload':
             attn_out = full_decode_attn_offload(query_states, layer_idx, self.kv_cache)
-        elif self.attention_type in ('RetroInfer', 'AdaptiveIMI'):
-            attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
+        elif self.attention_type == "AdaptiveIMI":
+            attn_out = imi_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
@@ -434,47 +351,14 @@ class LlamaModel(LLM):
         hidden_states = hidden_states.to(next_device)
         self.position_ids = self.position_ids.to(next_device)
         self.cos_sin_cache = self.cos_sin_cache.to(next_device)
-        if self.attention_type == 'Full_Flash_Attn':
+        if self.attention_type in ('Full_Flash_Attn', 'Full_Flash_Attn_Offload'):
             if hidden_states.shape[1] == 1:
                 self.kv_cache.batch_indices = self.kv_cache.batch_indices_dict[next_device]
                 self.kv_cache.valid_length = self.kv_cache.valid_length_dict[next_device]
-        elif self.attention_type in ('RetroInfer', 'AdaptiveIMI'):
-            if hidden_states.shape[1] == 1:
-                if self.uses_retroinfer_gpu_cache:
-                    self.kv_cache.gemm_o = self.kv_cache.gemm_o_dict[next_device]
-                    self.kv_cache.softmax_o = self.kv_cache.softmax_o_dict[next_device]
-                    self.kv_cache.norm = self.kv_cache.norm_dict[next_device]
-                    self.kv_cache.sum = self.kv_cache.sum_dict[next_device]
-                    self.kv_cache.dist = self.kv_cache.dist_dict[next_device]
-                    self.kv_cache.cI = self.kv_cache.cI_dict[next_device]
-                    self.kv_cache.cV = self.kv_cache.cV_dict[next_device]
-                    self.kv_cache.es_centroids = self.kv_cache.es_centroids_dict[next_device]
-                    self.kv_cache.es_value_sum = self.kv_cache.es_value_sum_dict[next_device]
-                    self.kv_cache.es_cluster_size = self.kv_cache.es_cluster_size_dict[next_device]
-                    self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
-                    self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
-                    self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]
-                    self.kv_cache.static_len_tensor = self.kv_cache.static_len_tensor_dict[next_device]
-                    self.kv_cache.nprobe_tensor = self.kv_cache.nprobe_tensor_dict[next_device]
-                else:
-                    self.kv_cache.cI = self.kv_cache.cI_dict[next_device]
-                    self.kv_cache.static_len_tensor = self.kv_cache.static_len_tensor_dict[next_device]
-                    if self.kv_cache.use_cuda_graph:
-                        self.kv_cache.query_buffer = self.kv_cache.query_buffer_dict[next_device]
-                        self.kv_cache.attn_out = self.kv_cache.attn_out_dict[next_device]
-                    else:
-                        self.kv_cache.gemm_o = self.kv_cache.gemm_o_dict[next_device]
-                        self.kv_cache.softmax_o = self.kv_cache.softmax_o_dict[next_device]
-                        self.kv_cache.norm = self.kv_cache.norm_dict[next_device]
-                        self.kv_cache.sum = self.kv_cache.sum_dict[next_device]
-                        self.kv_cache.dist = self.kv_cache.dist_dict[next_device]
-                        self.kv_cache.cV = self.kv_cache.cV_dict[next_device]
-                        self.kv_cache.es_centroids = self.kv_cache.es_centroids_dict[next_device]
-                        self.kv_cache.es_value_sum = self.kv_cache.es_value_sum_dict[next_device]
-                        self.kv_cache.es_cluster_size = self.kv_cache.es_cluster_size_dict[next_device]
-                        self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
-                        self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
-                        self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]
+        elif self.attention_type == "AdaptiveIMI":
+            self.kv_cache.execution_buffer_keys = self.kv_cache.execution_buffer_keys_dict[next_device]
+            self.kv_cache.execution_buffer_values = self.kv_cache.execution_buffer_values_dict[next_device]
+            self.kv_cache.valid_lengths = self.kv_cache.valid_lengths_dict[next_device]
         return hidden_states
 
     
