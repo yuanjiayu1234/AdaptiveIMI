@@ -1,5 +1,5 @@
 import torch
-from .cache import KV_Cache
+from .base import KV_Cache
 
 
 class flash_attn_cache(KV_Cache):
@@ -36,6 +36,15 @@ class flash_attn_cache(KV_Cache):
         self.batch_indices = self.batch_indices_dict[self.layer_mapping[str(0)]]
 
         self.allocated = self.pre_allocate_decision()
+        if not self.allocated:
+            device_free = []
+            for dev in self.device_list:
+                free_bytes, _ = torch.cuda.mem_get_info(dev)
+                device_free.append(f"{dev}={free_bytes / (1024 ** 3):.2f} GiB")
+            raise torch.cuda.OutOfMemoryError(
+                "Full_Flash_Attn estimated insufficient GPU memory for KV pre-allocation. "
+                f"Free memory by device: {', '.join(device_free)}"
+            )
 
         if self.allocated:
             self.key_cache = [

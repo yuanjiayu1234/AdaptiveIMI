@@ -36,6 +36,26 @@ export PYTHONPATH="$(dirname "${PROJECT_ROOT}"):${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 MODEL2PATH_FILE="${SCRIPT_DIR}/model2path.json"
 
+resolve_repo_model_path() {
+    local model_key="$1"
+    python - "${PROJECT_ROOT}" "${model_key}" <<'PY'
+import sys
+
+project_root = sys.argv[1]
+model_key = sys.argv[2]
+
+sys.path.insert(0, project_root)
+
+try:
+    from config import resolve_model_path
+    resolved = resolve_model_path(model_key)
+except Exception:
+    resolved = model_key
+
+print(resolved, end="")
+PY
+}
+
 get_local_model_path() {
     local model_key="$1"
     local resolved_path=""
@@ -64,42 +84,45 @@ MODEL_SELECT() {
 
     case $MODEL_NAME in
         qwen2.5-7b)
-            MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"
+            REMOTE_MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"
             MODEL_TEMPLATE_TYPE="meta-chat"
             MODEL_FRAMEWORK="hf"
             ;;
         llama-3-8b-1048k|gradientai/Llama-3-8B-Instruct-Gradient-1048k|Llama-3-8B-Instruct-Gradient-1048k)
-            MODEL_PATH="gradientai/Llama-3-8B-Instruct-Gradient-1048k"
+            REMOTE_MODEL_PATH="gradientai/Llama-3-8B-Instruct-Gradient-1048k"
             MODEL_TEMPLATE_TYPE="meta-chat"
             MODEL_FRAMEWORK="hf"
             ;;
-        llama-3.1-8b)
-            MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
-            MODEL_TEMPLATE_TYPE="meta-chat"
-            MODEL_FRAMEWORK="hf"
-            ;;
-        meta-llama/Llama-3.1-8B-Instruct|Llama-3.1-8B-Instruct)
-            MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
+        llama-3.1-8b|meta-llama/Llama-3.1-8B-Instruct|Llama-3.1-8B-Instruct)
+            REMOTE_MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
             MODEL_TEMPLATE_TYPE="meta-chat"
             MODEL_FRAMEWORK="hf"
             ;;
         qwen2.5-72b)
-            MODEL_PATH="Qwen/Qwen2.5-72B-Instruct"
+            REMOTE_MODEL_PATH="Qwen/Qwen2.5-72B-Instruct"
             MODEL_TEMPLATE_TYPE="meta-chat"
             MODEL_FRAMEWORK="hf"
             ;;
+        *)
+            REMOTE_MODEL_PATH=""
+            ;;
     esac
+
+    MODEL_PATH=$(resolve_repo_model_path "${MODEL_NAME}")
+
+    LOCAL_MODEL_PATH=$(get_local_model_path "${MODEL_NAME}")
+    if [[ -z "${LOCAL_MODEL_PATH}" && -n "${REMOTE_MODEL_PATH}" ]]; then
+        LOCAL_MODEL_PATH=$(get_local_model_path "${REMOTE_MODEL_PATH}")
+    fi
+    if [[ -n "${LOCAL_MODEL_PATH}" ]]; then
+        MODEL_PATH=${LOCAL_MODEL_PATH}
+    fi
+    if [[ -z "${MODEL_PATH}" ]]; then
+        MODEL_PATH=${REMOTE_MODEL_PATH}
+    fi
 
     TOKENIZER_PATH=${MODEL_PATH}
     TOKENIZER_TYPE="hf"
-
-    LOCAL_MODEL_PATH=$(get_local_model_path "${MODEL_NAME}")
-    if [[ -z "${LOCAL_MODEL_PATH}" ]]; then
-        LOCAL_MODEL_PATH=$(get_local_model_path "${MODEL_PATH}")
-    fi
-    if [[ -n "${LOCAL_MODEL_PATH}" ]]; then
-        TOKENIZER_PATH=${LOCAL_MODEL_PATH}
-    fi
 
     echo "$MODEL_PATH:$MODEL_TEMPLATE_TYPE:$MODEL_FRAMEWORK:$TOKENIZER_PATH:$TOKENIZER_TYPE"
 }
@@ -110,6 +133,12 @@ IFS=":" read MODEL_PATH MODEL_TEMPLATE_TYPE MODEL_FRAMEWORK TOKENIZER_PATH TOKEN
 if [ -z "${MODEL_PATH}" ]; then
     echo "Model: ${MODEL_NAME} is not supported"
     exit 1
+fi
+
+if [[ -e "${MODEL_PATH}" ]]; then
+    echo "Using local model path: ${MODEL_PATH}"
+else
+    echo "Local model not found, fallback to HF: ${MODEL_PATH}"
 fi
 
 # Benchmark and Tasks
@@ -138,7 +167,7 @@ fi
 
 DTYPE=${6}
 SUBSET="validation"
-RULER_DATA_ROOT="${RULER_DATA_ROOT:-${SCRIPT_DIR}/../../../data/RULER}"
+RULER_DATA_ROOT="${RULER_DATA_ROOT:-${PROJECT_ROOT}/data/RULER}"
 
 for TASK in "${TASK_LIST[@]}"; do
     if [[ ! " ${TASKS[*]} " =~ " ${TASK} " ]]; then

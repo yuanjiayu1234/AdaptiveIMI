@@ -1,7 +1,7 @@
 import math
 import torch
 from flash_attn import flash_attn_with_kvcache
-from .cache import KV_Cache
+from .base import KV_Cache
 
 
 class flash_attn_cache_offload(KV_Cache):

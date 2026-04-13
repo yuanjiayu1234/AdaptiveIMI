@@ -6,11 +6,9 @@ import torch
 import torch.nn.functional as F
 import flashinfer
 from transformers import AutoTokenizer, Qwen2ForCausalLM, Qwen2Config
-from .LLM import LLM
+from .base import LLM
 from attn_hub import full_decode_attn, imi_decode_attn, \
-                     full_prefill_attn, prefill_xattn, prefill_minfer, full_decode_attn_offload
-from .xattn_thresholds import qwen_25_7b_8_thresholds, qwen_25_72b_8_thresholds
-from .minfer_patterns import qwen_25_7b_best_patterns, qwen_25_72b_best_patterns
+                     full_prefill_attn, full_decode_attn_offload
 
 
 
@@ -54,25 +52,7 @@ class QwenModel(LLM):
     """
 
     def _infer_model_size_b(self) -> int:
-        """Infer model size (in billions) from name/path.
-
-        Used for memory estimation in KV cache.
-        """
-        candidates = [self.model_name, getattr(self, "model_path", None)]
-        for item in candidates:
-            if not item:
-                continue
-            text = str(item)
-            m = re.search(r"(\d+)\s*[Bb]", text)
-            if m is not None:
-                return int(m.group(1))
-        # Known aliases used by benchmark scripts
-        lower = (self.model_name or "").lower()
-        if "7b" in lower:
-            return 7
-        if "72b" in lower:
-            return 72
-        raise ValueError(f"Cannot infer model size from model_name={self.model_name!r}, model_path={getattr(self, 'model_path', None)!r}")
+        return self._infer_model_size_from_candidates({"72b": 72, "7b": 7})
 
     def __init__(
         self,
@@ -88,16 +68,9 @@ class QwenModel(LLM):
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path) if tokenizer is None else tokenizer
         self.config = Qwen2Config.from_pretrained(self.model_path)
-        self.num_layers = self.config.num_hidden_layers
-        self.num_heads = self.config.num_attention_heads
-        self.num_key_value_heads = self.config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.hidden_size = self.config.hidden_size
-        self.head_dim = self.hidden_size // self.num_heads
+        self._populate_common_config_fields()
         self.base = self.config.rope_theta
-        self.max_position_embeddings = self.config.max_position_embeddings
         self.yarn_factor = 4         # # qwen2.5 use yarn in context length larger than 32768
-        self.vocab_size = self.config.vocab_size
         self.eos_tokens = [self.config.eos_token_id]
         self.init_model()
 
@@ -148,79 +121,11 @@ class QwenModel(LLM):
 
     def init_model(self):
         hf_qwen = Qwen2ForCausalLM.from_pretrained(self.model_path, torch_dtype=self.dtype)
+        root_device = self._configure_devices()
+        self._initialize_shared_runtime_tensors(hf_qwen, root_device)
+        self._initialize_layers(hf_qwen.model.layers, QwenLayer)
+        self._finalize_model_init()
 
-        self.num_gpus = torch.cuda.device_count() if self.device_map == 'auto' else 1
-        if self.device_map == 'auto' and self.num_gpus == 1:
-            self.device_map = 'cuda:0'
-        
-        if self.device_map != "auto":   # single GPU
-            self.layer_mapping = {}
-            for ldx in range(0, self.num_layers):
-                self.layer_mapping.update({str(ldx): self.device_map})
-
-            self.embed_tokens = hf_qwen.model.embed_tokens.weight.detach().to(self.device_map, non_blocking=True)
-            self.lm_head = hf_qwen.lm_head.weight.detach().to(self.device_map, non_blocking=True)
-
-            self.norm_weight = hf_qwen.model.norm.weight.detach().to(self.device_map, non_blocking=True)
-            self.norm_variance_epsilon = hf_qwen.model.norm.variance_epsilon
-
-            self.position_ids = torch.arange(0, self.max_length).to(self.device_map, non_blocking=True)
-            self.inv_freq = hf_qwen.model.rotary_emb.inv_freq.detach().to(self.device_map, non_blocking=True)
-            self.attention_scaling = hf_qwen.model.rotary_emb.attention_scaling
-            self.cos_cache, self.sin_cache = self._set_cos_sin_cache()
-            self.cos_sin_cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1)
-
-            self.layers = []
-            for idx, hf_qwen_layer in enumerate(hf_qwen.model.layers):
-                qwen_layer = QwenLayer(idx, device=self.device_map)
-                qwen_layer.init_layer(hf_qwen_layer)
-                self.layers.append(qwen_layer)
-                hf_qwen.model.layers[idx] = None
-
-        else:   # multi GPUs
-            self.gpu_ids = list(range(self.num_gpus))
-            self.layer_interval = (self.num_layers + self.num_gpus - 1) // self.num_gpus
-            self.layer_mapping = {}
-            for ldx in range(0, self.num_layers):
-                self.layer_mapping.update({str(ldx): f'cuda:{ldx // self.layer_interval}'})
-
-            self.embed_tokens = hf_qwen.model.embed_tokens.weight.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.lm_head = hf_qwen.lm_head.weight.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-
-            self.norm_weight = hf_qwen.model.norm.weight.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.norm_variance_epsilon = hf_qwen.model.norm.variance_epsilon
-
-            self.position_ids = torch.arange(0, self.max_length).to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.inv_freq = hf_qwen.model.rotary_emb.inv_freq.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.attention_scaling = hf_qwen.model.rotary_emb.attention_scaling
-            self.cos_cache, self.sin_cache = self._set_cos_sin_cache()
-            self.cos_sin_cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1)
-
-            self.layers = []
-            for ldx, hf_qwen_layer in enumerate(hf_qwen.model.layers):
-                qwen_layer = QwenLayer(ldx, device=self.layer_mapping[str(ldx)])
-                qwen_layer.init_layer(hf_qwen_layer)
-                self.layers.append(qwen_layer)
-                hf_qwen.model.layers[ldx] = None
-
-        del self.inv_freq, self.cos_cache, self.sin_cache
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        model_name_lower = self.model_name.lower()
-        if "qwen2.5-7b" in model_name_lower:
-            self.thresholds = [torch.tensor(qwen_25_7b_8_thresholds[layer_idx]).to(self.layer_mapping[str(layer_idx)]) 
-                               for layer_idx in range(self.num_layers)]
-            self.best_patterns = qwen_25_7b_best_patterns
-        elif "qwen2.5-72b" in model_name_lower:
-            self.thresholds = [torch.tensor(qwen_25_72b_8_thresholds[layer_idx]).to(self.layer_mapping[str(layer_idx)]) 
-                               for layer_idx in range(self.num_layers)]
-            self.best_patterns = qwen_25_72b_best_patterns
-        else:
-            self.thresholds = [torch.ones((self.num_heads,), device=self.layer_mapping[str(layer_idx)])*0.9
-                               for layer_idx in range(self.num_layers)]
-            self.best_patterns = [{str(head_idx): ["vertical_and_slash", 1000, 6096, 1] for head_idx in range(self.num_heads)}
-                                  for layer_idx in range(self.num_layers)]
 
     @staticmethod
     def _resolve_model_path(model_path: str) -> str:
@@ -241,115 +146,7 @@ class QwenModel(LLM):
 
     
     def init_kv_cache(self, valid_start, attn_config):
-        # collect memory from previous kv_cache
-        self.kv_cache = None
-        gc.collect()
-
-        qwen_config = attn_config
-        self.apply_prefill_config(qwen_config)
-        
-        # Init kv cache
-        if self.attention_type == 'Full_Flash_Attn':
-            from cache_hub.flash_attn_cache import flash_attn_cache
-
-            self.kv_cache = flash_attn_cache(
-                valid_start = valid_start,
-                layer_num = self.num_layers,
-                batch_size = self.batch_size,
-                max_length = self.max_new_length + self.input_length,
-                num_key_value_heads = self.num_key_value_heads,
-                num_heads = self.num_heads,
-                head_dim = self.head_dim,
-                dtype = self.dtype,
-                layer_mapping = self.layer_mapping,
-                prefill_bsz = self.prefill_bsz,
-                num_gpus = self.num_gpus,
-                model_size = self._infer_model_size_b()
-            )
-        elif self.attention_type == 'Full_Flash_Attn_Offload':
-            from cache_hub.flash_attn_cache_offload import flash_attn_cache_offload
-
-            self.kv_cache = flash_attn_cache_offload(
-                valid_start = valid_start,
-                layer_num = self.num_layers,
-                batch_size = self.batch_size,
-                max_length = self.max_new_length + self.input_length,
-                num_key_value_heads = self.num_key_value_heads,
-                num_heads = self.num_heads,
-                head_dim = self.head_dim,
-                dtype = self.dtype,
-                layer_mapping = self.layer_mapping,
-                prefill_bsz = self.prefill_bsz,
-                num_gpus = self.num_gpus,
-                model_size = self._infer_model_size_b()
-            )
-        elif self.attention_type == "AdaptiveIMI":
-            imi_config = qwen_config.get("AdaptiveIMI")
-            if imi_config is None:
-                raise ValueError("AdaptiveIMI config is missing for this model.")
-
-            streaming_cfg = imi_config.setdefault("streaming", {})
-            streaming_cfg["prefill_chunk_size"] = self.prefill_attn_chunk_size
-
-            if imi_config.get("gpu_only"):
-                raise ValueError("AdaptiveIMI gpu_only mode is not supported.")
-
-            from cache_hub.adpimi_cache import adpimi_cache
-
-            self.kv_cache = adpimi_cache(
-                valid_start = valid_start,
-                layer_num = self.num_layers,
-                batch_size = self.batch_size,
-                max_length = self.max_new_length + self.input_length,
-                num_key_value_heads = self.num_key_value_heads,
-                num_heads = self.num_heads,
-                head_dim = self.head_dim,
-                dtype = self.dtype,
-                layer_mapping = self.layer_mapping,
-                max_new_length = self.max_new_length,
-                input_length = self.input_length,
-                static_pattern_start = imi_config["static_pattern_start"],
-                static_pattern_end = imi_config["static_pattern_end"],
-                core = imi_config["core"],
-                pages_per_cluster = imi_config["pages_per_cluster"],
-                retrieval_budget = imi_config["retrieval_budget"],
-                cache_ratio = imi_config.get("cache_ratio", 0.0),
-                buffer_cluster_num = imi_config["buffer_cluster_num"],
-                prefill_bsz = self.prefill_bsz,
-                num_gpus = self.num_gpus,
-                model_size = self._infer_model_size_b(),
-                subspace_parts = imi_config.get("subspace_parts", 2),
-                runtime_config = {
-                    "cpu_threads": imi_config.get("cpu_threads"),
-                    "pipeline": imi_config.get("pipeline", {}),
-                    "kmeans": imi_config.get("kmeans", {}),
-                    "prefetch": imi_config.get("prefetch", {}),
-                    "prefill": imi_config.get("prefill", {}),
-                    "streaming": imi_config.get("streaming", {}),
-                    "async_update": imi_config.get("async_update", {}),
-                },
-            )
-        else:
-            raise ValueError(f"Unsupported attention type: {self.attention_type}")
-
-    
-    def move(self):
-        torch.cuda.empty_cache()
-        if self.attention_type in ('Full_Flash_Attn', 'Full_Flash_Attn_Offload'):
-            self.kv_cache.move_gpu()
-        elif self.attention_type == "AdaptiveIMI":
-            self.kv_cache.prepare_cache()
-        torch.cuda.empty_cache()
-
-    
-    def word_embedding(self, inputs_id):
-        hidden_states = F.embedding(inputs_id, self.embed_tokens)
-        return hidden_states
-
-    
-    def lm(self, hidden_states):
-        logits = F.linear(hidden_states, self.lm_head).float()
-        return logits
+        self._build_kv_cache(valid_start, attn_config, support_offload=True, adaptive_prefill_bsz=self.prefill_bsz)
 
 
     def wqkv(self, hidden_states, layer):
@@ -373,18 +170,12 @@ class QwenModel(LLM):
         chunk_size=None,
         chunk_callback=None,
     ):
-        if self.prefill_method == "xattn":
-            attn_out = prefill_xattn(query_states, key_states, value_states, self.thresholds[layer_idx], causal=True)
-        elif self.prefill_method == "minfer":
-            attn_out = prefill_minfer(query_states, key_states, value_states, self.best_patterns[layer_idx])
-        else:   # default use full attention
-            attn_out = full_prefill_attn(
-                query_states,
-                key_states,
-                value_states,
-                causal=True,
-            )
-        return attn_out
+        return full_prefill_attn(
+            query_states,
+            key_states,
+            value_states,
+            causal=True,
+        )
     
 
     def decode_attention(self, query_states, key_states, value_states, layer_idx):

@@ -17,6 +17,8 @@
 /throughput_eval/
 /benchmark/
 /build/
+/models/
+/data/
 /ruler_eval_result/
 # Mono auto generated files
 mono_crash.*

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ctypes
+import importlib.util
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import json
@@ -16,8 +18,66 @@ if _CPP_EXT_DIR.exists():
     if cpp_path not in sys.path:
         sys.path.insert(0, cpp_path)
 
+
+def _load_shared_library(lib_path: Path) -> bool:
+    if not lib_path.exists():
+        return False
+    try:
+        ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+        return True
+    except OSError:
+        return False
+
+
+def _preload_extension_dependencies() -> None:
+    candidate_dirs = []
+
+    torch_lib_dir = Path(torch.__file__).resolve().parent / "lib"
+    if torch_lib_dir.exists():
+        candidate_dirs.append(torch_lib_dir)
+
+    cuda_runtime_spec = importlib.util.find_spec("nvidia.cuda_runtime")
+    if cuda_runtime_spec and cuda_runtime_spec.submodule_search_locations:
+        for location in cuda_runtime_spec.submodule_search_locations:
+            runtime_dir = Path(location) / "lib"
+            if runtime_dir.exists():
+                candidate_dirs.append(runtime_dir)
+
+    cuda_home = os.getenv("CUDA_HOME")
+    if cuda_home:
+        for suffix in ("lib64", "targets/x86_64-linux/lib"):
+            runtime_dir = Path(cuda_home) / suffix
+            if runtime_dir.exists():
+                candidate_dirs.append(runtime_dir)
+
+    seen = set()
+    unique_dirs = []
+    for directory in candidate_dirs:
+        resolved = directory.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_dirs.append(resolved)
+
+    preload_order = [
+        "libcudart.so.12",
+        "libcudart.so.11.0",
+        "libc10.so",
+        "libtorch.so",
+        "libtorch_cpu.so",
+        "libtorch_python.so",
+        "libc10_cuda.so",
+    ]
+    for lib_name in preload_order:
+        for directory in unique_dirs:
+            if _load_shared_library(directory / lib_name):
+                break
+
+
+_preload_extension_dependencies()
+
 try:
-    import ultra_layer_pipeline_cpp as _pipeline_cpp
+    from library.AdaptiveIMI.cpp_extensions import ultra_layer_pipeline_cpp as _pipeline_cpp
 except ImportError as exc:  # pragma: no cover - handled at runtime
     _pipeline_cpp = None
     _pipeline_import_error = exc
@@ -53,7 +113,7 @@ class _TorchIMIKernels:
 
 def get_imi_kernels():
     try:
-        import gpu_cluster_manager_cpp as imi_gpu_kernels
+        from library.AdaptiveIMI.cpp_extensions import gpu_cluster_manager_cpp as imi_gpu_kernels
 
         return imi_gpu_kernels
     except Exception:  # pragma: no cover - fallback when kernels unavailable
@@ -114,6 +174,22 @@ class IMIPipeline:
         self._batch_allocate_cpu_buffer_callback = callback
         if self._pipeline is not None:
             self._pipeline.set_batch_allocate_cpu_buffer_callback(callback)
+
+    def cancel_pipeline(self) -> None:
+        pipeline = self._pipeline
+        if pipeline is None:
+            return
+        pipeline.cancel_pipeline()
+
+    def close(self) -> None:
+        pipeline = self._pipeline
+        if pipeline is None:
+            return
+        try:
+            pipeline.cancel_pipeline()
+        finally:
+            self._batch_allocate_cpu_buffer_callback = None
+            self._pipeline = None
 
     def set_worker_threads(self, worker_threads: int) -> None:
         pipeline = self._get_pipeline()

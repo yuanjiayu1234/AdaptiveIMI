@@ -2,8 +2,8 @@
 统一构建脚本 - 编译 C++/CUDA 扩展模块
 
 模块:
-1. gpu_cluster_manager_cpp - IMI decode kernels
-2. ultra_layer_pipeline_cpp - 32层并行K-means管道
+1. library.AdaptiveIMI.cpp_extensions.gpu_cluster_manager_cpp - IMI decode kernels
+2. library.AdaptiveIMI.cpp_extensions.ultra_layer_pipeline_cpp - 32层并行K-means管道
 3. library.AdaptiveIMI.cpp_extensions.AdpIMI_Index - AdpIMI CPU index manager
 4. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
 5. library.AdaptiveIMI.cpp_extensions.gemm_softmax - CUTLASS batch gemm softmax
@@ -178,7 +178,7 @@ gpu_cluster_manager_sources = [
 ]
 
 gpu_cluster_manager_ext = CUDAExtension(
-    name='gpu_cluster_manager_cpp',
+    name='library.AdaptiveIMI.cpp_extensions.gpu_cluster_manager_cpp',
     sources=gpu_cluster_manager_sources,
     include_dirs=[str(HERE / 'include')] + TORCH_INCLUDE,
     extra_compile_args={
@@ -198,7 +198,7 @@ ultra_layer_pipeline_sources = [
 ]
 
 ultra_layer_pipeline_ext = CppExtension(
-    name='ultra_layer_pipeline_cpp',
+    name='library.AdaptiveIMI.cpp_extensions.ultra_layer_pipeline_cpp',
     sources=ultra_layer_pipeline_sources,
     include_dirs=[str(HERE / 'include'), CUDA_INCLUDE] + TORCH_INCLUDE,
     library_dirs=[CUDA_LIB],

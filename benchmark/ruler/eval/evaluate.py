@@ -27,12 +27,6 @@ import re
 import os
 import sys
 import argparse
-import nltk
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-    
 import pandas as pd
 import importlib
 import yaml

@@ -44,6 +44,8 @@ import numpy as np
 import random
 from tqdm import tqdm
 from pathlib import Path
+
+from config import resolve_model_path
 from typing import Dict, List, Optional
 import traceback
 from utils import load_data
@@ -55,8 +57,7 @@ try:
 except ImportError:
     QwenModel = None
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from benchmark.config import generate_config, parse_attn_args
+from config import generate_config
 
 
 
@@ -83,12 +84,16 @@ def cleanup_kv_cache(llm):
     if os.getenv("IMI_DEBUG_SKIP_KV_CLEANUP", "0") == "1":
         return
     kv_cache = getattr(llm, "kv_cache", None)
-    if kv_cache is None:
-        return
-    cleanup = getattr(kv_cache, "cleanup", None)
-    if callable(cleanup):
-        cleanup()
-    llm.kv_cache = None
+    if kv_cache is not None:
+        reuse_ok = hasattr(kv_cache, "reset_for_next_sequence") and hasattr(kv_cache, "can_reuse_for_next_sequence")
+        if not reuse_ok:
+            cleanup = getattr(kv_cache, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            llm.kv_cache = None
+    clear_prefill_workspace = getattr(llm, "_clear_prefill_prefix_kv_workspace", None)
+    if callable(clear_prefill_workspace):
+        clear_prefill_workspace()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -243,7 +248,7 @@ def get_pred(
         model_name,
         input_ids.shape[1],  # 使用实际输入长度，而非预设的 synthetic_len
         attn_type,
-        budget_ratio=budget_ratio,
+        retrieval_budget=budget_ratio,
         subspace_parts=subspace_parts,
     )
 
@@ -314,6 +319,8 @@ def main(args):
     else:
         pred_file = args.save_dir / f'{args.task}.jsonl'
         
+    args.model_path = resolve_model_path(args.model_path or args.model_name)
+    print(args)
     print(f'Predict {args.task} \nfrom {task_file}\nto {pred_file}')
     pred_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -428,8 +435,8 @@ if __name__ == '__main__':
     parser.add_argument("--threads", type=int, default=4)
 
     parser.add_argument("--synthetic_len", type=int, required=True)
-
-    parser = parse_attn_args(parser)
+    parser.add_argument("--budget_ratio", type=float, default=0.018, help="Retrieval budget for AdaptiveIMI")
+    parser.add_argument("--subspace_parts", type=int, default=2, help="IMI subspace parts (0, 2 or 4)")
 
     args = parser.parse_args()
     print(args)

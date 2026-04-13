@@ -4,6 +4,7 @@
         "static_pattern_end": 64,
         "core": 24,
         "pages_per_cluster": 2,
+        "cache_ratio": 0.05,
         "retrieval_budget": 0.1,
         "buffer_cluster_num": 32,
         "gpu_only": false,

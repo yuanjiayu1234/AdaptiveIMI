@@ -5,18 +5,99 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 MODEL_REGISTRY = {
     "Llama-3-8B-Instruct-Gradient-1048k": {
-        "path": "/data/yjy/.cache/huggingface/hub/Llama-3-8B-Instruct-Gradient-1048k",
+        "path": os.path.join("models", "llama3-8b-1048k"),
         "config_name": "Llama-3-8B-Instruct-Gradient-1048k.json",
     },
     "Qwen2.5-7B-Instruct": {
-        "path": "/data/yjy/.cache/huggingface/hub/qwen2.5-7b",
+        "path": os.path.join("models", "qwen2.5-7b"),
         "config_name": "Qwen2.5-7B-Instruct.json",
     },
     "Llama-3.1-8B-Instruct": {
-        "path": "/data/yjy/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct",
+        "path": os.path.join("models", "Llama-3.1-8B-Instruct"),
         "config_name": "Llama-3.1-8B-Instruct.json",
     },
+    "Mistral-7B-Instruct-v0.2": {
+        "path": os.path.join("models", "models--mistralai--Mistral-7B-Instruct-v0.2"),
+        "config_name": "mistral-7b-Instruct-32k.json",
+    },
 }
+
+MODEL_PATH_ALIASES = {
+    "qwen2.5-7b": {
+        "local": os.path.join("models", "qwen2.5-7b"),
+        "remote": "Qwen/Qwen2.5-7B-Instruct",
+        "config": "Qwen2.5-7B-Instruct.json",
+    },
+    "qwen/qwen2.5-7b-instruct": {
+        "local": os.path.join("models", "qwen2.5-7b"),
+        "remote": "Qwen/Qwen2.5-7B-Instruct",
+        "config": "Qwen2.5-7B-Instruct.json",
+    },
+    "qwen2.5-72b": {
+        "local": None,
+        "remote": "Qwen/Qwen2.5-72B-Instruct",
+        "config": "Qwen2.5-72B-Instruct.json",
+    },
+    "qwen/qwen2.5-72b-instruct": {
+        "local": None,
+        "remote": "Qwen/Qwen2.5-72B-Instruct",
+        "config": "Qwen2.5-72B-Instruct.json",
+    },
+    "llama-3.1-8b": {
+        "local": os.path.join("models", "Llama-3.1-8B-Instruct"),
+        "remote": "meta-llama/Llama-3.1-8B-Instruct",
+        "config": "Llama-3.1-8B-Instruct.json",
+    },
+    "meta-llama/llama-3.1-8b-instruct": {
+        "local": os.path.join("models", "Llama-3.1-8B-Instruct"),
+        "remote": "meta-llama/Llama-3.1-8B-Instruct",
+        "config": "Llama-3.1-8B-Instruct.json",
+    },
+    "llama-3-8b-1048k": {
+        "local": os.path.join("models", "llama3-8b-1048k"),
+        "remote": "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
+        "config": "Llama-3-8B-Instruct-Gradient-1048k.json",
+    },
+    "gradientai/llama-3-8b-instruct-gradient-1048k": {
+        "local": os.path.join("models", "llama3-8b-1048k"),
+        "remote": "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
+        "config": "Llama-3-8B-Instruct-Gradient-1048k.json",
+    },
+    "mistral-7b-instruct-v0.2": {
+        "local": os.path.join("models", "models--mistralai--Mistral-7B-Instruct-v0.2"),
+        "remote": "mistralai/Mistral-7B-Instruct-v0.2",
+        "config": "mistral-7b-Instruct-32k.json",
+    },
+    "mistralai/mistral-7b-instruct-v0.2": {
+        "local": os.path.join("models", "models--mistralai--Mistral-7B-Instruct-v0.2"),
+        "remote": "mistralai/Mistral-7B-Instruct-v0.2",
+        "config": "mistral-7b-Instruct-32k.json",
+    },
+    "models--mistralai--mistral-7b-instruct-v0.2": {
+        "local": os.path.join("models", "models--mistralai--Mistral-7B-Instruct-v0.2"),
+        "remote": "mistralai/Mistral-7B-Instruct-v0.2",
+        "config": "mistral-7b-Instruct-32k.json",
+    },
+}
+
+def get_model_choices() -> list[str]:
+    choices = []
+    for model_name, model_info in MODEL_REGISTRY.items():
+        choices.append(model_name)
+        model_path = model_info.get("path")
+        if model_path:
+            choices.append(model_path)
+    return list(dict.fromkeys(choices))
+
+
+def get_default_model_name() -> str:
+    return next(iter(MODEL_REGISTRY))
+
+
+def _resolve_project_relative_model_path(model_path: str) -> str:
+    if not model_path or os.path.isabs(model_path):
+        return model_path
+    return os.path.join(PROJECT_ROOT, model_path)
 
 
 def add_config_args(parser):
@@ -69,11 +150,71 @@ def _resolve_snapshot_path(model_path: str) -> str:
     return snapshot_dirs[0]
 
 
+def _iter_model_lookup_keys(model_name: str):
+    normalized = (model_name or "").rstrip("/")
+    if not normalized:
+        return []
+    base_name = os.path.basename(normalized)
+    keys = [normalized.lower()]
+    if base_name:
+        keys.append(base_name.lower())
+    return list(dict.fromkeys(keys))
+
+
+
+def _existing_local_model_path(candidate: str) -> str | None:
+    if not candidate:
+        return None
+    resolved = _resolve_snapshot_path(_resolve_project_relative_model_path(candidate))
+    return resolved if resolved and os.path.exists(resolved) else None
+
+
+
 def resolve_model_path(model_name: str) -> str:
+    direct_path = _existing_local_model_path(model_name)
+    if direct_path is not None:
+        return direct_path
+
     model_info = MODEL_REGISTRY.get(model_name)
     if model_info and model_info.get("path"):
-        return _resolve_snapshot_path(model_info["path"])
-    return _resolve_snapshot_path(model_name)
+        registry_path = _existing_local_model_path(model_info["path"])
+        if registry_path is not None:
+            return registry_path
+
+    for lookup_key in _iter_model_lookup_keys(model_name):
+        alias_info = MODEL_PATH_ALIASES.get(lookup_key)
+        if alias_info is None:
+            continue
+        local_path = _existing_local_model_path(alias_info.get("local"))
+        if local_path is not None:
+            return local_path
+
+    normalized = (model_name or "").rstrip("/")
+    base_name = os.path.basename(normalized)
+    local_candidates = []
+    if base_name:
+        local_candidates.append(os.path.join("models", base_name))
+    if "/" in normalized:
+        org, repo = normalized.split("/", 1)
+        local_candidates.append(os.path.join("models", repo))
+        local_candidates.append(os.path.join("models", f"models--{org}--{repo}"))
+
+    for candidate in local_candidates:
+        local_path = _existing_local_model_path(candidate)
+        if local_path is not None:
+            return local_path
+
+    if model_info and model_info.get("path"):
+        return _resolve_snapshot_path(_resolve_project_relative_model_path(model_info["path"]))
+
+    for lookup_key in _iter_model_lookup_keys(model_name):
+        alias_info = MODEL_PATH_ALIASES.get(lookup_key)
+        if alias_info is not None:
+            remote_path = alias_info.get("remote")
+            if remote_path:
+                return remote_path
+
+    return _resolve_snapshot_path(_resolve_project_relative_model_path(model_name))
 
 
 def resolve_config_name(model_name: str) -> str:
@@ -81,15 +222,10 @@ def resolve_config_name(model_name: str) -> str:
     if model_info and model_info.get("config_name"):
         return model_info["config_name"]
 
-    # Common aliases used by benchmark scripts / CLI
-    aliases = {
-        "qwen2.5-7b": "Qwen2.5-7B-Instruct.json",
-        "qwen2.5-72b": "Qwen2.5-72B-Instruct.json",
-        "llama-3.1-8b": "Llama-3.1-8B-Instruct.json",
-        "llama-3-8b-1048k": "Llama-3-8B-Instruct-Gradient-1048k.json",
-    }
-    if model_name in aliases:
-        return aliases[model_name]
+    for lookup_key in _iter_model_lookup_keys(model_name):
+        alias_info = MODEL_PATH_ALIASES.get(lookup_key)
+        if alias_info is not None and alias_info.get("config"):
+            return alias_info["config"]
 
     base_name = os.path.basename(model_name.rstrip("/"))
     if base_name.endswith(".json"):
