@@ -28,8 +28,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute RoPE-pair dependency matrices from saved key tensors.")
     parser.add_argument("--keys", type=Path, required=True, help="Path to a .pt key tensor or dict containing 'keys'.")
     parser.add_argument("--layout", type=str, default="auto", choices=["auto", "slhtd", "lhtd", "htd", "td"])
-    parser.add_argument("--scope", type=str, default="layer_group_head", choices=["global_head", "layer_group_head", "layer_head"])
-    parser.add_argument("--layer-groups", type=int, default=3, help="Number of layer groups for layer_group_head scope.")
+    parser.add_argument(
+        "--scope",
+        type=str,
+        default="layer_group",
+        choices=["global", "layer_group", "layer", "global_head", "layer_group_head", "layer_head"],
+    )
+    parser.add_argument("--layer-groups", type=int, default=3, help="Number of layer groups for layer_group scopes.")
     parser.add_argument("--max-tokens-per-scope", type=int, default=262144, help="Subsample tokens per scope for stable memory use.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mi-weight", type=float, default=0.25)
@@ -87,4 +92,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

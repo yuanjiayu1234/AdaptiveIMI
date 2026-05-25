@@ -40,9 +40,22 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")) 
 from utils import dump_jsonl
 from tokenizer import select_tokenizer
-import nltk
-nltk.download('punkt_tab')
-from nltk.tokenize import sent_tokenize
+
+sent_tokenize = None
+
+
+def _get_sent_tokenize():
+    global sent_tokenize
+    if sent_tokenize is not None:
+        return sent_tokenize
+    import nltk
+    try:
+        nltk.data.find("tokenizers/punkt_tab")
+    except LookupError:
+        nltk.download("punkt_tab")
+    from nltk.tokenize import sent_tokenize as _sent_tokenize
+    sent_tokenize = _sent_tokenize
+    return sent_tokenize
 
 
 parser = argparse.ArgumentParser()
@@ -142,7 +155,7 @@ def generate_input_output(num_haystack):
     # Context
     if args.type_haystack == 'essay':
         text = " ".join(haystack[:num_haystack])
-        document_sents = sent_tokenize(text.strip())
+        document_sents = _get_sent_tokenize()(text.strip())
         insertion_positions = [0] + \
                               sorted([int(len(document_sents) * (depth / 100)) for depth in random.sample(DEPTHS, len(needles))]) + \
                               [len(document_sents)]

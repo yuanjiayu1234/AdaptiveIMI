@@ -7,6 +7,7 @@
 3. library.AdaptiveIMI.cpp_extensions.AdpIMI_Index - AdpIMI CPU index manager
 4. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
 5. library.AdaptiveIMI.cpp_extensions.gemm_softmax - CUTLASS batch gemm softmax
+6. library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp - Hybrid 8-way GPU index builder
 
 使用方法:
     cd cpp_extensions
@@ -19,6 +20,7 @@ import os
 import subprocess
 import re
 import shutil
+import site
 from pathlib import Path
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
@@ -36,7 +38,60 @@ TORCH_INCLUDE = torch.utils.cpp_extension.include_paths()
 # 获取 CUDA 路径
 CUDA_HOME = os.environ.get('CUDA_HOME', '/usr/local/cuda')
 CUDA_INCLUDE = os.path.join(CUDA_HOME, 'include')
-CUDA_LIB = os.path.join(CUDA_HOME, 'lib64')
+
+
+def _existing_unique(paths):
+    seen = set()
+    result = []
+    for path in paths:
+        if not path:
+            continue
+        path = os.path.abspath(os.fspath(path))
+        if path in seen or not os.path.exists(path):
+            continue
+        result.append(path)
+        seen.add(path)
+    return result
+
+
+def _nvidia_package_dirs(kind):
+    """Find headers/libs shipped by pip nvidia-* CUDA packages."""
+    roots = []
+    try:
+        roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+
+    candidates = []
+    for root in roots:
+        nvidia_root = Path(root) / 'nvidia'
+        if not nvidia_root.exists():
+            continue
+        for package_dir in nvidia_root.iterdir():
+            candidate = package_dir / kind
+            if candidate.exists():
+                candidates.append(candidate)
+    return _existing_unique(candidates)
+
+
+NVIDIA_INCLUDE_DIRS = _nvidia_package_dirs('include')
+NVIDIA_LIB_DIRS = _nvidia_package_dirs('lib')
+CUDA_INCLUDE_DIRS = _existing_unique([
+    CUDA_INCLUDE,
+    os.path.join(CUDA_HOME, 'targets', 'x86_64-linux', 'include'),
+] + NVIDIA_INCLUDE_DIRS)
+CUDA_LIB_CANDIDATES = [
+    os.path.join(CUDA_HOME, 'lib64'),
+    os.path.join(CUDA_HOME, 'lib'),
+    os.path.join(CUDA_HOME, 'targets', 'x86_64-linux', 'lib'),
+] + NVIDIA_LIB_DIRS
+CUDA_LIB_DIRS = _existing_unique(CUDA_LIB_CANDIDATES)
+if not CUDA_LIB_DIRS:
+    CUDA_LIB_DIRS = [os.path.join(CUDA_HOME, 'lib64'), os.path.join(CUDA_HOME, 'lib')]
 
 # 通用编译参数
 COMMON_CXX_FLAGS = [
@@ -180,7 +235,8 @@ gpu_cluster_manager_sources = [
 gpu_cluster_manager_ext = CUDAExtension(
     name='library.AdaptiveIMI.cpp_extensions.gpu_cluster_manager_cpp',
     sources=gpu_cluster_manager_sources,
-    include_dirs=[str(HERE / 'include')] + TORCH_INCLUDE,
+    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
+    library_dirs=CUDA_LIB_DIRS,
     extra_compile_args={
         'cxx': COMMON_CXX_FLAGS,
         'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
@@ -200,8 +256,8 @@ ultra_layer_pipeline_sources = [
 ultra_layer_pipeline_ext = CppExtension(
     name='library.AdaptiveIMI.cpp_extensions.ultra_layer_pipeline_cpp',
     sources=ultra_layer_pipeline_sources,
-    include_dirs=[str(HERE / 'include'), CUDA_INCLUDE] + TORCH_INCLUDE,
-    library_dirs=[CUDA_LIB],
+    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
+    library_dirs=CUDA_LIB_DIRS,
     libraries=['cudart'],
     extra_compile_args={
         'cxx': COMMON_CXX_FLAGS,
@@ -215,7 +271,7 @@ ultra_layer_pipeline_ext = CppExtension(
 adpimi_index_ext = CppExtension(
     name='library.AdaptiveIMI.cpp_extensions.AdpIMI_Index',
     sources=[str(HERE / 'src' / 'wave_buffer_cpu_hotcold.cpp')],
-    include_dirs=[str(HERE / 'include'), CUDA_INCLUDE] + TORCH_INCLUDE,
+    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
     extra_compile_args={
         'cxx': COMMON_CXX_FLAGS,
     },
@@ -229,7 +285,8 @@ adpimi_index_ext = CppExtension(
 copy_ext = CUDAExtension(
     name='library.AdaptiveIMI.cpp_extensions.Copy',
     sources=[str(HERE / 'cuda' / 'gather_copy.cu')],
-    include_dirs=[str(HERE / 'include'), CUDA_INCLUDE] + TORCH_INCLUDE,
+    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
+    library_dirs=CUDA_LIB_DIRS,
     extra_compile_args={
         'cxx': COMMON_CXX_FLAGS,
         'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
@@ -248,8 +305,28 @@ gemm_softmax_ext = CUDAExtension(
         str(CUTLASS_DIR / 'include'),
         str(CUTLASS_DIR / 'examples' / 'common'),
         str(CUTLASS_DIR / 'tools' / 'util' / 'include'),
-        CUDA_INCLUDE,
-    ] + TORCH_INCLUDE,
+    ] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
+    library_dirs=CUDA_LIB_DIRS,
+    extra_compile_args={
+        'cxx': COMMON_CXX_FLAGS,
+        'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
+    },
+    extra_link_args=['-lcuda', '-lcudart'],
+)
+
+# ============================================================================
+# 模块 6: hybrid_8way_builder_cpp (CUDA)
+# ============================================================================
+hybrid_8way_builder_sources = [
+    str(HERE / 'src' / 'hybrid_8way_bindings.cpp'),
+    str(HERE / 'cuda' / 'hybrid_8way_builder.cu'),
+]
+
+hybrid_8way_builder_ext = CUDAExtension(
+    name='library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp',
+    sources=hybrid_8way_builder_sources,
+    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
+    library_dirs=CUDA_LIB_DIRS,
     extra_compile_args={
         'cxx': COMMON_CXX_FLAGS,
         'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
@@ -272,6 +349,7 @@ setup(
         adpimi_index_ext,
         copy_ext,
         gemm_softmax_ext,
+        hybrid_8way_builder_ext,
     ],
     cmdclass={
         'build_ext': BuildExtension,

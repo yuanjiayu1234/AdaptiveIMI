@@ -175,10 +175,56 @@ def iter_scope_keys(
     num_layers, num_heads, _, _ = keys_lhtd.shape
     scope = scope.lower()
 
+    if scope == "global":
+        values = keys_lhtd.reshape(-1, keys_lhtd.size(-1))
+        yield (
+            "global",
+            values,
+            {
+                "layer_start": 0,
+                "layer_end": int(num_layers),
+                "head_count": int(num_heads),
+                "scope_kind": "global",
+            },
+        )
+        return
+
+    if scope == "layer_group":
+        for group_idx, (start, end) in enumerate(layer_groups(num_layers, group_count)):
+            values = keys_lhtd[start:end, :, :, :].reshape(-1, keys_lhtd.size(-1))
+            yield (
+                f"layer_group{group_idx}_layers{start}-{end - 1}",
+                values,
+                {
+                    "layer_group": int(group_idx),
+                    "layer_start": int(start),
+                    "layer_end": int(end),
+                    "head_count": int(num_heads),
+                    "scope_kind": "layer_group",
+                },
+            )
+        return
+
+    if scope == "layer":
+        for layer in range(num_layers):
+            values = keys_lhtd[layer, :, :, :].reshape(-1, keys_lhtd.size(-1))
+            yield (
+                f"layer{layer}",
+                values,
+                {
+                    "layer": int(layer),
+                    "layer_start": int(layer),
+                    "layer_end": int(layer + 1),
+                    "head_count": int(num_heads),
+                    "scope_kind": "layer",
+                },
+            )
+        return
+
     if scope == "global_head":
         for head in range(num_heads):
             values = keys_lhtd[:, head, :, :].reshape(-1, keys_lhtd.size(-1))
-            yield f"global_head{head}", values, {"head": int(head), "layer_group": -1}
+            yield f"global_head{head}", values, {"head": int(head), "layer_group": -1, "scope_kind": "global_head"}
         return
 
     if scope == "layer_group_head":
@@ -193,6 +239,7 @@ def iter_scope_keys(
                         "layer_group": int(group_idx),
                         "layer_start": int(start),
                         "layer_end": int(end),
+                        "scope_kind": "layer_group_head",
                     },
                 )
         return
@@ -203,9 +250,8 @@ def iter_scope_keys(
                 yield (
                     f"layer{layer}_head{head}",
                     keys_lhtd[layer, head, :, :],
-                    {"head": int(head), "layer": int(layer), "layer_group": -1},
+                    {"head": int(head), "layer": int(layer), "layer_group": -1, "scope_kind": "layer_head"},
                 )
         return
 
-    raise ValueError("scope must be one of: global_head, layer_group_head, layer_head")
-
+    raise ValueError("scope must be one of: global, layer_group, layer, global_head, layer_group_head, layer_head")

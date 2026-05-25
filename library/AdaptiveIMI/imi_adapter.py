@@ -4,10 +4,11 @@ from dataclasses import dataclass, field
 import ctypes
 import importlib.util
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import json
 import os
 import sys
+import time
 
 import torch
 
@@ -36,7 +37,10 @@ def _preload_extension_dependencies() -> None:
     if torch_lib_dir.exists():
         candidate_dirs.append(torch_lib_dir)
 
-    cuda_runtime_spec = importlib.util.find_spec("nvidia.cuda_runtime")
+    try:
+        cuda_runtime_spec = importlib.util.find_spec("nvidia.cuda_runtime")
+    except ModuleNotFoundError:
+        cuda_runtime_spec = None
     if cuda_runtime_spec and cuda_runtime_spec.submodule_search_locations:
         for location in cuda_runtime_spec.submodule_search_locations:
             runtime_dir = Path(location) / "lib"
@@ -85,39 +89,16 @@ else:
     _pipeline_import_error = None
 
 
-class _TorchIMIKernels:
-    @staticmethod
-    def fused_query_group_similarities(
-        query_grouped: torch.Tensor,
-        centroids: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if query_grouped.dim() != 3 or centroids.dim() != 3:
-            raise ValueError("query_grouped and centroids must be 3D tensors")
-        if query_grouped.size(0) != centroids.size(0):
-            raise ValueError("kv_heads mismatch between query_grouped and centroids")
-        if query_grouped.size(2) != centroids.size(2):
-            raise ValueError("head_dim mismatch between query_grouped and centroids")
-
-        aggregated = query_grouped.float().sum(dim=1)
-        similarities = torch.einsum("hd,hnd->hn", aggregated, centroids.float())
-
-        if out is None:
-            return similarities
-
-        kv_heads, n_clusters = similarities.shape
-        out_slice = out.narrow(0, 0, kv_heads).narrow(1, 0, n_clusters)
-        out_slice.copy_(similarities)
-        return out_slice
-
-
 def get_imi_kernels():
     try:
         from library.AdaptiveIMI.cpp_extensions import gpu_cluster_manager_cpp as imi_gpu_kernels
 
         return imi_gpu_kernels
-    except Exception:  # pragma: no cover - fallback when kernels unavailable
-        return _TorchIMIKernels()
+    except Exception as exc:  # pragma: no cover - extension availability is environment-dependent
+        raise RuntimeError(
+            "gpu_cluster_manager_cpp is required; PyTorch kernel fallback has been removed. "
+            "Build library/AdaptiveIMI/cpp_extensions before running AdaptiveIMI."
+        ) from exc
 
 
 @dataclass
@@ -137,11 +118,13 @@ class IMIPipeline:
     subspace_parts: int = 2
     runtime_config: IMIRuntimeConfig = field(default_factory=IMIRuntimeConfig)
     enable_direct_write: bool = True
+    learned_partition: Optional[Dict[str, object]] = None
 
     def __post_init__(self) -> None:
         self._pipeline = None
         self._batch_allocate_cpu_buffer_callback = None
         self._last_pipeline_stats: Optional[Dict[str, object]] = None
+        self._last_search_metadata_cpu: Optional[Dict[str, torch.Tensor]] = None
 
     def _get_pipeline(self):
         if _pipeline_cpp is None:
@@ -149,6 +132,12 @@ class IMIPipeline:
                 "ultra_layer_pipeline_cpp is required for IMI indexing"
             ) from _pipeline_import_error
         if self._pipeline is None:
+            runtime_config = {
+                "pipeline": dict(self.runtime_config.pipeline),
+                "kmeans": dict(self.runtime_config.kmeans),
+            }
+            if self.learned_partition is not None:
+                runtime_config["learned_partition"] = dict(self.learned_partition)
             self._pipeline = _pipeline_cpp.LayerPipeline(
                 layer_idx=self.layer_idx,
                 kv_heads=self.kv_heads,
@@ -159,10 +148,7 @@ class IMIPipeline:
                 cache_manager_ptr=None,
                 enable_direct_write=self.enable_direct_write,
                 subspace_parts=self.subspace_parts,
-                runtime_config={
-                    "pipeline": dict(self.runtime_config.pipeline),
-                    "kmeans": dict(self.runtime_config.kmeans),
-                },
+                runtime_config=runtime_config,
             )
             if self._batch_allocate_cpu_buffer_callback is not None:
                 self._pipeline.set_batch_allocate_cpu_buffer_callback(
@@ -192,8 +178,23 @@ class IMIPipeline:
             self._pipeline = None
 
     def set_worker_threads(self, worker_threads: int) -> None:
+        worker_threads = max(1, int(worker_threads))
+        self.runtime_config.pipeline["worker_threads"] = worker_threads
+        if self._pipeline is not None:
+            self._pipeline.set_worker_threads(worker_threads)
+
+    def wait_transfers_done(self, timeout_sec: float = 60.0) -> None:
         pipeline = self._get_pipeline()
-        pipeline.set_worker_threads(int(worker_threads))
+        deadline = time.monotonic() + float(timeout_sec)
+        failed = _pipeline_cpp.PipelineStage.Failed
+        while True:
+            if pipeline.current_stage() == failed:
+                raise RuntimeError(pipeline.error_message() or "IMI pipeline failed during transfer")
+            if pipeline.transfers_finished():
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("IMI pipeline transfer did not finish in time")
+            time.sleep(0.001)
 
     def build_index(
         self,
@@ -280,6 +281,41 @@ class IMIPipeline:
         ):
             raise RuntimeError("IMI pipeline failed to submit chunk")
 
+    def submit_index_stream_raw_sequence_chunk(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        chunk_id: int,
+        source_token: int,
+        token_offset: int,
+        chunk_len: int,
+        is_last: bool,
+    ) -> None:
+        if key_states.dim() != 4 or value_states.dim() != 4:
+            raise ValueError("raw key_states/value_states must be [1, seq_len, kv_heads, head_dim]")
+        if key_states.size(0) != 1 or value_states.size(0) != 1:
+            raise ValueError("IMI pipeline supports batch_size=1")
+        if key_states.size() != value_states.size():
+            raise ValueError("raw key_states and value_states must share the same shape")
+        if key_states.size(2) != self.kv_heads:
+            raise ValueError("kv_heads mismatch in raw IMI pipeline chunk")
+        if source_token < 0 or chunk_len <= 0 or source_token + chunk_len > int(key_states.size(1)):
+            raise ValueError("invalid raw source token range")
+        if token_offset < 0:
+            raise ValueError("token_offset must be non-negative")
+
+        pipeline = self._get_pipeline()
+        if not pipeline.submit_raw_sequence_chunk(
+            key_states,
+            value_states,
+            chunk_id,
+            source_token,
+            token_offset,
+            chunk_len,
+            is_last,
+        ):
+            raise RuntimeError("IMI pipeline failed to submit raw sequence chunk")
+
 
     def finish_index(
         self,
@@ -316,31 +352,22 @@ class IMIPipeline:
             print(json.dumps(stats_payload, ensure_ascii=False), flush=True)
 
         metadata = pipeline.get_metadata_result()
-        if os.getenv("IMI_DEBUG_INDEX_METADATA", "0") == "1":
-            cluster_counts = metadata.get("cluster_counts")
-            head_indices = metadata.get("head_indices")
-            if cluster_counts is not None and head_indices is not None:
-                cc = cluster_counts.to(dtype=torch.int64, device="cpu")
-                hi = head_indices.to(dtype=torch.int64, device="cpu")
-                nonzero_heads = int((cc > 0).sum().item())
-                total_clusters = int(cc.sum().item())
-                max_clusters = int(cc.max().item()) if cc.numel() else 0
-                min_clusters = int(cc.min().item()) if cc.numel() else 0
-                sample_counts = cc[: min(8, cc.numel())].tolist()
-                sample_heads = hi[: min(8, hi.numel())].tolist()
-                print(
-                    json.dumps({
-                        "tag": "IMI_META_FINISH",
-                        "layer_idx": int(self.layer_idx),
-                        "nonzero_heads": nonzero_heads,
-                        "total_clusters": total_clusters,
-                        "min_clusters": min_clusters,
-                        "max_clusters": max_clusters,
-                        "sample_heads": sample_heads,
-                        "sample_cluster_counts": sample_counts,
-                    }, ensure_ascii=False),
-                    flush=True,
-                )
+        search_keys = (
+            "subspace_centroids",
+            "subspace_centroid_masks",
+            "subspace_dim_ids",
+            "subspace_dim_masks",
+            "compact_codes",
+            "token_ids_by_cluster",
+            "cluster_sizes",
+            "cluster_offsets",
+            "cluster_counts",
+        )
+        self._last_search_metadata_cpu = {
+            key: metadata[key]
+            for key in search_keys
+            if key in metadata and torch.is_tensor(metadata[key])
+        }
         if not self.enable_direct_write:
             reorganized = pipeline.get_reorganize_results()
             for head_idx, head_reorg in enumerate(reorganized):
@@ -355,6 +382,15 @@ class IMIPipeline:
         if self._last_pipeline_stats is None:
             return None
         return dict(self._last_pipeline_stats)
+
+    def get_last_search_metadata_cpu(self) -> Optional[Dict[str, torch.Tensor]]:
+        if self._last_search_metadata_cpu is None:
+            return None
+        return dict(self._last_search_metadata_cpu)
+
+    def get_kmeans_result(self) -> Dict[str, object]:
+        pipeline = self._get_pipeline()
+        return dict(pipeline.get_kmeans_result())
 
     def build_index_chunked(
         self,
@@ -382,7 +418,7 @@ class IMIPipeline:
         middle_start: int,
         middle_end: int,
         chunk_size: int,
-    ) -> List[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> None:
         if key_states.dim() != 4 or value_states.dim() != 4:
             raise ValueError("key_states/value_states must be [1, seq_len, kv_heads, head_dim]")
         if key_states.size(0) != 1 or value_states.size(0) != 1:
@@ -402,56 +438,27 @@ class IMIPipeline:
                 f"token_count({token_count}) exceeds max_tokens({self.max_tokens})"
             )
 
-        if chunk_size <= 0 or chunk_size >= token_count:
-            middle_keys, middle_values = self._prepare_pipeline_chunk(
-                key_states,
-                value_states,
-                middle_start,
-                middle_end,
-            )
-            self.start_index(middle_keys, middle_values)
-            return [(middle_keys, middle_values)]
+        submit_chunk_size = token_count if chunk_size <= 0 else int(chunk_size)
+        self.begin_index_stream(token_count, submit_chunk_size)
 
-        pipeline = self._get_pipeline()
-        self.begin_index_stream(token_count, chunk_size)
-
-        chunk_refs: List[tuple[torch.Tensor, torch.Tensor]] = []
         chunk_id = 0
         token_offset = 0
-        for chunk_start in range(middle_start, middle_end, chunk_size):
-            chunk_end = min(middle_end, chunk_start + chunk_size)
+        for chunk_start in range(middle_start, middle_end, submit_chunk_size):
+            chunk_end = min(middle_end, chunk_start + submit_chunk_size)
             chunk_len = chunk_end - chunk_start
-            chunk_keys, chunk_values = self._prepare_pipeline_chunk(
+            self.submit_index_stream_raw_sequence_chunk(
                 key_states,
                 value_states,
-                chunk_start,
-                chunk_end,
-            )
-            is_last = chunk_end == middle_end
-            self.submit_index_stream_chunk(
-                chunk_keys,
-                chunk_values,
                 chunk_id=chunk_id,
+                source_token=chunk_start,
                 token_offset=token_offset,
-                is_last=is_last,
+                chunk_len=chunk_len,
+                is_last=chunk_end == middle_end,
             )
-            chunk_refs.append((chunk_keys, chunk_values))
             chunk_id += 1
             token_offset += chunk_len
 
         self._token_count = token_count
-        return chunk_refs
-
-    def _prepare_pipeline_chunk(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        start: int,
-        end: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        chunk_keys = key_states[:, start:end, :, :].transpose(1, 2).contiguous()
-        chunk_values = value_states[:, start:end, :, :].transpose(1, 2).contiguous()
-        return chunk_keys, chunk_values
 
     def _build_metadata_from_tensors(
         self,

@@ -12,6 +12,10 @@ MODEL_REGISTRY = {
         "path": os.path.join("models", "qwen2.5-7b"),
         "config_name": "Qwen2.5-7B-Instruct.json",
     },
+    "Qwen3-8B": {
+        "path": os.path.join("models", "qwen3-8b"),
+        "config_name": "Qwen3-8B.json",
+    },
     "Llama-3.1-8B-Instruct": {
         "path": os.path.join("models", "Llama-3.1-8B-Instruct"),
         "config_name": "Llama-3.1-8B-Instruct.json",
@@ -32,6 +36,16 @@ MODEL_PATH_ALIASES = {
         "local": os.path.join("models", "qwen2.5-7b"),
         "remote": "Qwen/Qwen2.5-7B-Instruct",
         "config": "Qwen2.5-7B-Instruct.json",
+    },
+    "qwen3-8b": {
+        "local": os.path.join("models", "qwen3-8b"),
+        "remote": "Qwen/Qwen3-8B",
+        "config": "Qwen3-8B.json",
+    },
+    "qwen/qwen3-8b": {
+        "local": os.path.join("models", "qwen3-8b"),
+        "remote": "Qwen/Qwen3-8B",
+        "config": "Qwen3-8B.json",
     },
     "qwen2.5-72b": {
         "local": None,
@@ -240,7 +254,8 @@ def _clone_attn_config_section(section):
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=0.018, cache_ratio=0.0,
-    gpu_only=False, subspace_parts=2
+    gpu_only=False, subspace_parts=2,
+    imi_engine=None, partition_path=None, hybrid_index=None, decode_search=None
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     model_config_name = resolve_config_name(model_name)
@@ -249,8 +264,13 @@ def generate_config(
         _config = json.load(f)
     
     if attn_type == "AdaptiveIMI":
-        if subspace_parts not in (0, 2, 4):
+        imi_engine = str(imi_engine or "").lower()
+        if imi_engine != "hybrid_8way_v2" and subspace_parts not in (0, 2, 4):
             raise ValueError("subspace_parts must be 0, 2 or 4")
+        if imi_engine == "hybrid_8way_v2":
+            subspace_parts = 8
+            if not partition_path:
+                raise ValueError("hybrid_8way_v2 requires partition_path or learned_partition_path")
 
         base_config = _clone_attn_config_section(_config.get("AdaptiveIMI"))
         if retrieval_budget is None:
@@ -264,6 +284,27 @@ def generate_config(
         base_config["cache_ratio"] = cache_ratio
         base_config["subspace_parts"] = subspace_parts
         base_config["gpu_only"] = gpu_only
+        if imi_engine:
+            base_config["engine"] = imi_engine
+        if partition_path:
+            base_config["partition_path"] = partition_path
+            base_config["learned_partition_path"] = partition_path
+        if hybrid_index is not None:
+            base_config["hybrid_index"] = hybrid_index
+        elif imi_engine == "hybrid_8way_v2":
+            hybrid_policy = os.getenv("IMI_HYBRID_INDEX_POLICY")
+            hybrid_start = os.getenv("IMI_HYBRID_INDEX_START", "cpu")
+            hybrid_gpu_every = os.getenv("IMI_HYBRID_INDEX_GPU_EVERY")
+            if not hybrid_policy:
+                hybrid_policy = "gpu_only" if gpu_only else "alternate"
+            base_config["hybrid_index"] = {
+                "policy": hybrid_policy,
+                "start": hybrid_start,
+            }
+            if hybrid_gpu_every:
+                base_config["hybrid_index"]["gpu_every"] = int(hybrid_gpu_every)
+        if decode_search is not None:
+            base_config["decode_search"] = decode_search
         if context_len <= 4096:
             base_config["buffer_cluster_num"] = 150
         _config["AdaptiveIMI"] = base_config

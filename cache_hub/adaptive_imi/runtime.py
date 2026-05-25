@@ -4,6 +4,8 @@ import time
 
 import torch
 
+from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
+
 
 class AdaptiveIMIRuntimeMixin:
     def capture_cuda_graph(self):
@@ -29,12 +31,29 @@ class AdaptiveIMIRuntimeMixin:
                 last_ts = now
 
         n_tokens = max(self.list_capacity, 1)
-        total_clusters = max(int(n_tokens / 16), 1)
-        if self.subspace_parts == 4:
+        if getattr(self, "learned_partition_enabled", False):
+            kmeans_cfg = self.runtime_config.get("kmeans") or {}
+            target_cluster_size = max(int(kmeans_cfg.get("target_cluster_size", kmeans_cfg.get("cluster_size", 16))), 1)
+            max_clusters = 1
+            for spec in getattr(self, "learned_partition_specs", []):
+                if spec is None:
+                    continue
+                m = max(int(spec.get("subspace_parts", 1)), 1)
+                k_values = choose_learned_k_values(
+                    spec,
+                    n_tokens,
+                    target_cluster_size,
+                    default_m=m,
+                )
+                product = product_k_values(k_values)
+                max_clusters = max(max_clusters, min(product, n_tokens))
+            self.n_centroids = int(max_clusters) + 1
+        elif self.subspace_parts == 4:
             total_clusters_f = max(n_tokens / 16.0, 1.0)
             k = max(int(round(total_clusters_f ** 0.25)), 2)
             self.n_centroids = k ** 4 + 1
         else:
+            total_clusters = max(int(n_tokens / 16), 1)
             k = max(int(math.sqrt(total_clusters)), 32)
             self.n_centroids = k * k + 1
         self.padding_cluster_id = self.n_centroids - 1

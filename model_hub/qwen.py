@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn.functional as F
 import flashinfer
-from transformers import AutoTokenizer, Qwen2ForCausalLM, Qwen2Config
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from .base import LLM
 from attn_hub import full_decode_attn, imi_decode_attn, \
                      full_prefill_attn, full_decode_attn_offload
@@ -25,12 +25,23 @@ class QwenLayer:
         self.wq = hf_qwen_layer.self_attn.q_proj.weight.detach()
         self.wk = hf_qwen_layer.self_attn.k_proj.weight.detach()
         self.wv = hf_qwen_layer.self_attn.v_proj.weight.detach()
-        self.bq = hf_qwen_layer.self_attn.q_proj.bias.detach()
-        self.bk = hf_qwen_layer.self_attn.k_proj.bias.detach()
-        self.bv = hf_qwen_layer.self_attn.v_proj.bias.detach()
+        self.bq = hf_qwen_layer.self_attn.q_proj.bias.detach() if hf_qwen_layer.self_attn.q_proj.bias is not None else torch.zeros(self.wq.size(0), dtype=self.wq.dtype)
+        self.bk = hf_qwen_layer.self_attn.k_proj.bias.detach() if hf_qwen_layer.self_attn.k_proj.bias is not None else torch.zeros(self.wk.size(0), dtype=self.wk.dtype)
+        self.bv = hf_qwen_layer.self_attn.v_proj.bias.detach() if hf_qwen_layer.self_attn.v_proj.bias is not None else torch.zeros(self.wv.size(0), dtype=self.wv.dtype)
         self.wqkv = torch.cat((self.wq, self.wk, self.wv), dim=0).to(self.device, non_blocking=True)
         self.bqkv = torch.cat((self.bq, self.bk, self.bv), dim=0).to(self.device, non_blocking=True)
         self.wo = hf_qwen_layer.self_attn.o_proj.weight.detach().to(self.device, non_blocking=True)
+        self.q_norm_weight = None
+        self.k_norm_weight = None
+        self.q_norm_variance_epsilon = None
+        self.k_norm_variance_epsilon = None
+        if hasattr(hf_qwen_layer.self_attn, "q_norm") and hasattr(hf_qwen_layer.self_attn, "k_norm"):
+            q_norm = hf_qwen_layer.self_attn.q_norm
+            k_norm = hf_qwen_layer.self_attn.k_norm
+            self.q_norm_weight = q_norm.weight.detach().to(self.device, non_blocking=True)
+            self.k_norm_weight = k_norm.weight.detach().to(self.device, non_blocking=True)
+            self.q_norm_variance_epsilon = getattr(q_norm, "variance_epsilon", getattr(q_norm, "eps", 1e-6))
+            self.k_norm_variance_epsilon = getattr(k_norm, "variance_epsilon", getattr(k_norm, "eps", 1e-6))
         
         self.gate_proj = hf_qwen_layer.mlp.gate_proj.weight.detach()
         self.up_proj = hf_qwen_layer.mlp.up_proj.weight.detach()
@@ -67,9 +78,9 @@ class QwenModel(LLM):
         self.model_path = self._resolve_model_path(model_path if model_path else model_name)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path) if tokenizer is None else tokenizer
-        self.config = Qwen2Config.from_pretrained(self.model_path)
+        self.config = AutoConfig.from_pretrained(self.model_path)
         self._populate_common_config_fields()
-        self.base = self.config.rope_theta
+        self.base = getattr(self.config, "rope_theta", None) or self.config.to_dict().get("rope_theta", 1000000)
         self.yarn_factor = 4         # # qwen2.5 use yarn in context length larger than 32768
         self.eos_tokens = [self.config.eos_token_id]
         self.init_model()
@@ -120,7 +131,7 @@ class QwenModel(LLM):
 
 
     def init_model(self):
-        hf_qwen = Qwen2ForCausalLM.from_pretrained(self.model_path, torch_dtype=self.dtype)
+        hf_qwen = AutoModelForCausalLM.from_pretrained(self.model_path, torch_dtype=self.dtype)
         root_device = self._configure_devices()
         self._initialize_shared_runtime_tensors(hf_qwen, root_device)
         self._initialize_layers(hf_qwen.model.layers, QwenLayer)
@@ -152,6 +163,26 @@ class QwenModel(LLM):
     def wqkv(self, hidden_states, layer):
         qkv = F.linear(hidden_states, layer.wqkv, layer.bqkv)
         query_states, key_states, value_states = qkv.split([self.hidden_size, self.hidden_size//self.num_key_value_groups, self.hidden_size//self.num_key_value_groups], dim=-1)
+        if layer.q_norm_weight is not None and layer.k_norm_weight is not None:
+            bsz, seq_len, _ = query_states.shape
+            query_states = query_states.reshape(bsz * seq_len * self.num_heads, self.head_dim)
+            key_states = key_states.reshape(bsz * seq_len * self.num_key_value_heads, self.head_dim)
+            query_states = flashinfer.rmsnorm(
+                query_states,
+                layer.q_norm_weight,
+                layer.q_norm_variance_epsilon,
+            )
+            key_states = flashinfer.rmsnorm(
+                key_states,
+                layer.k_norm_weight,
+                layer.k_norm_variance_epsilon,
+            )
+            query_states = query_states.view(bsz, seq_len, self.hidden_size)
+            key_states = key_states.view(
+                bsz,
+                seq_len,
+                self.hidden_size // self.num_key_value_groups,
+            )
         return query_states, key_states, value_states
 
     

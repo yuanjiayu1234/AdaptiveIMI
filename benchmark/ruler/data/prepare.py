@@ -50,6 +50,8 @@ except LookupError:
 Templates = {
     'base': "{task_template}",
 
+    'hf-chat': None,
+
     'meta-chat': "[INST] {task_template} [/INST]",
 
     'vicuna-chat': "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: {task_template} ASSISTANT:",
@@ -62,6 +64,23 @@ Templates = {
     
     'RWKV': "User: hi\n\nAssistant: Hi. I am your assistant and I will provide expert full response in full details. Please feel free to ask any question and I will always answer it\n\nUser: {task_template}\n\nAssistant:",
 }
+
+
+def apply_hf_chat_template(tokenizer_path: str, task_template: str) -> str:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=True,
+        local_files_only=os.path.exists(tokenizer_path),
+    )
+    if tokenizer.chat_template is None:
+        raise ValueError(f"Tokenizer at {tokenizer_path} does not define a chat_template")
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": task_template}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 
 def main(args):
@@ -85,12 +104,15 @@ def main(args):
 
     # Add templates
     assert args.model_template_type in Templates, print(f'{args.model_template_type} is not found in {Templates.keys()}')
-    model_template = Templates[args.model_template_type]    
     task_template = config['template']
 
     # Add answer prefix for all models
     answer_prefix = config['answer_prefix'] if 'answer_prefix' in config else ''
-    config['template'] = model_template.format(task_template=task_template) + answer_prefix
+    if args.model_template_type == 'hf-chat':
+        config['template'] = apply_hf_chat_template(args.tokenizer_path, task_template) + answer_prefix
+    else:
+        model_template = Templates[args.model_template_type]
+        config['template'] = model_template.format(task_template=task_template) + answer_prefix
 
     # Split task into multiple chunks 
     chunks = [(args.num_samples // args.chunk_amount) + (1 if i < args.num_samples % args.chunk_amount else 0) for i in range(args.chunk_amount)]

@@ -11,6 +11,7 @@
 #include <iostream>
 #include <iomanip>
 #include <atomic>  
+#include <unordered_set>
 #include <c10/core/ScalarType.h>
 
 namespace imi {
@@ -142,12 +143,14 @@ static void kmeans_plusplus_init_inplace(
     int32_t k,
     uint64_t seed,
     float* centroids,
-    std::vector<float>& min_dists
+    std::vector<float>& min_dists,
+    int32_t n_threads
 ) {
     if (min_dists.size() < static_cast<size_t>(n_samples)) {
         min_dists.resize(static_cast<size_t>(n_samples));
     }
     std::fill(min_dists.begin(), min_dists.begin() + n_samples, std::numeric_limits<float>::max());
+    const int32_t thread_count = std::max<int32_t>(1, n_threads);
 
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<int32_t> uniform_dist(0, n_samples - 1);
@@ -156,15 +159,13 @@ static void kmeans_plusplus_init_inplace(
     std::memcpy(&centroids[0], &data[first_idx * dim], dim * sizeof(float));
 
     for (int32_t c = 1; c < k; c++) {
+        double total_weight = 0.0;
+        #pragma omp parallel for num_threads(thread_count) reduction(+:total_weight) schedule(static)
         for (int32_t i = 0; i < n_samples; i++) {
             float dist = euclidean_distance_avx2(&data[i * dim], &centroids[(c - 1) * dim], dim);
             if (dist < min_dists[i]) {
                 min_dists[i] = dist;
             }
-        }
-
-        double total_weight = 0.0;
-        for (int32_t i = 0; i < n_samples; i++) {
             total_weight += min_dists[i];
         }
 
@@ -361,7 +362,7 @@ static void run_imi_single_phase_from_subvec(
 ) {
 
     kmeans_plusplus_init_inplace(
-        subvec, n_tokens, dim_half, k, seed, out_centroids, min_dists
+        subvec, n_tokens, dim_half, k, seed, out_centroids, min_dists, lloyd_threads
     );
 
     float inertia = 0.0f;
@@ -552,7 +553,8 @@ public:
                 k,
                 /*seed=*/42,
                 result->per_head_centroids1[head].data(),
-                min_dists
+                min_dists,
+                threads_per_phase
             );
 
             float inertia = 0.0f;
@@ -765,6 +767,154 @@ public:
                 }
             }
             result->per_head_n_clusters[head] = active_count;
+        }
+
+        return result;
+    }
+};
+
+class KmeansExecutorM {
+public:
+    static std::unique_ptr<KmeansResult> execute(
+        const float* keys_fp32,     // [kv_heads, n_tokens, dim] or [n_tokens, kv_heads, dim]
+        int32_t kv_heads,
+        int32_t n_tokens,
+        int32_t dim,
+        const std::vector<int32_t>& k_values,
+        const std::vector<std::vector<std::vector<int32_t>>>& head_pair_groups,
+        int32_t worker_threads = 12,
+        int32_t min_threads_per_phase = 1,
+        const LloydRuntimeConfig& runtime_cfg = LloydRuntimeConfig(),
+        bool sequence_major = false
+    ) {
+        if (dim % 2 != 0) {
+            throw std::invalid_argument("KmeansExecutorM requires even head dim");
+        }
+        if (static_cast<int32_t>(head_pair_groups.size()) != kv_heads) {
+            throw std::invalid_argument("learned partition head count must match kv_heads");
+        }
+        if (head_pair_groups.empty() || head_pair_groups[0].empty()) {
+            throw std::invalid_argument("learned partition must contain at least one subspace");
+        }
+
+        const int32_t stages = static_cast<int32_t>(head_pair_groups[0].size());
+        if (stages <= 0) {
+            throw std::invalid_argument("learned partition stage count must be positive");
+        }
+        if (k_values.empty() || static_cast<int32_t>(k_values.size()) != stages) {
+            throw std::invalid_argument("learned k_values length must match subspace count");
+        }
+
+        const int32_t half = dim / 2;
+        for (int32_t head = 0; head < kv_heads; ++head) {
+            if (static_cast<int32_t>(head_pair_groups[head].size()) != stages) {
+                throw std::invalid_argument("all heads must use the same learned subspace count");
+            }
+            std::vector<uint8_t> seen(half, 0);
+            int32_t covered = 0;
+            for (int32_t stage = 0; stage < stages; ++stage) {
+                const auto& group = head_pair_groups[head][stage];
+                if (group.empty()) {
+                    throw std::invalid_argument("learned partition contains an empty subspace");
+                }
+                for (int32_t pair : group) {
+                    if (pair < 0 || pair >= half) {
+                        throw std::invalid_argument("learned partition pair index out of range");
+                    }
+                    if (seen[pair]) {
+                        throw std::invalid_argument("learned partition pair index appears more than once");
+                    }
+                    seen[pair] = 1;
+                    ++covered;
+                }
+            }
+            if (covered != half) {
+                throw std::invalid_argument("learned partition must cover every RoPE pair exactly once");
+            }
+        }
+
+        auto result = std::make_unique<KmeansResult>();
+        result->kv_heads = kv_heads;
+        result->n_tokens = n_tokens;
+        result->dim = dim;
+        result->subspace_parts = stages;
+
+        result->per_head_labels_m.resize(kv_heads);
+        result->per_head_centroids_m.resize(kv_heads);
+        result->per_head_subspace_dims.resize(kv_heads);
+        result->per_head_n_clusters.assign(kv_heads, 0);
+
+        const int32_t total_tasks = kv_heads * stages;
+        std::vector<std::vector<float>> subvecs(total_tasks);
+        std::vector<std::vector<float>> min_dists_per_task(total_tasks);
+
+        for (int32_t head = 0; head < kv_heads; ++head) {
+            result->per_head_labels_m[head].resize(stages);
+            result->per_head_centroids_m[head].resize(stages);
+            result->per_head_subspace_dims[head].resize(stages);
+            for (int32_t stage = 0; stage < stages; ++stage) {
+                const int32_t task = head * stages + stage;
+                const int32_t sub_dim = static_cast<int32_t>(head_pair_groups[head][stage].size()) * 2;
+                const int32_t k = k_values[stage];
+                if (k <= 0) {
+                    throw std::invalid_argument("learned k_values must be positive");
+                }
+                result->per_head_subspace_dims[head][stage] = sub_dim;
+                result->per_head_labels_m[head][stage].resize(n_tokens);
+                result->per_head_centroids_m[head][stage].resize(static_cast<size_t>(k) * sub_dim);
+                subvecs[task].resize(static_cast<size_t>(n_tokens) * sub_dim);
+                min_dists_per_task[task].resize(n_tokens);
+            }
+        }
+
+        int32_t available_threads = std::max<int32_t>(1, worker_threads);
+        int32_t extract_threads = std::max<int32_t>(1, std::min(available_threads, total_tasks));
+        #pragma omp parallel for num_threads(extract_threads) schedule(static)
+        for (int32_t task = 0; task < total_tasks; ++task) {
+            const int32_t head = task / stages;
+            const int32_t stage = task % stages;
+            const auto& pairs = head_pair_groups[head][stage];
+            const int32_t sub_dim = static_cast<int32_t>(pairs.size()) * 2;
+            auto& subvec = subvecs[task];
+            for (int32_t token = 0; token < n_tokens; ++token) {
+                const float* src = sequence_major
+                    ? keys_fp32 + (static_cast<size_t>(token) * kv_heads + head) * dim
+                    : keys_fp32 + (static_cast<size_t>(head) * n_tokens + token) * dim;
+                float* dst = subvec.data() + static_cast<size_t>(token) * sub_dim;
+                int32_t offset = 0;
+                for (int32_t pair : pairs) {
+                    dst[offset++] = src[pair];
+                    dst[offset++] = src[pair + half];
+                }
+            }
+        }
+
+        int32_t min_threads = std::max<int32_t>(1, std::min(min_threads_per_phase, available_threads));
+        int32_t max_concurrent_phases = std::max<int32_t>(
+            1,
+            std::min(total_tasks, available_threads / min_threads)
+        );
+        int32_t threads_per_phase = std::max<int32_t>(1, available_threads / max_concurrent_phases);
+        threads_per_phase = std::max<int32_t>(threads_per_phase, min_threads);
+
+        #pragma omp parallel for num_threads(max_concurrent_phases) schedule(dynamic, 1)
+        for (int32_t task = 0; task < total_tasks; ++task) {
+            const int32_t head = task / stages;
+            const int32_t stage = task % stages;
+            const int32_t sub_dim = result->per_head_subspace_dims[head][stage];
+            const int32_t k = k_values[stage];
+            run_imi_single_phase_from_subvec(
+                subvecs[task].data(),
+                n_tokens,
+                sub_dim,
+                k,
+                static_cast<uint64_t>(42 + stage),
+                result->per_head_labels_m[head][stage].data(),
+                result->per_head_centroids_m[head][stage].data(),
+                threads_per_phase,
+                runtime_cfg,
+                min_dists_per_task[task]
+            );
         }
 
         return result;
@@ -1057,6 +1207,123 @@ std::unique_ptr<KmeansResult> kmeans_execute_4(
     );
 
     return result;
+}
+
+std::unique_ptr<KmeansResult> kmeans_execute_m(
+    const void* keys_data,       // 16-bit data (FP16/BF16)
+    int32_t kv_heads,
+    int32_t n_tokens,
+    int32_t dim,
+    const std::vector<int32_t>& k_values,
+    const std::vector<std::vector<std::vector<int32_t>>>& head_pair_groups,
+    torch::Dtype kv_dtype,
+    int32_t worker_threads,
+    const LayerPipelineRuntimeConfig& runtime_config,
+    bool sequence_major
+) {
+    size_t total_elements = static_cast<size_t>(kv_heads) * n_tokens * dim;
+    size_t element_size = c10::elementSize(kv_dtype);
+    if (element_size != 2) {
+        throw std::invalid_argument("kmeans_execute_m only supports 16-bit inputs (fp16/bf16)");
+    }
+
+    if (kv_dtype != torch::kFloat16 && kv_dtype != torch::kBFloat16) {
+        throw std::invalid_argument("kmeans_execute_m expects torch.float16 or torch.bfloat16 inputs");
+    }
+
+    const uint16_t* keys_u16 = static_cast<const uint16_t*>(keys_data);
+    KmeansConcurrencyGuard guard(g_active_kmeans);
+    int min_threads_per_phase = runtime_config.enable_omp_nested
+        ? runtime_config.min_threads_per_phase
+        : 1;
+    int effective_threads = worker_threads;
+    int effective_min_threads = min_threads_per_phase;
+    compute_kmeans_thread_budget(
+        worker_threads,
+        guard.active(),
+        min_threads_per_phase,
+        effective_threads,
+        effective_min_threads
+    );
+    log_kmeans_active(
+        guard.active(),
+        worker_threads,
+        effective_threads,
+        effective_min_threads,
+        kv_heads,
+        n_tokens
+    );
+
+    struct AlignedFloatBuffer {
+        float* data = nullptr;
+        size_t capacity = 0;
+
+        ~AlignedFloatBuffer() {
+            if (data) {
+                free(data);
+            }
+        }
+
+        void ensure(size_t count) {
+            if (count <= capacity) {
+                return;
+            }
+            if (data) {
+                free(data);
+                data = nullptr;
+            }
+            size_t bytes = count * sizeof(float);
+            size_t aligned_bytes = ((bytes + 63) / 64) * 64;
+            data = static_cast<float*>(aligned_alloc(64, aligned_bytes));
+            if (!data) {
+                throw std::runtime_error("Failed to allocate FP32 buffer for learned M-way K-means");
+            }
+            capacity = aligned_bytes / sizeof(float);
+        }
+    };
+
+    static thread_local AlignedFloatBuffer keys_fp32_buffer;
+    keys_fp32_buffer.ensure(total_elements);
+    float* keys_fp32 = keys_fp32_buffer.data;
+
+    size_t chunk_elems = std::max<size_t>(1, static_cast<size_t>(runtime_config.fp32_convert_chunk_elems));
+    chunk_elems = std::min(chunk_elems, total_elements);
+    const size_t num_chunks = (total_elements + chunk_elems - 1) / chunk_elems;
+
+    if (kv_dtype == torch::kFloat16) {
+        #pragma omp parallel for num_threads(effective_threads) schedule(static)
+        for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+            const size_t start = chunk_idx * chunk_elems;
+            const size_t end = std::min(total_elements, start + chunk_elems);
+            for (size_t i = start; i < end; ++i) {
+                keys_fp32[i] = fp16_to_fp32(keys_u16[i]);
+            }
+        }
+    } else {
+        #pragma omp parallel for num_threads(effective_threads) schedule(static)
+        for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+            const size_t start = chunk_idx * chunk_elems;
+            const size_t end = std::min(total_elements, start + chunk_elems);
+            for (size_t i = start; i < end; ++i) {
+                keys_fp32[i] = bf16_to_fp32(keys_u16[i]);
+            }
+        }
+    }
+
+    auto runtime_cfg = load_lloyd_runtime_config(runtime_config);
+
+    return KmeansExecutorM::execute(
+        keys_fp32,
+        kv_heads,
+        n_tokens,
+        dim,
+        k_values,
+        head_pair_groups,
+        effective_threads,
+        effective_min_threads,
+        runtime_cfg,
+        sequence_major
+    );
 }
 
 std::unique_ptr<KmeansResult> kmeans_execute_ivf(

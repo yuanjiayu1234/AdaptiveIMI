@@ -6,27 +6,38 @@ import torch
 
 class PrefillMixin:
     def _get_prefill_prefix_kv_workspace(self, device: str, bsz: int, seq_len: int):
-        workspace = self._prefill_prefix_kv_workspace.get(device)
-        needs_alloc = (
-            workspace is None
-            or int(workspace["batch_size"]) < int(bsz)
-            or int(workspace["seq_len"]) < int(seq_len)
-        )
+        pool = self._prefill_prefix_kv_workspace.get(device)
+        if pool is None:
+            pool = []
+            self._prefill_prefix_kv_workspace[device] = pool
+        elif isinstance(pool, dict):
+            pool = [pool]
+            self._prefill_prefix_kv_workspace[device] = pool
 
-        if needs_alloc:
-            key_buffer = torch.empty(
-                (bsz, seq_len, self.num_key_value_heads, self.head_dim),
-                dtype=self.dtype,
-                device=device,
-            )
-            value_buffer = torch.empty_like(key_buffer)
-            workspace = {
-                "batch_size": int(bsz),
-                "seq_len": int(seq_len),
-                "key": key_buffer,
-                "value": value_buffer,
-            }
-            self._prefill_prefix_kv_workspace[device] = workspace
+        kv_cache = getattr(self, "kv_cache", None)
+        available = getattr(kv_cache, "prefill_kv_workspace_available", None)
+        for workspace in pool:
+            if int(workspace["batch_size"]) < int(bsz) or int(workspace["seq_len"]) < int(seq_len):
+                continue
+            if available is not None and not available(workspace["key"], workspace["value"]):
+                continue
+            key_states = workspace["key"][:bsz, :seq_len, :, :]
+            value_states = workspace["value"][:bsz, :seq_len, :, :]
+            return key_states, value_states
+
+        key_buffer = torch.empty(
+            (bsz, seq_len, self.num_key_value_heads, self.head_dim),
+            dtype=self.dtype,
+            device=device,
+        )
+        value_buffer = torch.empty_like(key_buffer)
+        workspace = {
+            "batch_size": int(bsz),
+            "seq_len": int(seq_len),
+            "key": key_buffer,
+            "value": value_buffer,
+        }
+        pool.append(workspace)
 
         key_states = workspace["key"][:bsz, :seq_len, :, :]
         value_states = workspace["value"][:bsz, :seq_len, :, :]
@@ -113,6 +124,7 @@ class PrefillMixin:
         chunk_end,
         layer,
         layer_idx,
+        start_bdx,
         key_states,
         value_states,
     ):
@@ -120,7 +132,7 @@ class PrefillMixin:
         device = layer.device
         chunk_len = chunk_end - chunk_start
 
-        hidden_chunk = hidden_cpu[:, chunk_start:chunk_end, :].to(device, non_blocking=False)
+        hidden_chunk = hidden_cpu[:, chunk_start:chunk_end, :].to(device, non_blocking=True)
 
         pre_attn_total_start = self._start_prefill_gpu_segment()
         temp_hidden_states = self.layernorm(
@@ -141,6 +153,20 @@ class PrefillMixin:
 
         key_states[:, chunk_start:chunk_end, :, :].copy_(key_chunk)
         value_states[:, chunk_start:chunk_end, :, :].copy_(value_chunk)
+        kv_cache = getattr(self, "kv_cache", None)
+        if (
+            kv_cache is not None
+            and hasattr(kv_cache, "prefill_submit_kv_chunk")
+            and not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI")
+        ):
+            kv_cache.prefill_submit_kv_chunk(
+                key_states,
+                value_states,
+                layer_idx,
+                start_bdx,
+                chunk_start,
+                chunk_end,
+            )
         self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
 
         return hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk
@@ -227,7 +253,7 @@ class PrefillMixin:
         hidden_chunk = hidden_chunk + mlp_out
         self._finish_prefill_gpu_total_segment(layer_idx, post_attn_total_start)
 
-        output_cpu[:, chunk_start:chunk_end, :].copy_(hidden_chunk, non_blocking=False)
+        output_cpu[:, chunk_start:chunk_end, :].copy_(hidden_chunk, non_blocking=True)
         del hidden_chunk, hidden_states_norm, mlp_out, temp_hidden_states, query_chunk, key_chunk, value_chunk
     def layer_prefill_chunked(self, layer_idx, start_bdx, hidden_cpu, output_cpu, seq_len, chunk_size):
         bsz = hidden_cpu.shape[0]
@@ -257,6 +283,7 @@ class PrefillMixin:
                 chunk_end,
                 layer,
                 layer_idx,
+                start_bdx,
                 key_states,
                 value_states,
             )
@@ -295,36 +322,34 @@ class PrefillMixin:
         del key_states, value_states
 
         self._flush_prefill_gpu_layer_events(layer_idx)
-        torch.cuda.synchronize(device)
         self._log_streaming_progress(f"[IMI STREAM] layer={layer_idx} phase=done")
     def prefill_forward_chunked(self, inputs_ids):
         self._reset_prefill_gpu_profile()
         bsz, seq_len = inputs_ids.shape
         device = self.layers[0].device
         chunk_size = max(int(self.prefill_attn_chunk_size), 1)
-        pin_hidden = self._should_pin_streaming_hidden(bsz, seq_len)
+        keep_hidden_gpu = self._should_keep_streaming_hidden_on_gpu(device, bsz, seq_len)
+        pin_hidden = False if keep_hidden_gpu else self._should_pin_streaming_hidden(bsz, seq_len)
+        hidden_device = device if keep_hidden_gpu else "cpu"
 
         self._log_streaming_progress(
-            f"[IMI STREAM] prefill_start seq_len={seq_len} chunk_size={chunk_size} pin_hidden={int(pin_hidden)}"
+            f"[IMI STREAM] prefill_start seq_len={seq_len} chunk_size={chunk_size} hidden_device={hidden_device} pin_hidden={int(pin_hidden)}"
         )
 
-        hidden_cpu = torch.empty(
-            (bsz, seq_len, self.hidden_size),
-            dtype=self.dtype,
-            pin_memory=pin_hidden,
-        )
-        next_cpu = torch.empty(
-            (bsz, seq_len, self.hidden_size),
-            dtype=self.dtype,
-            pin_memory=pin_hidden,
-        )
+        hidden_kwargs = {
+            "dtype": self.dtype,
+            "device": hidden_device,
+        }
+        if not keep_hidden_gpu:
+            hidden_kwargs["pin_memory"] = pin_hidden
+        hidden_cpu = torch.empty((bsz, seq_len, self.hidden_size), **hidden_kwargs)
+        next_cpu = torch.empty_like(hidden_cpu)
 
         for chunk_start in range(0, seq_len, chunk_size):
             chunk_end = min(seq_len, chunk_start + chunk_size)
             ids_chunk = inputs_ids[:, chunk_start:chunk_end].to(device, non_blocking=True)
             embed_chunk = self.word_embedding(ids_chunk)
-            hidden_cpu[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=False)
-        torch.cuda.synchronize(device)
+            hidden_cpu[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=True)
         self._log_streaming_progress("[IMI STREAM] embedding_done")
 
         for ldx in range(self.num_layers):
@@ -337,7 +362,7 @@ class PrefillMixin:
 
         self._log_streaming_progress("[IMI STREAM] all_layers_done")
 
-        last_hidden = hidden_cpu[:, -1:, :].to(device, non_blocking=False)
+        last_hidden = hidden_cpu[:, -1:, :].to(device, non_blocking=True)
         last_hidden = self.layernorm(last_hidden, self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(last_hidden)
         return logits

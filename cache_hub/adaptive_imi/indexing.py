@@ -1,5 +1,6 @@
 from typing import Dict, List, Optional, Tuple
 import json
+import math
 import os
 import queue
 import threading
@@ -7,11 +8,23 @@ import time
 
 import torch
 
+from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
+
 
 class _KmeansScheduler:
-    def __init__(self, total_cores: int, min_threads_per_job: int, max_concurrent: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        total_cores: int,
+        min_threads_per_job: int,
+        max_concurrent: Optional[int] = None,
+        worker_threads_per_job: Optional[int] = None,
+    ) -> None:
         self._total_cores = max(1, total_cores)
         self._min_threads_per_job = max(1, min_threads_per_job)
+        self._worker_threads_per_job = max(
+            self._min_threads_per_job,
+            min(self._total_cores, int(worker_threads_per_job or self._total_cores)),
+        )
         if max_concurrent is None:
             self._max_concurrent = max(1, self._total_cores // self._min_threads_per_job)
         else:
@@ -34,6 +47,13 @@ class _KmeansScheduler:
         self._queue.put((priority, time.monotonic(), fn))
         with self._cv:
             self._cv.notify_all()
+    def active_jobs(self) -> int:
+        with self._cv:
+            return int(self._active_jobs)
+    def queued_jobs(self) -> int:
+        return int(self._queue.qsize())
+    def max_concurrent(self) -> int:
+        return int(self._max_concurrent)
     def shutdown(self) -> None:
         if self._stop_event.is_set():
             with self._cv:
@@ -68,7 +88,11 @@ class _KmeansScheduler:
                 if self._stop_event.is_set():
                     return
                 self._active_jobs += 1
-            worker_threads = max(1, self._total_cores // max(1, self._max_concurrent))
+            # Pass a stable per-job budget. The native K-means code divides
+            # this by the true active native jobs; keeping the budget stable
+            # avoids queued-job pre-shrinking while still leaving headroom for
+            # the prefill path.
+            worker_threads = self._worker_threads_per_job
             thread = threading.Thread(
                 target=self._run_job,
                 args=(fn, worker_threads),
@@ -105,9 +129,95 @@ class AdaptiveIMIIndexingMixin:
             dtype=self.dtype,
             pin_memory=True,
         ).contiguous()
+
+    def _resize_metadata_capacity(self, required_centroids: int) -> None:
+        required_centroids = int(required_centroids)
+        if required_centroids <= self.n_centroids:
+            return
+
+        old_centroids = int(self.n_centroids)
+        self.n_centroids = required_centroids
+        self.padding_cluster_id = self.n_centroids - 1
+        self.nprobe = max(round((self.n_centroids - 1) * self.retrieval_budget), 1)
+        self.nprobe = min(self.nprobe, self.n_centroids - 1)
+
+        def resize_cpu_tensor(tensor, shape, fill_value=0):
+            new_tensor = torch.empty(shape, dtype=tensor.dtype, pin_memory=tensor.is_pinned())
+            new_tensor.fill_(fill_value)
+            slices = tuple(slice(0, min(old, new)) for old, new in zip(tensor.shape, shape))
+            new_tensor[slices].copy_(tensor[slices])
+            return new_tensor
+
+        for ldx in range(self.layer_num):
+            sizes = self.cluster_sizes_cpu[ldx]
+            if sizes is not None:
+                self.cluster_sizes_cpu[ldx] = resize_cpu_tensor(
+                    sizes,
+                    (self.batch_groups, self.n_centroids),
+                    0,
+                )
+
+            offsets = self.cluster_offsets_cpu[ldx]
+            if offsets is not None:
+                new_offsets = resize_cpu_tensor(
+                    offsets,
+                    (self.batch_groups, self.n_centroids + 1),
+                    0,
+                )
+                if old_centroids >= 0:
+                    tail = offsets[:, min(old_centroids, offsets.shape[1] - 1)].view(self.batch_groups, 1)
+                    new_offsets[:, old_centroids + 1 :] = tail
+                self.cluster_offsets_cpu[ldx] = new_offsets
+
+            centroids_cpu = self.centroids_cpu[ldx]
+            if centroids_cpu is not None:
+                self.centroids_cpu[ldx] = resize_cpu_tensor(
+                    centroids_cpu,
+                    (self.batch_groups, self.n_centroids, self.head_dim),
+                    0,
+                )
+
+            masks_cpu = self.centroids_mask_cpu[ldx]
+            if masks_cpu is not None:
+                self.centroids_mask_cpu[ldx] = resize_cpu_tensor(
+                    masks_cpu,
+                    (self.batch_groups, self.n_centroids),
+                    True,
+                )
+
+            if self.cluster_sizes_gpu[ldx] is not None:
+                device = self.cluster_sizes_gpu[ldx].device
+                self.cluster_sizes_gpu[ldx] = self.cluster_sizes_cpu[ldx].to(device) if self.cluster_sizes_cpu[ldx] is not None else None
+            if self.centroids[ldx] is not None:
+                device = self.centroids[ldx].device
+                resized = torch.zeros(
+                    (self.batch_groups, self.n_centroids, self.head_dim),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if self.centroids_cpu[ldx] is not None:
+                    resized.copy_(self.centroids_cpu[ldx])
+                self.centroids[ldx] = resized
+            if self.centroids_mask[ldx] is not None:
+                device = self.centroids_mask[ldx].device
+                resized = torch.ones(
+                    (self.batch_groups, self.n_centroids),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                if self.centroids_mask_cpu[ldx] is not None:
+                    resized.copy_(self.centroids_mask_cpu[ldx])
+                self.centroids_mask[ldx] = resized
+
     def _load_layer_metadata(self, layer_idx: int, metadata: List[Dict[str, object]]):
+        required_centroids = 1
+        for head_meta in metadata:
+            required_centroids = max(
+                required_centroids,
+                int(head_meta["cluster_sizes"].shape[0]) + 1,
+            )
+        self._resize_metadata_capacity(required_centroids)
         self.layer_metadata[layer_idx] = metadata
-        self.layer_ready[layer_idx] = True
 
         cluster_sizes = self.cluster_sizes_cpu[layer_idx]
         cluster_offsets = self.cluster_offsets_cpu[layer_idx]
@@ -172,11 +282,28 @@ class AdaptiveIMIIndexingMixin:
             self.centroids_mask[layer_idx].copy_(centroids_mask_cpu)
         if self.adpimi_index[layer_idx] is not None:
             self.adpimi_index[layer_idx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
+        self.layer_ready[layer_idx] = True
     def _ensure_metadata_buffers(self) -> None:
         if self.n_centroids <= 0:
-            n_tokens = max(self.list_stride, 1)
-            total_clusters = max(int(n_tokens / 16), 1)
-            if self.subspace_parts == 0:
+            n_tokens = max(self.list_capacity, self.list_stride, 1)
+            if getattr(self, "learned_partition_enabled", False):
+                kmeans_cfg = self.runtime_config.get("kmeans") or {}
+                target_cluster_size = max(int(kmeans_cfg.get("target_cluster_size", kmeans_cfg.get("cluster_size", 16))), 1)
+                max_clusters = 1
+                for spec in getattr(self, "learned_partition_specs", []):
+                    if spec is None:
+                        continue
+                    m = max(int(spec.get("subspace_parts", 1)), 1)
+                    k_values = choose_learned_k_values(
+                        spec,
+                        n_tokens,
+                        target_cluster_size,
+                        default_m=m,
+                    )
+                    product = product_k_values(k_values)
+                    max_clusters = max(max_clusters, min(product, n_tokens))
+                self.n_centroids = int(max_clusters) + 1
+            elif self.subspace_parts == 0:
                 # IVF: n_centroids = round(T / 16)
                 self.n_centroids = max(int(round(n_tokens / 16.0)), 1) + 1
             elif self.subspace_parts == 4:
@@ -185,6 +312,7 @@ class AdaptiveIMIIndexingMixin:
                 self.n_centroids = k ** 4 + 1
             else:
                 # 2-way IMI
+                total_clusters = max(int(n_tokens / 16), 1)
                 k = max(int(math.sqrt(total_clusters)), 32)
                 self.n_centroids = k * k + 1
             self.padding_cluster_id = self.n_centroids - 1

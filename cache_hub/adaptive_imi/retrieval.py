@@ -155,7 +155,7 @@ class AdaptiveIMIRetrievalMixin:
             self.hit_num_units[layer_idx],
             self.valid_lengths_dict[device],
             self.batch_groups,
-            self.list_stride,
+            self.list_capacity,
             self.cache_size,
             self.retrieval_execution_stride,
             self.buffer_size,
@@ -248,7 +248,7 @@ class AdaptiveIMIRetrievalMixin:
             self.valid_lengths_dict[device],
             self.batch_groups,
             self.static_stride,
-            self.list_stride,
+            self.list_capacity,
             self.cache_size,
             self.execution_stride,
             self.buffer_size,
@@ -349,18 +349,21 @@ class AdaptiveIMIRetrievalMixin:
             start_time = time.perf_counter()
 
         query_grouped = queries.view(self.batch_groups, self.group_size, self.head_dim).contiguous()
-        similarities = imi_gpu_kernels.fused_query_group_similarities(
-            query_grouped,
-            self.centroids[layer_idx],
-            self.similarity_buffer_dict[device],
-        )
-        similarities.masked_fill_(self.centroids_mask[layer_idx], float("-inf"))
+        custom_selector = getattr(self, "_select_clusters_for_decode", None)
+        if custom_selector is None:
+            similarities = imi_gpu_kernels.fused_query_group_similarities(
+                query_grouped,
+                self.centroids[layer_idx],
+                self.similarity_buffer_dict[device],
+            )
+            similarities.masked_fill_(self.centroids_mask[layer_idx], float("-inf"))
+            selected = self._select_clusters(layer_idx, similarities)
+        else:
+            selected = custom_selector(layer_idx, query_grouped, device)
 
         if profile:
             torch.cuda.synchronize(device)
             sim_time = time.perf_counter()
-
-        selected = self._select_clusters(layer_idx, similarities)
         if debug_decode and layer_idx == 0:
             selected_count = int((selected != self.padding_cluster_id).sum().item())
             selected_sample = selected[0, : min(16, selected.shape[1])].tolist()

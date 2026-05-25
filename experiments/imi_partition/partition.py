@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import random
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 Matrix = List[List[float]]
 
@@ -13,8 +13,11 @@ class PartitionMetrics:
     within: float
     leakage: float
     total: float
+    within_ratio: float
     leak_ratio: float
     normalized_leak: float
+    top_edge_keep: Dict[str, float]
+    top_edge_weight_keep: Dict[str, float]
     locality_penalty: float
     cost_proxy: float
     group_sizes: List[int]
@@ -23,10 +26,17 @@ class PartitionMetrics:
         return {
             "objective": float(self.objective),
             "within": float(self.within),
+            "within_score": float(self.within),
             "leakage": float(self.leakage),
             "total": float(self.total),
+            "within_ratio": float(self.within_ratio),
+            "keep_ratio": float(self.within_ratio),
             "leak_ratio": float(self.leak_ratio),
+            "cut_ratio": float(self.leak_ratio),
             "normalized_leak": float(self.normalized_leak),
+            "relative_random_leak": float(self.normalized_leak),
+            "top_edge_keep": {str(k): float(v) for k, v in self.top_edge_keep.items()},
+            "top_edge_weight_keep": {str(k): float(v) for k, v in self.top_edge_weight_keep.items()},
             "locality_penalty": float(self.locality_penalty),
             "cost_proxy": float(self.cost_proxy),
             "group_sizes": list(map(int, self.group_sizes)),
@@ -81,6 +91,18 @@ def _balanced_sizes(n: int, m: int, min_size: int, max_size: int) -> List[int]:
     return sizes
 
 
+def _near_equal_sizes(n: int, m: int) -> List[int]:
+    if m <= 0:
+        raise ValueError("m must be positive")
+    base = n // m
+    remainder = n % m
+    if base <= 0:
+        raise ValueError(f"cannot split {n} items into {m} non-empty groups")
+    sizes = [base + (1 if idx < remainder else 0) for idx in range(m)]
+    sizes.sort(reverse=True)
+    return sizes
+
+
 def _contiguous_init(n: int, m: int, min_size: int, max_size: int) -> List[List[int]]:
     sizes = _balanced_sizes(n, m, min_size, max_size)
     groups: List[List[int]] = []
@@ -100,6 +122,16 @@ def _random_init(n: int, m: int, min_size: int, max_size: int, rng: random.Rando
     for size in sizes:
         groups.append(sorted(order[cursor : cursor + size]))
         cursor += size
+    return groups
+
+
+def _init_from_sizes(sizes: Sequence[int], order: Sequence[int]) -> List[List[int]]:
+    groups: List[List[int]] = []
+    cursor = 0
+    for size in sizes:
+        group = sorted(int(item) for item in order[cursor : cursor + int(size)])
+        groups.append(group)
+        cursor += int(size)
     return groups
 
 
@@ -136,6 +168,35 @@ def within_score(dependency: Matrix, groups: Sequence[Sequence[int]]) -> float:
     return score
 
 
+def _top_edge_metrics(
+    dependency: Matrix,
+    groups: Sequence[Sequence[int]],
+    fractions: Sequence[float] = (0.01, 0.05, 0.10),
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    n = len(dependency)
+    assignment = pair_to_group(groups, n)
+    edges: List[Tuple[float, int, int]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            edges.append((float(dependency[i][j]), i, j))
+    edges.sort(key=lambda item: item[0], reverse=True)
+
+    keep: Dict[str, float] = {}
+    weight_keep: Dict[str, float] = {}
+    edge_count = len(edges)
+    for fraction in fractions:
+        k = max(1, int(round(float(edge_count) * float(fraction))))
+        k = min(k, edge_count)
+        top = edges[:k]
+        kept = [edge for edge in top if assignment[edge[1]] == assignment[edge[2]]]
+        key = f"{float(fraction):.2f}"
+        keep[key] = float(len(kept)) / float(k) if k > 0 else 0.0
+        total_weight = sum(edge[0] for edge in top)
+        kept_weight = sum(edge[0] for edge in kept)
+        weight_keep[key] = kept_weight / total_weight if total_weight > 0 else 0.0
+    return keep, weight_keep
+
+
 def compute_metrics(
     dependency,
     groups: Sequence[Sequence[int]],
@@ -150,12 +211,14 @@ def compute_metrics(
         for j in range(i + 1, n):
             total += dep[i][j]
     leakage = max(total - within, 0.0)
+    within_ratio = within / total if total > 0 else 0.0
     leak_ratio = leakage / total if total > 0 else 0.0
     within_pairs = sum(len(group) * (len(group) - 1) / 2.0 for group in groups)
     all_pairs = n * (n - 1) / 2.0
     cross_pair_fraction = 1.0 - within_pairs / all_pairs if all_pairs > 0 else 0.0
     random_leak = total * cross_pair_fraction
     normalized_leak = leakage / random_leak if random_leak > 0 else 0.0
+    top_edge_keep, top_edge_weight_keep = _top_edge_metrics(dep, groups)
     loc = locality_penalty(groups)
     objective = within - float(gamma) * loc
 
@@ -168,8 +231,11 @@ def compute_metrics(
         within=within,
         leakage=leakage,
         total=total,
+        within_ratio=within_ratio,
         leak_ratio=leak_ratio,
         normalized_leak=normalized_leak,
+        top_edge_keep=top_edge_keep,
+        top_edge_weight_keep=top_edge_weight_keep,
         locality_penalty=loc,
         cost_proxy=cost_proxy,
         group_sizes=[len(group) for group in groups],
@@ -204,6 +270,8 @@ def optimize_partition(
     *,
     min_size: int = 2,
     max_size: int = 32,
+    balanced: bool = True,
+    balance_slack: int = 0,
     gamma: float = 0.01,
     seeds: int = 16,
     max_iter: int = 100,
@@ -214,14 +282,36 @@ def optimize_partition(
     n = len(dep)
     if m <= 0:
         raise ValueError("m must be positive")
-    if m * min_size > n or m * max_size < n:
-        raise ValueError(f"M={m} cannot satisfy size constraints for {n} pairs")
+    if balanced:
+        target_sizes = _near_equal_sizes(n, m)
+        if any(size < min_size or size > max_size for size in target_sizes):
+            raise ValueError(
+                f"M={m} balanced sizes {target_sizes} violate size constraints [{min_size}, {max_size}]"
+            )
+        slack = max(0, int(balance_slack))
+        lower_bounds = [max(int(min_size), size - slack) for size in target_sizes]
+        upper_bounds = [min(int(max_size), size + slack) for size in target_sizes]
+        if sum(lower_bounds) > n or sum(upper_bounds) < n:
+            raise ValueError(f"M={m} cannot satisfy balanced size slack={slack}")
+        initial_order = list(range(n))
+        initializations: List[tuple[int, List[List[int]]]] = [(-1, _init_from_sizes(target_sizes, initial_order))]
+    else:
+        if m * min_size > n or m * max_size < n:
+            raise ValueError(f"M={m} cannot satisfy size constraints for {n} pairs")
+        lower_bounds = [int(min_size)] * m
+        upper_bounds = [int(max_size)] * m
+        initializations = [(-1, _contiguous_init(n, m, min_size, max_size))]
 
-    initializations: List[tuple[int, List[List[int]]]] = [(-1, _contiguous_init(n, m, min_size, max_size))]
     rng_master = random.Random(random_seed)
     for seed_idx in range(seeds):
         seed = int(rng_master.randrange(0, 2**31 - 1))
-        initializations.append((seed, _random_init(n, m, min_size, max_size, random.Random(seed))))
+        rng = random.Random(seed)
+        if balanced:
+            order = list(range(n))
+            rng.shuffle(order)
+            initializations.append((seed, _init_from_sizes(target_sizes, order)))
+        else:
+            initializations.append((seed, _random_init(n, m, min_size, max_size, rng)))
 
     best_groups: Optional[List[List[int]]] = None
     best_seed = -1
@@ -238,12 +328,12 @@ def optimize_partition(
             assignment = pair_to_group(groups, n)
             for item in items:
                 src = assignment[item]
-                if len(groups[src]) <= min_size:
+                if len(groups[src]) <= lower_bounds[src]:
                     continue
                 best_dst = None
                 best_gain = 1e-12
                 for dst in range(m):
-                    if dst == src or len(groups[dst]) >= max_size:
+                    if dst == src or len(groups[dst]) >= upper_bounds[dst]:
                         continue
                     gain = _move_gain(dep, groups, src, dst, item, gamma)
                     if gain > best_gain:
@@ -305,13 +395,65 @@ def optimize_partition(
 def choose_by_constraint(
     results: Sequence[PartitionResult],
     *,
-    max_normalized_leak: float,
+    min_keep_ratio: Optional[float] = None,
+    min_top_edge_keep: Optional[float] = None,
+    top_edge_fraction: str = "0.10",
+    max_normalized_leak: Optional[float] = None,
+    max_leak_ratio: Optional[float] = None,
+    constraint_metric: str = "keep_ratio",
+    prefer: str = "largest",
 ) -> Optional[PartitionResult]:
-    feasible = [
-        result for result in results
-        if result.metrics.normalized_leak <= max_normalized_leak
-    ]
+    constraint_metric = constraint_metric.lower()
+    if constraint_metric in ("keep_ratio", "within_ratio"):
+        threshold = min_keep_ratio
+        metric_fn = lambda result: result.metrics.within_ratio
+        higher_is_better = True
+    elif constraint_metric == "leak_ratio":
+        threshold = max_leak_ratio if max_leak_ratio is not None else max_normalized_leak
+        metric_fn = lambda result: result.metrics.leak_ratio
+        higher_is_better = False
+    elif constraint_metric in ("normalized_leak", "relative_random_leak"):
+        threshold = max_normalized_leak
+        metric_fn = lambda result: result.metrics.normalized_leak
+        higher_is_better = False
+    else:
+        raise ValueError("constraint_metric must be one of: keep_ratio, leak_ratio, normalized_leak")
+
+    if threshold is None:
+        feasible = list(results)
+    elif higher_is_better:
+        feasible = [
+            result for result in results
+            if metric_fn(result) >= float(threshold)
+        ]
+    else:
+        feasible = [
+            result for result in results
+            if metric_fn(result) <= float(threshold)
+        ]
     if not feasible:
         return None
-    feasible.sort(key=lambda item: (item.m, -item.metrics.normalized_leak), reverse=True)
+
+    if min_top_edge_keep is not None and float(min_top_edge_keep) > 0.0:
+        key = f"{float(top_edge_fraction):.2f}"
+        feasible = [
+            result for result in feasible
+            if result.metrics.top_edge_keep.get(key, 0.0) >= float(min_top_edge_keep)
+        ]
+        if not feasible:
+            return None
+
+    def quality_key(item: PartitionResult) -> float:
+        value = metric_fn(item)
+        return -value if higher_is_better else value
+
+    prefer = prefer.lower()
+    if prefer == "largest":
+        feasible.sort(key=lambda item: (-item.m, quality_key(item), -item.metrics.objective))
+    elif prefer == "lowest_leak":
+        feasible.sort(key=lambda item: (metric_fn(item), item.m, item.metrics.leak_ratio, -item.metrics.objective))
+    elif prefer == "smallest":
+        feasible.sort(key=lambda item: (item.m, quality_key(item), -item.metrics.objective))
+    else:
+        raise ValueError("prefer must be one of: smallest, largest, lowest_leak")
     return feasible[0]

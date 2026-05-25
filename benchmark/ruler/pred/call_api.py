@@ -46,7 +46,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 from config import resolve_model_path
-from typing import Dict, List, Optional
+from typing import Dict, List
 import traceback
 from utils import load_data
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
@@ -70,6 +70,34 @@ SERVER_TYPES = (
     'mamba',
 )
 
+
+def load_existing_pred_indices(pred_file: Path) -> set:
+    indices = set()
+    if not pred_file.exists():
+        return indices
+
+    valid_lines = []
+    saw_invalid = False
+    with pred_file.open("r", encoding="utf-8") as fin:
+        for line in fin:
+            if not line.strip():
+                continue
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                saw_invalid = True
+                continue
+            valid_lines.append(line)
+            if "index" in sample:
+                indices.add(sample["index"])
+
+    if saw_invalid:
+        with pred_file.open("w", encoding="utf-8") as fout:
+            fout.writelines(valid_lines)
+        print(f"Removed malformed partial lines from {pred_file}")
+
+    return indices
+
 def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -80,13 +108,13 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def cleanup_kv_cache(llm):
+def cleanup_kv_cache(llm, force: bool = False):
     if os.getenv("IMI_DEBUG_SKIP_KV_CLEANUP", "0") == "1":
         return
     kv_cache = getattr(llm, "kv_cache", None)
     if kv_cache is not None:
         reuse_ok = hasattr(kv_cache, "reset_for_next_sequence") and hasattr(kv_cache, "can_reuse_for_next_sequence")
-        if not reuse_ok:
+        if force or not reuse_ok:
             cleanup = getattr(kv_cache, "cleanup", None)
             if callable(cleanup):
                 cleanup()
@@ -112,6 +140,11 @@ class HuggingFaceModel:
         budget_ratio,
         synthetic_len,
         subspace_parts=2,
+        imi_engine=None,
+        partition_path=None,
+        decode_search_mode=None,
+        candidate_clusters=None,
+        rerank_clusters=None,
     ) -> None:
         load_path = model_path or model_name
 
@@ -145,6 +178,11 @@ class HuggingFaceModel:
         self.budget_ratio = budget_ratio
         self.synthetic_len = synthetic_len
         self.subspace_parts = subspace_parts
+        self.imi_engine = imi_engine
+        self.partition_path = partition_path
+        self.decode_search_mode = decode_search_mode
+        self.candidate_clusters = candidate_clusters
+        self.rerank_clusters = rerank_clusters
         self._generate_lock = threading.Lock()
 
     def __call__(self, prompt: str, answer_prefix: str = "", **kwargs) -> Dict[str, List[str]]:
@@ -159,6 +197,11 @@ class HuggingFaceModel:
                 synthetic_len=self.synthetic_len,
                 answer_prefix=answer_prefix,
                 subspace_parts=self.subspace_parts,
+                imi_engine=self.imi_engine,
+                partition_path=self.partition_path,
+                decode_search_mode=self.decode_search_mode,
+                candidate_clusters=self.candidate_clusters,
+                rerank_clusters=self.rerank_clusters,
             )
 
         return {'text': [generated_text]}
@@ -180,6 +223,11 @@ def get_llm(
     synthetic_len,
     model_path=None,
     subspace_parts=2,
+    imi_engine=None,
+    partition_path=None,
+    decode_search_mode=None,
+    candidate_clusters=None,
+    rerank_clusters=None,
 ):
     if args.server_type == 'hf':
         llm = HuggingFaceModel(
@@ -193,6 +241,11 @@ def get_llm(
             budget_ratio=budget_ratio,
             synthetic_len=synthetic_len,
             subspace_parts=subspace_parts,
+            imi_engine=imi_engine,
+            partition_path=partition_path,
+            decode_search_mode=decode_search_mode,
+            candidate_clusters=candidate_clusters,
+            rerank_clusters=rerank_clusters,
         )
     else:
         raise RuntimeError(f'Unsupported server type {args.server_type}')
@@ -229,6 +282,11 @@ def get_pred(
     synthetic_len: int,
     answer_prefix: str = "",
     subspace_parts: int = 2,
+    imi_engine: str | None = None,
+    partition_path: str | None = None,
+    decode_search_mode: str | None = None,
+    candidate_clusters: int | None = None,
+    rerank_clusters: int | None = None,
 ) -> str:
 
     # Fix multiple <|begin_of_text|> tags
@@ -244,14 +302,25 @@ def get_pred(
     input_ids = inputs.input_ids
     attention_masks = inputs.attention_mask
 
+    decode_search = None
+    if decode_search_mode:
+        decode_search = {"mode": decode_search_mode}
+        if candidate_clusters is not None:
+            decode_search["candidate_clusters"] = int(candidate_clusters)
+        if rerank_clusters is not None:
+            decode_search["rerank_clusters"] = int(rerank_clusters)
+
     attn_config = generate_config(
         model_name,
         input_ids.shape[1],  # 使用实际输入长度，而非预设的 synthetic_len
         attn_type,
         retrieval_budget=budget_ratio,
         subspace_parts=subspace_parts,
+        imi_engine=imi_engine,
+        partition_path=partition_path,
+        decode_search=decode_search,
     )
-
+    success = False
     try:
         out = llm.generate(
             attention_type=attn_type,
@@ -263,8 +332,9 @@ def get_pred(
         )
 
         output = llm.tokenizer.batch_decode(out, skip_special_tokens=True)
+        success = True
     finally:
-        cleanup_kv_cache(llm)
+        cleanup_kv_cache(llm, force=not success)
 
     print("Chunked generation:", output[0])
     return output[0]
@@ -277,6 +347,8 @@ def get_output(llm, outputs_parallel, idx, index, input, outputs, others, trunca
             break
         except Exception as e:
             traceback.print_exc()
+            if isinstance(e, torch.cuda.OutOfMemoryError):
+                raise
 
     if len(pred['text']) > 0:
         processed_pred = postprocess_pred(pred['text'][0])
@@ -326,10 +398,14 @@ def main(args):
 
     # Load data
     if os.path.exists(pred_file):
-        pred_index = [sample['index'] for sample in load_data(pred_file)]
+        pred_index = load_existing_pred_indices(pred_file)
         data = [sample for sample in load_data(task_file) if sample['index'] not in pred_index]
     else:
         data = load_data(task_file)
+
+    if len(data) == 0:
+        print(f"Prediction for {args.task} is already complete; skip model loading.")
+        return
 
     # Load api
     dtype = torch.float16 if args.dtype == 'fp16' else torch.bfloat16
@@ -344,6 +420,11 @@ def main(args):
         synthetic_len=args.synthetic_len,
         model_path=args.model_path,
         subspace_parts=args.subspace_parts,
+        imi_engine=args.imi_engine,
+        partition_path=args.partition_path,
+        decode_search_mode=args.decode_search_mode,
+        candidate_clusters=args.candidate_clusters,
+        rerank_clusters=args.rerank_clusters,
     )
 
     threads = []
@@ -408,6 +489,8 @@ if __name__ == '__main__':
     parser.add_argument("--model_name", type=str, default="qwen2.5-7b",                                            \
             choices=[
                 "qwen2.5-7b",
+                "qwen3-8b",
+                "Qwen/Qwen3-8B",
                 "llama-3-8b-1048k",
                 "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
                 "Llama-3-8B-Instruct-Gradient-1048k",
@@ -437,6 +520,11 @@ if __name__ == '__main__':
     parser.add_argument("--synthetic_len", type=int, required=True)
     parser.add_argument("--budget_ratio", type=float, default=0.018, help="Retrieval budget for AdaptiveIMI")
     parser.add_argument("--subspace_parts", type=int, default=2, help="IMI subspace parts (0, 2 or 4)")
+    parser.add_argument("--imi_engine", type=str, default=None, choices=[None, "hybrid_8way_v2"])
+    parser.add_argument("--partition_path", type=str, default=None, help="Learned partition JSON for AdaptiveIMI hybrid v2")
+    parser.add_argument("--decode_search_mode", type=str, default=None, choices=[None, "flat", "subspace", "subspace_rerank", "hybrid"])
+    parser.add_argument("--candidate_clusters", type=int, default=None)
+    parser.add_argument("--rerank_clusters", type=int, default=None)
 
     args = parser.parse_args()
     print(args)

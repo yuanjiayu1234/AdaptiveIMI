@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set -e
+
 
 if [ $# -ne 7 ]; then
     echo "Usage: $0 <model_name> <benchmark_name> <attn_type> <context_length> <task> <dtype> <budget_ratio>"
@@ -22,17 +24,25 @@ fi
 # Root Directories
 ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and model predictions.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-NUM_SAMPLES=200
+NUM_SAMPLES=${NUM_SAMPLES:-200}
 MAX_SEQ_LENGTH=${4}
 ATTN_TYPE=${3}
 DEVICE=${DEVICE:-cuda:0}
 BUDGET_RATIO=${7}
 SUBSPACE_PARTS=${SUBSPACE_PARTS:-2}
+IMI_ENGINE=${IMI_ENGINE:-}
+PARTITION_PATH=${PARTITION_PATH:-}
+DECODE_SEARCH_MODE=${DECODE_SEARCH_MODE:-}
+CANDIDATE_CLUSTERS=${CANDIDATE_CLUSTERS:-}
+RERANK_CLUSTERS=${RERANK_CLUSTERS:-}
+RULER_RESUME=${RULER_RESUME:-0}
 
 # Model and Tokenizer
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export PYTHONPATH="$(dirname "${PROJECT_ROOT}"):${PROJECT_ROOT}:${PYTHONPATH:-}"
+export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${PROJECT_ROOT}/outputs/flashinfer}"
+mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
 
 MODEL2PATH_FILE="${SCRIPT_DIR}/model2path.json"
 
@@ -88,6 +98,11 @@ MODEL_SELECT() {
             MODEL_TEMPLATE_TYPE="meta-chat"
             MODEL_FRAMEWORK="hf"
             ;;
+        qwen3-8b|Qwen/Qwen3-8B)
+            REMOTE_MODEL_PATH="Qwen/Qwen3-8B"
+            MODEL_TEMPLATE_TYPE="hf-chat"
+            MODEL_FRAMEWORK="hf"
+            ;;
         llama-3-8b-1048k|gradientai/Llama-3-8B-Instruct-Gradient-1048k|Llama-3-8B-Instruct-Gradient-1048k)
             REMOTE_MODEL_PATH="gradientai/Llama-3-8B-Instruct-Gradient-1048k"
             MODEL_TEMPLATE_TYPE="meta-chat"
@@ -130,6 +145,13 @@ MODEL_SELECT() {
 MODEL_NAME=${1}
 MODEL_CONFIG=$(MODEL_SELECT ${MODEL_NAME})
 IFS=":" read MODEL_PATH MODEL_TEMPLATE_TYPE MODEL_FRAMEWORK TOKENIZER_PATH TOKENIZER_TYPE <<< "$MODEL_CONFIG"
+if [[ -n "${MODEL_PATH_OVERRIDE:-}" ]]; then
+    MODEL_PATH="${MODEL_PATH_OVERRIDE}"
+    TOKENIZER_PATH="${MODEL_PATH_OVERRIDE}"
+fi
+if [[ -n "${MODEL_TEMPLATE_TYPE_OVERRIDE:-}" ]]; then
+    MODEL_TEMPLATE_TYPE="${MODEL_TEMPLATE_TYPE_OVERRIDE}"
+fi
 if [ -z "${MODEL_PATH}" ]; then
     echo "Model: ${MODEL_NAME} is not supported"
     exit 1
@@ -152,9 +174,17 @@ fi
 
 # Start client (prepare data / call model API / obtain final metrics)
     
-RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${ATTN_TYPE}-br${BUDGET_RATIO}-sp${SUBSPACE_PARTS}"
+RUN_TAG="${ATTN_TYPE}-br${BUDGET_RATIO}-sp${SUBSPACE_PARTS}"
+if [[ -n "${IMI_ENGINE}" ]]; then
+    RUN_TAG="${RUN_TAG}-${IMI_ENGINE}"
+fi
+RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${RUN_TAG}"
 DATA_DIR="${RESULTS_DIR}/data"
 PRED_DIR="${RESULTS_DIR}/pred"
+if [[ "${RULER_RESUME}" != "1" ]]; then
+    rm -rf "${DATA_DIR}"
+    rm -rf "${PRED_DIR}"
+fi
 mkdir -p ${DATA_DIR}
 mkdir -p ${PRED_DIR}
 
@@ -168,6 +198,46 @@ fi
 DTYPE=${6}
 SUBSET="validation"
 RULER_DATA_ROOT="${RULER_DATA_ROOT:-${PROJECT_ROOT}/data/RULER}"
+RULER_USE_SOURCE_CACHE="${RULER_USE_SOURCE_CACHE:-0}"
+
+jsonl_count() {
+    local file="$1"
+    python - "${file}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print(0)
+else:
+    with path.open("r", encoding="utf-8") as fin:
+        print(sum(1 for line in fin if line.strip()))
+PY
+}
+
+pred_unique_count() {
+    local file="$1"
+    python - "${file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+indices = set()
+if path.exists():
+    with path.open("r", encoding="utf-8") as fin:
+        for line in fin:
+            if not line.strip():
+                continue
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "index" in sample:
+                indices.add(sample["index"])
+print(len(indices))
+PY
+}
 
 for TASK in "${TASK_LIST[@]}"; do
     if [[ ! " ${TASKS[*]} " =~ " ${TASK} " ]]; then
@@ -178,13 +248,22 @@ for TASK in "${TASK_LIST[@]}"; do
     echo "Running task ${TASK} ..."
     SOURCE_DATA="${RULER_DATA_ROOT}/${MAX_SEQ_LENGTH}/${TASK}/${SUBSET}.jsonl"
     TARGET_DATA="${DATA_DIR}/${TASK}/${SUBSET}.jsonl"
+    PRED_FILE="${PRED_DIR}/${TASK}.jsonl"
 
-    if [[ -f "${SOURCE_DATA}" ]]; then
+    if [[ "${RULER_RESUME}" = "1" && -f "${TARGET_DATA}" ]]; then
+        TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
+        if [[ "${TARGET_COUNT}" -ne "${NUM_SAMPLES}" ]]; then
+            echo "Existing dataset at ${TARGET_DATA} has ${TARGET_COUNT} samples, but NUM_SAMPLES=${NUM_SAMPLES}."
+            echo "Refusing to resume with a different sample count. Use the same NUM_SAMPLES, or remove/use a different results directory."
+            exit 1
+        fi
+        echo "Found existing dataset at ${TARGET_DATA}, reusing for resume..."
+    elif [[ "${RULER_USE_SOURCE_CACHE}" = "1" && -f "${SOURCE_DATA}" ]]; then
         echo "Found cached dataset at ${SOURCE_DATA}, copying..."
         mkdir -p "$(dirname "${TARGET_DATA}")"
         cp "${SOURCE_DATA}" "${TARGET_DATA}"
     else
-        echo "Cached dataset not found, generating ${TASK} ..."
+        echo "Generating ${TASK} with template ${MODEL_TEMPLATE_TYPE} ..."
         python -u "${SCRIPT_DIR}/data/prepare.py" \
             --save_dir ${DATA_DIR} \
             --benchmark ${BENCHMARK} \
@@ -195,6 +274,30 @@ for TASK in "${TASK_LIST[@]}"; do
             --model_template_type ${MODEL_TEMPLATE_TYPE} \
             --num_samples ${NUM_SAMPLES} \
             ${REMOVE_NEWLINE_TAB}
+    fi
+
+    TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
+    PRED_COUNT=$(pred_unique_count "${PRED_FILE}")
+    if [[ "${RULER_RESUME}" = "1" && "${TARGET_COUNT}" -gt 0 && "${PRED_COUNT}" -ge "${TARGET_COUNT}" ]]; then
+        echo "Prediction for ${TASK} is complete (${PRED_COUNT}/${TARGET_COUNT}), skipping..."
+        continue
+    fi
+
+    EXTRA_IMI_ARGS=()
+    if [[ -n "${IMI_ENGINE}" ]]; then
+        EXTRA_IMI_ARGS+=(--imi_engine "${IMI_ENGINE}")
+    fi
+    if [[ -n "${PARTITION_PATH}" ]]; then
+        EXTRA_IMI_ARGS+=(--partition_path "${PARTITION_PATH}")
+    fi
+    if [[ -n "${DECODE_SEARCH_MODE}" ]]; then
+        EXTRA_IMI_ARGS+=(--decode_search_mode "${DECODE_SEARCH_MODE}")
+    fi
+    if [[ -n "${CANDIDATE_CLUSTERS}" ]]; then
+        EXTRA_IMI_ARGS+=(--candidate_clusters "${CANDIDATE_CLUSTERS}")
+    fi
+    if [[ -n "${RERANK_CLUSTERS}" ]]; then
+        EXTRA_IMI_ARGS+=(--rerank_clusters "${RERANK_CLUSTERS}")
     fi
 
     python -u "${SCRIPT_DIR}/pred/call_api.py" \
@@ -212,7 +315,8 @@ for TASK in "${TASK_LIST[@]}"; do
         --device ${DEVICE} \
         --budget_ratio ${BUDGET_RATIO} \
         --synthetic_len ${MAX_SEQ_LENGTH} \
-        --subspace_parts ${SUBSPACE_PARTS}
+        --subspace_parts ${SUBSPACE_PARTS} \
+        "${EXTRA_IMI_ARGS[@]}"
 done
 
 python -u "${SCRIPT_DIR}/eval/evaluate.py" \

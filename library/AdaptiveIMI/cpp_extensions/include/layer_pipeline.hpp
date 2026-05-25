@@ -69,6 +69,12 @@ struct KmeansResult {
     std::vector<std::vector<float>> per_head_centroids3;         // [kv_heads][k3 * dim_quarter]
     std::vector<std::vector<float>> per_head_centroids4;         // [kv_heads][k4 * dim_quarter]
 
+    // Generic learned-M-way format. Only populated when
+    // LayerPipelineRuntimeConfig.learned_partition_enabled is true.
+    std::vector<std::vector<std::vector<int32_t>>> per_head_labels_m;   // [kv_heads][M][n_tokens]
+    std::vector<std::vector<std::vector<float>>> per_head_centroids_m;  // [kv_heads][M][k_m * sub_dim]
+    std::vector<std::vector<int32_t>> per_head_subspace_dims;           // [kv_heads][M]
+
     // ✅ 【统一输出】合并后的labels和centroids（对外接口）
     std::vector<std::vector<int32_t>> per_head_labels;          // [kv_heads][n_tokens]（已合并）
     std::vector<std::vector<float>> per_head_centroids;         // [kv_heads][n_clusters * dim]（已合并）
@@ -94,6 +100,8 @@ struct ReorganizeResult {
     torch::Tensor reorganized_values;    // [total_tokens, dim] CPU
     std::vector<int32_t> cluster_offsets; // [n_clusters+1]
     std::vector<int32_t> cluster_sizes;   // [n_clusters]
+    std::vector<int32_t> token_ids_by_cluster; // [total_tokens]
+    std::vector<int32_t> compact_codes;   // [n_clusters * subspace_parts]
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -150,11 +158,16 @@ struct LayerPipelineRuntimeConfig {
     int32_t kmeans_early_stop_min_iter = 5;
     float kmeans_early_stop_rel_tol = 5e-4f;
     int32_t fp32_convert_chunk_elems = 1 << 20;
+    bool defer_merge_until_wait = false;
     int32_t kmeans_target_cluster_size = 16;
     int32_t kmeans_k1 = 0;
     int32_t kmeans_k2 = 0;
     int32_t kmeans_k3 = 0;
     int32_t kmeans_k4 = 0;
+    bool learned_partition_enabled = false;
+    int32_t learned_subspace_parts = 0;
+    std::vector<int32_t> learned_k_values;
+    std::vector<std::vector<std::vector<int32_t>>> learned_head_pair_groups;
 };
 
 class LayerPipeline {
@@ -221,6 +234,16 @@ public:
         bool is_last
     );
 
+    bool submit_raw_sequence_chunk(
+        torch::Tensor keys,       // [1, seq_len, kv_heads, dim] GPU tensor
+        torch::Tensor values,     // [1, seq_len, kv_heads, dim] GPU tensor
+        int chunk_id,
+        int source_token,
+        int start_token,
+        int chunk_len,
+        bool is_last
+    );
+
 
     /**
      * 取消 chunk pipeline（用于中途退出）
@@ -239,6 +262,9 @@ public:
     // ════════════════════════════════════════════════════════════════════════
     PipelineStage current_stage() const;
     std::string error_message() const;
+    bool transfers_finished() const {
+        return transfers_finished_.load(std::memory_order_acquire);
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     // Get results (after wait_ready() returns true)
@@ -249,6 +275,10 @@ public:
 
     const std::vector<ReorganizeResult>& get_reorganize_results() const {
         return reorganize_results_;
+    }
+
+    const std::vector<std::vector<std::vector<int32_t>>>& get_learned_head_pair_groups() const {
+        return runtime_config_.learned_head_pair_groups;
     }
 
     torch::Tensor get_keys_cpu() const {
@@ -285,9 +315,13 @@ private:
         int chunk_len = 0;
         bool is_last = false;
         size_t buffer_index = 0;
+        bool direct_to_final = false;
+        bool sequence_major_staging = false;
         cudaEvent_t ready_event = nullptr;
         torch::Tensor keys_src;
         torch::Tensor values_src;
+        torch::Tensor keys_seq_cpu;
+        torch::Tensor values_seq_cpu;
     };
 
     // ════════════════════════════════════════════════════════════════════════
@@ -350,6 +384,9 @@ private:
     // CPU tensors after transfer
     torch::Tensor keys_cpu_;    // [kv_heads, n_tokens, dim]
     torch::Tensor values_cpu_;
+    torch::Tensor keys_sequence_cpu_;  // [n_tokens, kv_heads, dim], raw CPU path
+    torch::Tensor values_sequence_cpu_;
+    bool sequence_major_cpu_ready_ = false;
 
     // K-means result
     std::unique_ptr<KmeansResult> kmeans_result_;
@@ -438,6 +475,7 @@ struct HeadReorgInput {
     int32_t n_active = 0;
     std::vector<int32_t> final_labels;         // [T]
     std::vector<int32_t> cluster_offsets;      // [n_active + 1]
+    std::vector<int32_t> compact_codes;        // [n_active * M]
 };
 
 // ════════════════════════════════════════════════════════════════════════
@@ -485,6 +523,19 @@ std::unique_ptr<KmeansResult> kmeans_execute_4(
     const LayerPipelineRuntimeConfig& runtime_config = {}
 );
 
+std::unique_ptr<KmeansResult> kmeans_execute_m(
+    const void* keys_data,       // 16-bit data (FP16/BF16)
+    int32_t kv_heads,
+    int32_t n_tokens,
+    int32_t dim,
+    const std::vector<int32_t>& k_values,
+    const std::vector<std::vector<std::vector<int32_t>>>& head_pair_groups,
+    torch::Dtype kv_dtype,
+    int32_t worker_threads = 12,
+    const LayerPipelineRuntimeConfig& runtime_config = {},
+    bool sequence_major = false
+);
+
 
 
 
@@ -522,6 +573,15 @@ std::pair<HeadReorgInput, std::vector<float>> build_compact_reorg_input_ivf(
     int32_t dim
 );
 
+std::pair<HeadReorgInput, std::vector<float>> build_compact_reorg_input_m(
+    const std::vector<std::vector<int32_t>>& labels_m,
+    const std::vector<std::vector<float>>& centroids_m,
+    const std::vector<int32_t>& subspace_dims,
+    const std::vector<std::vector<int32_t>>& pair_groups,
+    int32_t T,
+    int32_t dim
+);
+
 void reorganize_from_kmeans(
     const torch::Tensor& keys_cpu,
     const torch::Tensor& values_cpu,
@@ -552,6 +612,18 @@ void reorganize_from_kmeans_4(
     std::vector<ReorganizeResult>& out_results,
     std::vector<torch::Tensor>& merged_centroids,
     const std::vector<CPUBufferDescriptor>* output_buffers = nullptr
+);
+
+void reorganize_from_kmeans_m(
+    const torch::Tensor& keys_cpu,
+    const torch::Tensor& values_cpu,
+    const KmeansResult& kmeans_result,
+    const std::vector<std::vector<std::vector<int32_t>>>& head_pair_groups,
+    int32_t total_tokens,
+    std::vector<ReorganizeResult>& out_results,
+    std::vector<torch::Tensor>& merged_centroids,
+    const std::vector<CPUBufferDescriptor>* output_buffers = nullptr,
+    bool sequence_major = false
 );
 
 } // namespace imi

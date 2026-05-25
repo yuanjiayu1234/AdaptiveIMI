@@ -12,6 +12,7 @@ from library.AdaptiveIMI.cpp_extensions import gather_copy_and_concat, gather_co
 from library.AdaptiveIMI.imi_adapter import IMIPipeline, IMIRuntimeConfig, get_imi_kernels
 from ..base import KV_Cache
 from .async_update import AdaptiveIMIAsyncUpdateMixin
+from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
 from .indexing import AdaptiveIMIIndexingMixin, _KmeansScheduler
 from .prefetch import AdaptiveIMIPrefetchMixin
 from .retrieval import AdaptiveIMIRetrievalMixin
@@ -38,6 +39,77 @@ def _read_int_env(name: str) -> Optional[int]:
         return int(value)
     except ValueError:
         return None
+
+
+def _load_learned_partition_specs(
+    partition_path: Optional[str],
+    *,
+    layer_num: int,
+    kv_heads: int,
+) -> List[Optional[Dict[str, object]]]:
+    if not partition_path:
+        return [None] * layer_num
+
+    with open(partition_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    layer_groups = payload.get("layer_groups") or payload.get("groups")
+    if not isinstance(layer_groups, list):
+        raise ValueError("learned partition file must contain a 'layer_groups' list")
+
+    specs: List[Optional[Dict[str, object]]] = [None] * layer_num
+    for group in layer_groups:
+        if not isinstance(group, dict):
+            raise ValueError("each learned partition layer group must be an object")
+        layer_start = int(group.get("layer_start", group.get("start", 0)))
+        layer_end = int(group.get("layer_end", group.get("end", layer_num)))
+        if bool(group.get("layer_end_inclusive", False)):
+            layer_end += 1
+        layer_start = max(layer_start, 0)
+        layer_end = min(layer_end, layer_num)
+        if layer_start >= layer_end:
+            continue
+
+        heads_obj = group.get("heads")
+        if not isinstance(heads_obj, dict):
+            raise ValueError("learned partition layer group must contain heads as a dict")
+
+        heads: Dict[str, Dict[str, object]] = {}
+        expected_m = int(group.get("M", group.get("subspace_parts", 0)) or 0)
+        for head_idx in range(kv_heads):
+            raw_head = heads_obj.get(str(head_idx), heads_obj.get(head_idx))
+            if raw_head is None:
+                raise ValueError(f"learned partition missing head {head_idx}")
+            if isinstance(raw_head, dict):
+                groups = raw_head.get("groups")
+            else:
+                groups = raw_head
+            if not isinstance(groups, list) or not groups:
+                raise ValueError(f"learned partition head {head_idx} has no groups")
+            groups = [[int(pair) for pair in subgroup] for subgroup in groups]
+            if expected_m <= 0:
+                expected_m = len(groups)
+            if len(groups) != expected_m:
+                raise ValueError(
+                    f"learned partition head {head_idx} has M={len(groups)}, expected {expected_m}"
+                )
+            heads[str(head_idx)] = {"groups": groups}
+
+        spec = {
+            "enabled": True,
+            "subspace_parts": expected_m,
+            "M": expected_m,
+            "heads": heads,
+        }
+        if "k_values" in group:
+            spec["k_values"] = [int(value) for value in group["k_values"]]
+        elif "K" in group:
+            spec["k_values"] = [int(value) for value in group["K"]]
+
+        for layer_idx in range(layer_start, layer_end):
+            specs[layer_idx] = spec
+
+    return specs
 
 
 class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveIMIAsyncUpdateMixin, AdaptiveIMIRetrievalMixin, AdaptiveIMIRuntimeMixin, KV_Cache):
@@ -80,7 +152,7 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
             num_gpus,
             model_size,
         )
-        if batch_size != 1:
+        if batch_size != 1 and not bool((runtime_config or {}).get("allow_batch_size_gt_one", False)):
             raise ValueError("IMI cache currently supports batch_size=1.")
 
         self.device_list = sorted(set(self.layer_mapping.values()), key=lambda x: int(x.split(":")[-1]))
@@ -88,7 +160,8 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
 
         self.static_pattern_start = static_pattern_start
         self.static_pattern_end = static_pattern_end
-        self.static_pattern_total = self.static_pattern_start + self.static_pattern_end
+        self.base_static_pattern_total = self.static_pattern_start + self.static_pattern_end
+        self.static_pattern_total = self.base_static_pattern_total
 
         self.group_size = self.num_heads // self.kv_head
         self.batch_groups = self.batch_size * self.kv_head
@@ -98,11 +171,18 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
         self.retrieval_budget = retrieval_budget
         self.cache_ratio = cache_ratio
         self.buffer_cluster_num = buffer_cluster_num
-        if subspace_parts not in (0, 2, 4):
-            raise ValueError("subspace_parts must be 0, 2 or 4")
-        self.subspace_parts = subspace_parts
         self._available_cpu_cores = _get_available_cpu_cores()
         runtime_config = runtime_config or {}
+        partition_path = runtime_config.get("partition_path") or runtime_config.get("learned_partition_path")
+        self.learned_partition_specs = _load_learned_partition_specs(
+            str(partition_path) if partition_path else None,
+            layer_num=self.layer_num,
+            kv_heads=self.kv_head,
+        )
+        self.learned_partition_enabled = any(spec is not None for spec in self.learned_partition_specs)
+        if subspace_parts not in (0, 2, 4) and not self.learned_partition_enabled:
+            raise ValueError("subspace_parts must be 0, 2 or 4 unless a learned partition_path is provided")
+        self.subspace_parts = subspace_parts
         prefill_cfg = runtime_config.get("prefill") or {}
         if not isinstance(prefill_cfg, dict):
             prefill_cfg = {}
@@ -110,7 +190,11 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
             prefill_cfg = {"streaming": runtime_config.get("streaming")}
 
         kmeans_cfg = dict(runtime_config.get("kmeans") or {})
-        per_layer_tasks = self.kv_head * max(self.subspace_parts, 1)
+        max_partition_m = max(
+            [int(spec.get("subspace_parts", 0)) for spec in self.learned_partition_specs if spec is not None]
+            or [0]
+        )
+        per_layer_tasks = self.kv_head * max(max_partition_m, self.subspace_parts, 1)
         min_threads_per_phase = max(1, self._available_cpu_cores // max(1, per_layer_tasks))
         env_min_threads = _read_int_env("IMI_MIN_THREADS_PER_PHASE")
         if env_min_threads is not None and env_min_threads > 0:
@@ -122,6 +206,9 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
             "enable_omp_nested": True,
             "omp_max_active_levels": 2,
         }
+        user_pipeline_cfg = runtime_config.get("pipeline")
+        if isinstance(user_pipeline_cfg, dict):
+            pipeline_cfg.update(user_pipeline_cfg)
 
         self.runtime_config = {
             "cpu_threads": self._available_cpu_cores,
@@ -130,6 +217,7 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
             "prefetch": dict(runtime_config.get("prefetch") or {}),
             "streaming": dict(prefill_cfg.get("streaming")or {}),
             "async_update": dict(runtime_config.get("async_update") or {}),
+            "partition_path": str(partition_path) if partition_path else None,
         }
 
         self.input_length = int(input_length) if input_length is not None else self.max_length - max_new_length
@@ -202,6 +290,12 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
             enable_direct_write = os.getenv("IMI_DISABLE_DIRECT_WRITE", "0") != "1"
             for ldx in range(self.layer_num):
                 device_id = int(self.layer_mapping[str(ldx)].split(":")[-1])
+                learned_partition = self.learned_partition_specs[ldx]
+                layer_subspace_parts = (
+                    int(learned_partition["subspace_parts"])
+                    if learned_partition is not None
+                    else self.subspace_parts
+                )
                 self.imi_pipelines.append(
                     IMIPipeline(
                         layer_idx=ldx,
@@ -210,7 +304,8 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
                         dtype=self.dtype,
                         device_id=device_id,
                         max_tokens=self.list_capacity,
-                        subspace_parts=self.subspace_parts,
+                        subspace_parts=layer_subspace_parts,
+                        learned_partition=learned_partition,
                         enable_direct_write=enable_direct_write,
                         runtime_config=IMIRuntimeConfig(
                             pipeline=self.runtime_config["pipeline"],
@@ -366,7 +461,7 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
 
         self._kmeans_job_seq = 0
         self._kmeans_job_lock = threading.Lock()
-        self._kmeans_min_threads_per_layer = max(1, self.kv_head * max(self.subspace_parts, 1))
+        self._kmeans_min_threads_per_layer = max(1, self.kv_head * max(max_partition_m, self.subspace_parts, 1))
         max_concurrent = _read_int_env("IMI_KMEANS_MAX_CONCURRENT")
         if max_concurrent is None and self.list_capacity >= 65536:
             max_concurrent = 1
@@ -380,11 +475,12 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
     def can_reuse_for_next_sequence(self, valid_start, max_new_length: int, input_length: int) -> bool:
         new_input_length = int(input_length)
         new_actual_gen_len = int(max_new_length) - 1
-        new_list_stride = max(new_input_length - self.static_pattern_total, 0)
+        base_static_pattern_total = int(getattr(self, "base_static_pattern_total", self.static_pattern_start + self.static_pattern_end))
+        new_list_stride = max(new_input_length - base_static_pattern_total, 0)
         if new_list_stride > self.list_capacity:
             return False
         if self.build_index_when_prefilling:
-            new_static_stride = self.static_pattern_total + new_actual_gen_len
+            new_static_stride = base_static_pattern_total + new_actual_gen_len
         else:
             new_static_stride = new_input_length + new_actual_gen_len
         if new_static_stride > self.static_capacity:
@@ -400,6 +496,7 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
         self.valid_start_list = valid_start
         self.input_length = int(input_length)
         self.actual_gen_len = int(max_new_length) - 1
+        self.static_pattern_total = int(getattr(self, "base_static_pattern_total", self.static_pattern_start + self.static_pattern_end))
         self.list_stride = max(self.input_length - self.static_pattern_total, 0)
         if self.build_index_when_prefilling:
             self.static_stride = self.static_pattern_total + self.actual_gen_len
@@ -411,6 +508,7 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
         self.layer_metadata = [None] * self.layer_num
         self.layer_ready = [False] * self.layer_num
         self.layer_started = [False] * self.layer_num
+        self.cache_prepared = False
         self._index_summary_logged = False
         self._expected_middle_len = [None] * self.layer_num
 
@@ -443,6 +541,22 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
             done_event.clear()
 
         for layer_idx in range(self.layer_num):
+            if self.cluster_sizes_cpu[layer_idx] is not None:
+                self.cluster_sizes_cpu[layer_idx].zero_()
+            if self.cluster_offsets_cpu[layer_idx] is not None:
+                self.cluster_offsets_cpu[layer_idx].zero_()
+            if self.cluster_sizes_gpu[layer_idx] is not None:
+                self.cluster_sizes_gpu[layer_idx].zero_()
+            if self.centroids_cpu[layer_idx] is not None:
+                self.centroids_cpu[layer_idx].zero_()
+            if self.centroids_mask_cpu[layer_idx] is not None:
+                self.centroids_mask_cpu[layer_idx].fill_(True)
+            if self.centroids[layer_idx] is not None:
+                self.centroids[layer_idx].zero_()
+            if self.centroids_mask[layer_idx] is not None:
+                self.centroids_mask[layer_idx].fill_(True)
+            self.centroids_shadow[layer_idx] = None
+            self.centroid_counts[layer_idx] = None
             if self.async_update_buffers[layer_idx] is not None:
                 self.async_update_buffers[layer_idx]["count"] = 0
                 self.async_update_buffers[layer_idx]["delta_write_pos"].zero_()
@@ -452,18 +566,37 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
                 self.delta_sums[layer_idx].zero_()
             if self.delta_counts_gpu[layer_idx] is not None:
                 self.delta_counts_gpu[layer_idx].zero_()
+            if self.delta_cluster_ids[layer_idx] is not None:
+                self.delta_cluster_ids[layer_idx].fill_(self.padding_cluster_id)
 
     def _estimate_cache_parameters(self) -> Tuple[int, int, int, int]:
         if not self.build_index_when_prefilling:
             return 0, 0, 0, 0
 
-        n_tokens = max(self.list_stride, 1)
-        total_clusters = max(int(n_tokens / 16), 1)
-        if self.subspace_parts == 4:
+        n_tokens = max(self.list_capacity, self.list_stride, 1)
+        if self.learned_partition_enabled:
+            kmeans_cfg = self.runtime_config.get("kmeans") or {}
+            target_cluster_size = max(int(kmeans_cfg.get("target_cluster_size", kmeans_cfg.get("cluster_size", 16))), 1)
+            max_clusters = 1
+            for spec in self.learned_partition_specs:
+                if spec is None:
+                    continue
+                m = max(int(spec.get("subspace_parts", 1)), 1)
+                k_values = choose_learned_k_values(
+                    spec,
+                    n_tokens,
+                    target_cluster_size,
+                    default_m=m,
+                )
+                product = product_k_values(k_values)
+                max_clusters = max(max_clusters, min(product, n_tokens))
+            n_centroids = int(max_clusters) + 1
+        elif self.subspace_parts == 4:
             total_clusters_f = max(n_tokens / 16.0, 1.0)
             k = max(int(round(total_clusters_f ** 0.25)), 2)
             n_centroids = k ** 4 + 1
         else:
+            total_clusters = max(int(n_tokens / 16), 1)
             k = max(int(math.sqrt(total_clusters)), 32)
             n_centroids = k * k + 1
 

@@ -137,11 +137,13 @@ class LLM(PrefillMixin, SamplingMixin):
         torch.cuda.empty_cache()
 
     def _clear_prefill_prefix_kv_workspace(self) -> None:
-        for workspace in self._prefill_prefix_kv_workspace.values():
-            if not workspace:
+        for pool in self._prefill_prefix_kv_workspace.values():
+            if not pool:
                 continue
-            workspace["key"] = None
-            workspace["value"] = None
+            workspaces = pool if isinstance(pool, list) else [pool]
+            for workspace in workspaces:
+                workspace["key"] = None
+                workspace["value"] = None
         self._prefill_prefix_kv_workspace.clear()
 
     def _reset_kv_cache_state(self) -> None:
@@ -202,13 +204,17 @@ class LLM(PrefillMixin, SamplingMixin):
         streaming_cfg = imi_config.setdefault("streaming", {})
         streaming_cfg["prefill_chunk_size"] = self.prefill_attn_chunk_size
 
-        if imi_config.get("gpu_only", False):
+        imi_engine = str(imi_config.get("engine", "") or "").lower()
+        if imi_config.get("gpu_only", False) and imi_engine != "hybrid_8way_v2":
             raise ValueError("AdaptiveIMI gpu_only mode is not supported.")
 
-        from cache_hub.adaptive_imi.cache import adpimi_cache
+        if imi_engine == "hybrid_8way_v2":
+            from cache_hub.adaptive_imi_v2.cache import Hybrid8WayIMICache as imi_cache_cls
+        else:
+            from cache_hub.adaptive_imi.cache import adpimi_cache as imi_cache_cls
 
         existing_cache = getattr(self, "kv_cache", None)
-        if isinstance(existing_cache, adpimi_cache) and existing_cache.can_reuse_for_next_sequence(
+        if isinstance(existing_cache, imi_cache_cls) and existing_cache.can_reuse_for_next_sequence(
             valid_start,
             self.max_new_length,
             self.input_length,
@@ -221,7 +227,7 @@ class LLM(PrefillMixin, SamplingMixin):
             return
 
         self._reset_kv_cache_state()
-        self.kv_cache = adpimi_cache(
+        self.kv_cache = imi_cache_cls(
             valid_start=valid_start,
             layer_num=self.num_layers,
             batch_size=self.batch_size,
@@ -252,6 +258,9 @@ class LLM(PrefillMixin, SamplingMixin):
                 "prefill": imi_config.get("prefill", {}),
                 "streaming": imi_config.get("streaming", {}),
                 "async_update": imi_config.get("async_update", {}),
+                "partition_path": imi_config.get("partition_path") or imi_config.get("learned_partition_path"),
+                "hybrid_index": imi_config.get("hybrid_index", {}),
+                "decode_search": imi_config.get("decode_search", {}),
             },
         )
 
@@ -271,6 +280,9 @@ class LLM(PrefillMixin, SamplingMixin):
             return
 
         chunk_size = prefill_cfg.get("prefill_chunk_size")
+        env_chunk_size = os.getenv("IMI_PREFILL_CHUNK_SIZE")
+        if env_chunk_size:
+            chunk_size = env_chunk_size
         if chunk_size is not None:
             chunk_size = int(chunk_size)
             if chunk_size > 0:
@@ -355,6 +367,23 @@ class LLM(PrefillMixin, SamplingMixin):
             float(bsz) * float(seq_len) * float(self.hidden_size) * float(torch.tensor([], dtype=self.dtype).element_size())
         ) / (1024 ** 3)
         return required_gb <= max_pinned_gb
+    def _should_keep_streaming_hidden_on_gpu(self, device: str, bsz: int, seq_len: int) -> bool:
+        mode = os.getenv("IMI_STREAMING_HIDDEN_DEVICE", "auto").lower()
+        if mode in ("cpu", "host", "offload"):
+            return False
+        if mode in ("gpu", "cuda", "device"):
+            return True
+        if mode != "auto" or self.num_gpus != 1:
+            return False
+
+        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        required_bytes = 2 * int(bsz) * int(seq_len) * int(self.hidden_size) * int(element_size)
+        max_bytes = int(float(os.getenv("IMI_STREAMING_HIDDEN_GPU_GB", "4.0")) * (1024 ** 3))
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
+        except Exception:
+            return False
+        return required_bytes <= max_bytes and required_bytes <= int(free_bytes * 0.5)
     def _streaming_progress_enabled(self) -> bool:
         return os.getenv("IMI_STREAMING_PROGRESS", "0") == "1"
     def _debug_stop_after_prefill(self) -> bool:
@@ -412,24 +441,52 @@ class LLM(PrefillMixin, SamplingMixin):
         print("Start prefilling ...")
         torch.cuda.synchronize()
         prefill_start = time.time()
+        profile_prefill_phases = os.getenv("IMI_PROFILE_PREFILL_PHASES", "0") == "1"
+        phase_start = time.perf_counter()
 
         logits = self.prefill_forward(inputs_ids=inputs_ids)
+        prefill_forward_end = time.perf_counter()
         output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+        sampling_end = time.perf_counter()
         outputs_ids.append(output_ids)
         self._debug_log_token_ids("prefill", output_ids)
 
         if self._debug_stop_after_prefill():
             torch.cuda.synchronize()
+            final_sync_end = time.perf_counter()
             prefill_end = time.time()
             self.prefill_latency_s = prefill_end - prefill_start
+            if profile_prefill_phases:
+                print(
+                    "[IMI prefill phases] "
+                    f"prefill_forward_ms={(prefill_forward_end - phase_start) * 1000.0:.2f} "
+                    f"sampling_ms={(sampling_end - prefill_forward_end) * 1000.0:.2f} "
+                    f"move_prepare_cache_ms=0.00 "
+                    f"final_sync_ms={(final_sync_end - sampling_end) * 1000.0:.2f} "
+                    f"total_ms={(final_sync_end - phase_start) * 1000.0:.2f}",
+                    flush=True,
+                )
             print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
             return torch.cat(outputs_ids, dim=-1).tolist()
 
+        move_start = time.perf_counter()
         self.move()
+        move_end = time.perf_counter()
 
         torch.cuda.synchronize()
+        final_sync_end = time.perf_counter()
         prefill_end = time.time()
         self.prefill_latency_s = prefill_end - prefill_start
+        if profile_prefill_phases:
+            print(
+                "[IMI prefill phases] "
+                f"prefill_forward_ms={(prefill_forward_end - phase_start) * 1000.0:.2f} "
+                f"sampling_ms={(sampling_end - prefill_forward_end) * 1000.0:.2f} "
+                f"move_prepare_cache_ms={(move_end - move_start) * 1000.0:.2f} "
+                f"final_sync_ms={(final_sync_end - move_end) * 1000.0:.2f} "
+                f"total_ms={(final_sync_end - phase_start) * 1000.0:.2f}",
+                flush=True,
+            )
         print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
 
         # CUDAGraph Capture (if enabled)

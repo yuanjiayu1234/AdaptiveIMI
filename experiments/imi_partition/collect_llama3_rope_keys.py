@@ -132,6 +132,19 @@ def _iter_prompts(args: argparse.Namespace) -> Iterable[str]:
     raise ValueError("provide either --jsonl or --hf-dataset")
 
 
+def _resolve_modeling_module(model_path: str, model_name: str):
+    import importlib
+
+    probe = f"{model_name} {model_path}".lower()
+    if "qwen3" in probe:
+        return importlib.import_module("transformers.models.qwen3.modeling_qwen3")
+    if "qwen2" in probe:
+        return importlib.import_module("transformers.models.qwen2.modeling_qwen2")
+    if "mistral" in probe:
+        return importlib.import_module("transformers.models.mistral.modeling_mistral")
+    return importlib.import_module("transformers.models.llama.modeling_llama")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect RoPE-applied Llama keys for IMI partition experiments.")
     parser.add_argument("--model", type=str, default="llama-3-8b-1048k")
@@ -172,7 +185,7 @@ def main() -> None:
         max_tokens_per_prompt=args.max_tokens_per_prompt,
     )
 
-    import transformers.models.llama.modeling_llama as llama_modeling
+    llama_modeling = _resolve_modeling_module(model_path, args.model)
 
     original_apply_rope = llama_modeling.apply_rotary_pos_emb
     original_forwards = []

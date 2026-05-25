@@ -1,15 +1,31 @@
-tqdm
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# PyTorch itself is intentionally installed in README before this file:
+#   pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+# Keeping torch out of this file avoids accidentally installing a CPU-only build.
+
+tqdm==4.67.1
 ninja==1.11.1.4
 argparse
-termcolor
+termcolor==2.5.0
+setuptools==75.8.0
+wheel==0.45.1
 packaging==25.0
-torch==2.5.1
+numpy==1.26.4
+pandas==2.2.3
+PyYAML==6.0.2
+nltk==3.9.1
+sentencepiece==0.2.0
+protobuf==5.29.3
+accelerate==1.8.1
 vllm==0.6.5
-transformers==4.49.0
+transformers==4.57.1
+tokenizers==0.22.1
+safetensors==0.5.3
+huggingface-hub==0.36.0
 pybind11==2.12.0
 
 datasets==3.6.0
-huggingface-hub==0.33.0
 
 evaluate==0.4.3
 rouge==1.0.1
@@ -23,3 +39,19 @@ scipy==1.13.0
 jieba==0.42.1
 fuzzywuzzy==0.18.0
 fire==0.7.0
+
+# Explicitly pin packages that commonly break import-time dependency checks
+# when a conda/pip environment is partially overwritten.
+filelock==3.16.1
+fsspec==2024.12.0
+requests==2.32.3
+urllib3==2.2.3
+idna==3.7
+certifi==2024.12.14
+charset-normalizer==3.4.1
+jinja2==3.1.6
+MarkupSafe==3.0.3
+sympy==1.13.1
+mpmath==1.3.0
+pillow==11.1.0
+typing_extensions==4.12.2

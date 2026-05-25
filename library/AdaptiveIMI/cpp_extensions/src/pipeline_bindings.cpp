@@ -95,6 +95,79 @@ float py_dict_get_f32(const py::dict& dict_obj, const char* key, float fallback)
     return fallback;
 }
 
+std::vector<int32_t> py_sequence_to_i32_vector(const py::handle& obj) {
+    std::vector<int32_t> out;
+    if (obj.is_none()) {
+        return out;
+    }
+    py::sequence seq = py::cast<py::sequence>(obj);
+    out.reserve(seq.size());
+    for (py::handle item : seq) {
+        out.push_back(py::cast<int32_t>(item));
+    }
+    return out;
+}
+
+std::vector<std::vector<int32_t>> py_groups_to_i32_vectors(const py::handle& obj) {
+    std::vector<std::vector<int32_t>> out;
+    if (obj.is_none()) {
+        return out;
+    }
+    py::sequence groups = py::cast<py::sequence>(obj);
+    out.reserve(groups.size());
+    for (py::handle group : groups) {
+        out.push_back(py_sequence_to_i32_vector(group));
+    }
+    return out;
+}
+
+std::vector<std::vector<std::vector<int32_t>>> py_heads_to_pair_groups(
+    const py::handle& heads_obj,
+    int32_t kv_heads_hint
+) {
+    std::vector<std::vector<std::vector<int32_t>>> out;
+    if (heads_obj.is_none()) {
+        return out;
+    }
+
+    if (py::isinstance<py::dict>(heads_obj)) {
+        py::dict heads_dict = py::cast<py::dict>(heads_obj);
+        int32_t max_head = kv_heads_hint - 1;
+        for (auto item : heads_dict) {
+            int32_t head = std::stoi(py::cast<std::string>(py::str(item.first)));
+            max_head = std::max(max_head, head);
+        }
+        out.resize(std::max<int32_t>(max_head + 1, 0));
+        for (auto item : heads_dict) {
+            int32_t head = std::stoi(py::cast<std::string>(py::str(item.first)));
+            py::handle value = item.second;
+            py::object groups_obj = py::none();
+            if (py::isinstance<py::dict>(value)) {
+                py::dict head_dict = py::cast<py::dict>(value);
+                groups_obj = py_dict_get_value(head_dict, "groups");
+            } else {
+                groups_obj = py::reinterpret_borrow<py::object>(value);
+            }
+            out.at(head) = py_groups_to_i32_vectors(groups_obj);
+        }
+        return out;
+    }
+
+    py::sequence heads = py::cast<py::sequence>(heads_obj);
+    out.reserve(heads.size());
+    for (py::handle head_obj : heads) {
+        py::object groups_obj = py::none();
+        if (py::isinstance<py::dict>(head_obj)) {
+            py::dict head_dict = py::cast<py::dict>(head_obj);
+            groups_obj = py_dict_get_value(head_dict, "groups");
+        } else {
+            groups_obj = py::reinterpret_borrow<py::object>(head_obj);
+        }
+        out.push_back(py_groups_to_i32_vectors(groups_obj));
+    }
+    return out;
+}
+
 LayerPipelineRuntimeConfig runtime_config_from_python(const py::object& runtime_config_obj) {
     LayerPipelineRuntimeConfig cfg;
     if (runtime_config_obj.is_none()) {
@@ -140,6 +213,33 @@ LayerPipelineRuntimeConfig runtime_config_from_python(const py::object& runtime_
     cfg.kmeans_k2 = py_dict_get_i32(kmeans, "k2", cfg.kmeans_k2);
     cfg.kmeans_k3 = py_dict_get_i32(kmeans, "k3", cfg.kmeans_k3);
     cfg.kmeans_k4 = py_dict_get_i32(kmeans, "k4", cfg.kmeans_k4);
+    cfg.defer_merge_until_wait = py_obj_to_bool(
+        py_dict_get_value(pipeline, "defer_merge_until_wait"),
+        cfg.defer_merge_until_wait
+    );
+
+    py::object learned_obj = py_dict_get_value(root, "learned_partition");
+    if (!learned_obj.is_none()) {
+        py::dict learned = py::cast<py::dict>(learned_obj);
+        cfg.learned_partition_enabled = py_obj_to_bool(
+            py_dict_get_value(learned, "enabled"),
+            true
+        );
+        cfg.learned_subspace_parts = py_dict_get_i32(
+            learned,
+            "subspace_parts",
+            py_dict_get_i32(learned, "M", cfg.learned_subspace_parts)
+        );
+        py::object k_values_obj = py_dict_get_value(learned, "k_values");
+        if (k_values_obj.is_none()) {
+            k_values_obj = py_dict_get_value(learned, "K");
+        }
+        cfg.learned_k_values = py_sequence_to_i32_vector(k_values_obj);
+        cfg.learned_head_pair_groups = py_heads_to_pair_groups(
+            py_dict_get_value(learned, "heads"),
+            0
+        );
+    }
     return cfg;
 }
 
@@ -187,6 +287,45 @@ py::dict kmeans_result_to_dict(const KmeansResult* result) {
 
     d["per_head_n_clusters"] = result->per_head_n_clusters;
 
+    if (!result->per_head_labels_m.empty()) {
+        py::list per_head_labels_m;
+        py::list per_head_centroids_m;
+        py::list per_head_subspace_dims;
+        for (int32_t head = 0; head < static_cast<int32_t>(result->per_head_labels_m.size()); ++head) {
+            py::list labels_for_head;
+            py::list centroids_for_head;
+            py::list dims_for_head;
+            for (int32_t stage = 0; stage < static_cast<int32_t>(result->per_head_labels_m[head].size()); ++stage) {
+                const auto& labels = result->per_head_labels_m[head][stage];
+                auto labels_tensor = torch::from_blob(
+                    const_cast<int32_t*>(labels.data()),
+                    {static_cast<int64_t>(labels.size())},
+                    torch::kInt32
+                ).clone();
+                labels_for_head.append(labels_tensor);
+
+                int32_t sub_dim = result->per_head_subspace_dims[head][stage];
+                dims_for_head.append(sub_dim);
+                const auto& centroids = result->per_head_centroids_m[head][stage];
+                int64_t k = sub_dim > 0
+                    ? static_cast<int64_t>(centroids.size() / static_cast<size_t>(sub_dim))
+                    : 0;
+                auto centroids_tensor = torch::from_blob(
+                    const_cast<float*>(centroids.data()),
+                    {k, static_cast<int64_t>(sub_dim)},
+                    torch::kFloat32
+                ).clone();
+                centroids_for_head.append(centroids_tensor);
+            }
+            per_head_labels_m.append(labels_for_head);
+            per_head_centroids_m.append(centroids_for_head);
+            per_head_subspace_dims.append(dims_for_head);
+        }
+        d["per_head_labels_m"] = per_head_labels_m;
+        d["per_head_centroids_m"] = per_head_centroids_m;
+        d["per_head_subspace_dims"] = per_head_subspace_dims;
+    }
+
     return d;
 }
 
@@ -200,6 +339,8 @@ py::dict reorganize_result_to_dict(const ReorganizeResult& result) {
     d["reorganized_values"] = result.reorganized_values;
     d["cluster_offsets"] = result.cluster_offsets;
     d["cluster_sizes"] = result.cluster_sizes;
+    d["token_ids_by_cluster"] = result.token_ids_by_cluster;
+    d["compact_codes"] = result.compact_codes;
     return d;
 }
 
@@ -230,12 +371,18 @@ py::dict metadata_result_to_dict(LayerPipeline& pipeline) {
     auto cluster_sizes = torch::zeros({kv_heads, max_clusters}, int_opts);
     auto cluster_offsets = torch::zeros({kv_heads, max_clusters + 1}, int_opts);
     auto centroids = torch::zeros({kv_heads, max_clusters, kmeans->dim}, float_opts);
+    auto token_ids_by_cluster = torch::full({kv_heads, kmeans->n_tokens}, -1, int_opts);
+
+    const int64_t M = static_cast<int64_t>(kmeans->subspace_parts);
+    auto compact_codes = torch::full({kv_heads, max_clusters, M}, -1, int_opts);
 
     auto* head_indices_ptr = head_indices.data_ptr<int64_t>();
     auto* cluster_counts_ptr = cluster_counts.data_ptr<int32_t>();
     auto* cluster_sizes_ptr = cluster_sizes.data_ptr<int32_t>();
     auto* cluster_offsets_ptr = cluster_offsets.data_ptr<int32_t>();
     auto* centroids_ptr = centroids.data_ptr<float>();
+    auto* token_ids_ptr = token_ids_by_cluster.data_ptr<int32_t>();
+    auto* compact_codes_ptr = compact_codes.data_ptr<int32_t>();
 
     for (int64_t head = 0; head < kv_heads; ++head) {
         const auto& reorg = reorganized[head];
@@ -260,6 +407,20 @@ py::dict metadata_result_to_dict(LayerPipeline& pipeline) {
                 centroid_values.data(),
                 static_cast<size_t>(cluster_count * kmeans->dim) * sizeof(float)
             );
+            if (!reorg.token_ids_by_cluster.empty()) {
+                std::memcpy(
+                    token_ids_ptr + head * kmeans->n_tokens,
+                    reorg.token_ids_by_cluster.data(),
+                    static_cast<size_t>(kmeans->n_tokens) * sizeof(int32_t)
+                );
+            }
+            if (!reorg.compact_codes.empty() && M > 0) {
+                std::memcpy(
+                    compact_codes_ptr + head * max_clusters * M,
+                    reorg.compact_codes.data(),
+                    static_cast<size_t>(cluster_count * M) * sizeof(int32_t)
+                );
+            }
             const int32_t last_offset = reorg.cluster_offsets[cluster_count];
             for (int64_t idx = cluster_count + 1; idx < max_clusters + 1; ++idx) {
                 cluster_offsets_ptr[head * (max_clusters + 1) + idx] = last_offset;
@@ -272,6 +433,76 @@ py::dict metadata_result_to_dict(LayerPipeline& pipeline) {
     d["cluster_sizes"] = cluster_sizes;
     d["cluster_offsets"] = cluster_offsets;
     d["centroids"] = centroids;
+    d["token_ids_by_cluster"] = token_ids_by_cluster;
+    d["compact_codes"] = compact_codes;
+
+    if (!kmeans->per_head_centroids_m.empty()) {
+        int64_t max_k = 1;
+        int64_t max_sub_dim = 1;
+        for (int64_t head = 0; head < kv_heads; ++head) {
+            for (int64_t m = 0; m < static_cast<int64_t>(kmeans->per_head_centroids_m[head].size()); ++m) {
+                int64_t sub_dim = static_cast<int64_t>(kmeans->per_head_subspace_dims[head][m]);
+                max_sub_dim = std::max<int64_t>(max_sub_dim, sub_dim);
+                if (sub_dim > 0) {
+                    max_k = std::max<int64_t>(
+                        max_k,
+                        static_cast<int64_t>(kmeans->per_head_centroids_m[head][m].size()) / sub_dim
+                    );
+                }
+            }
+        }
+
+        auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+        auto subspace_centroids = torch::zeros({kv_heads, M, max_k, max_sub_dim}, float_opts);
+        auto subspace_centroid_masks = torch::ones({kv_heads, M, max_k}, bool_opts);
+        auto subspace_dim_ids = torch::zeros({kv_heads, M, max_sub_dim}, long_opts);
+        auto subspace_dim_masks = torch::ones({kv_heads, M, max_sub_dim}, bool_opts);
+
+        auto* sub_centroids_ptr = subspace_centroids.data_ptr<float>();
+        auto* sub_masks_ptr = subspace_centroid_masks.data_ptr<bool>();
+        auto* dim_ids_ptr = subspace_dim_ids.data_ptr<int64_t>();
+        auto* dim_masks_ptr = subspace_dim_masks.data_ptr<bool>();
+
+        const auto& pair_groups = pipeline.get_learned_head_pair_groups();
+        const int64_t half_dim = static_cast<int64_t>(kmeans->dim / 2);
+        for (int64_t head = 0; head < kv_heads; ++head) {
+            for (int64_t m = 0; m < M; ++m) {
+                const int64_t sub_dim = static_cast<int64_t>(kmeans->per_head_subspace_dims[head][m]);
+                const auto& values = kmeans->per_head_centroids_m[head][m];
+                const int64_t k = sub_dim > 0 ? static_cast<int64_t>(values.size()) / sub_dim : 0;
+                if (k > 0 && sub_dim > 0) {
+                    float* dst = sub_centroids_ptr
+                        + (((head * M + m) * max_k) * max_sub_dim);
+                    for (int64_t centroid = 0; centroid < k; ++centroid) {
+                        std::memcpy(
+                            dst + centroid * max_sub_dim,
+                            values.data() + centroid * sub_dim,
+                            static_cast<size_t>(sub_dim) * sizeof(float)
+                        );
+                        sub_masks_ptr[(head * M + m) * max_k + centroid] = false;
+                    }
+                }
+
+                if (head < static_cast<int64_t>(pair_groups.size()) &&
+                    m < static_cast<int64_t>(pair_groups[head].size())) {
+                    int64_t offset = 0;
+                    for (int32_t pair : pair_groups[head][m]) {
+                        dim_ids_ptr[(head * M + m) * max_sub_dim + offset] = pair;
+                        dim_masks_ptr[(head * M + m) * max_sub_dim + offset] = false;
+                        ++offset;
+                        dim_ids_ptr[(head * M + m) * max_sub_dim + offset] = pair + half_dim;
+                        dim_masks_ptr[(head * M + m) * max_sub_dim + offset] = false;
+                        ++offset;
+                    }
+                }
+            }
+        }
+
+        d["subspace_centroids"] = subspace_centroids;
+        d["subspace_centroid_masks"] = subspace_centroid_masks;
+        d["subspace_dim_ids"] = subspace_dim_ids;
+        d["subspace_dim_masks"] = subspace_dim_masks;
+    }
     return d;
 }
 
@@ -431,6 +662,42 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                      - C++ chunk worker will wait for transfer to complete
              )pbdoc")
 
+        .def("submit_raw_sequence_chunk",
+            [](LayerPipeline& self,
+               torch::Tensor keys,
+               torch::Tensor values,
+               int chunk_id,
+               int source_token,
+               int start_token,
+               int chunk_len,
+               bool is_last) {
+                py::gil_scoped_release release;
+                return self.submit_raw_sequence_chunk(
+                    keys,
+                    values,
+                    chunk_id,
+                    source_token,
+                    start_token,
+                    chunk_len,
+                    is_last
+                );
+            },
+            py::arg("keys"),
+            py::arg("values"),
+            py::arg("chunk_id"),
+            py::arg("source_token"),
+            py::arg("start_token"),
+            py::arg("chunk_len"),
+            py::arg("is_last"),
+            R"pbdoc(
+                Submit one raw-layout chunk from [1, seq_len, kv_heads, dim].
+
+                The pipeline copies directly from the original sequence layout
+                to pinned CPU staging on its transfer stream. It does not
+                require Python to transpose or materialize a GPU-contiguous
+                [kv_heads, chunk_len, dim] buffer.
+             )pbdoc")
+
         .def("set_worker_threads",
             [](LayerPipeline& self, int32_t worker_threads) {
                 self.set_worker_threads(worker_threads);
@@ -494,6 +761,13 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                     PipelineStage enum value
              )pbdoc")
 
+        .def("transfers_finished", &LayerPipeline::transfers_finished,
+             R"pbdoc(
+                Return true once all submitted GPU-to-CPU raw KV transfers have
+                completed and the CPU pipeline no longer needs the source GPU
+                KV workspace.
+             )pbdoc")
+
         .def("error_message", &LayerPipeline::error_message,
              R"pbdoc(
                 Get error message if pipeline failed.
@@ -534,6 +808,12 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                       - 'cluster_sizes': int32 [kv_heads, max_clusters]
                       - 'cluster_offsets': int32 [kv_heads, max_clusters + 1]
                       - 'centroids': float32 [kv_heads, max_clusters, dim]
+                      - 'token_ids_by_cluster': int32 [kv_heads, n_tokens]
+                      - 'compact_codes': int32 [kv_heads, max_clusters, subspace_parts]
+                      - 'subspace_centroids': float32 [kv_heads, subspace_parts, max_k, max_sub_dim] when learned partition is enabled
+                      - 'subspace_centroid_masks': bool [kv_heads, subspace_parts, max_k] when learned partition is enabled
+                      - 'subspace_dim_ids': int64 [kv_heads, subspace_parts, max_sub_dim] when learned partition is enabled
+                      - 'subspace_dim_masks': bool [kv_heads, subspace_parts, max_sub_dim] when learned partition is enabled
             )pbdoc")
 
         .def("get_pipeline_stats",
@@ -571,6 +851,8 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                       - 'reorganized_values': torch.Tensor (same dtype as kv_dtype, shape [n_tokens, dim])
                       - 'cluster_offsets': List[int] (CSR format)
                       - 'cluster_sizes': List[int]
+                      - 'token_ids_by_cluster': List[int]
+                      - 'compact_codes': List[int]
             )pbdoc")
 
         .def("get_keys_cpu", &LayerPipeline::get_keys_cpu,
