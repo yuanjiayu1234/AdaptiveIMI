@@ -8,6 +8,7 @@
 4. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
 5. library.AdaptiveIMI.cpp_extensions.gemm_softmax - CUTLASS batch gemm softmax
 6. library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp - Hybrid 8-way GPU index builder
+7. library.AdaptiveIMI.cpp_extensions.hybrid_subspace_kmeans_bench_cpp - benchmark-only subspace k-means
 
 使用方法:
     cd cpp_extensions
@@ -88,7 +89,16 @@ CUDA_LIB_CANDIDATES = [
     os.path.join(CUDA_HOME, 'lib64'),
     os.path.join(CUDA_HOME, 'lib'),
     os.path.join(CUDA_HOME, 'targets', 'x86_64-linux', 'lib'),
+    os.path.join(CUDA_HOME, 'lib64', 'stubs'),
+    os.path.join(CUDA_HOME, 'targets', 'x86_64-linux', 'lib', 'stubs'),
 ] + NVIDIA_LIB_DIRS
+for cuda_root in sorted(Path('/usr/local').glob('cuda-*')):
+    CUDA_LIB_CANDIDATES.extend([
+        str(cuda_root / 'lib64'),
+        str(cuda_root / 'lib64' / 'stubs'),
+        str(cuda_root / 'targets' / 'x86_64-linux' / 'lib'),
+        str(cuda_root / 'targets' / 'x86_64-linux' / 'lib' / 'stubs'),
+    ])
 CUDA_LIB_DIRS = _existing_unique(CUDA_LIB_CANDIDATES)
 if not CUDA_LIB_DIRS:
     CUDA_LIB_DIRS = [os.path.join(CUDA_HOME, 'lib64'), os.path.join(CUDA_HOME, 'lib')]
@@ -251,6 +261,7 @@ ultra_layer_pipeline_sources = [
     str(HERE / 'src' / 'layer_pipeline.cpp'),
     str(HERE / 'src' / 'kmeans_core.cpp'),
     str(HERE / 'src' / 'reorganize_core.cpp'),
+    str(HERE / 'src' / 'reorder_core.cpp'),
 ]
 
 ultra_layer_pipeline_ext = CppExtension(
@@ -319,12 +330,33 @@ gemm_softmax_ext = CUDAExtension(
 # ============================================================================
 hybrid_8way_builder_sources = [
     str(HERE / 'src' / 'hybrid_8way_bindings.cpp'),
+    str(HERE / 'src' / 'reorder_core.cpp'),
     str(HERE / 'cuda' / 'hybrid_8way_builder.cu'),
 ]
 
 hybrid_8way_builder_ext = CUDAExtension(
     name='library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp',
     sources=hybrid_8way_builder_sources,
+    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
+    library_dirs=CUDA_LIB_DIRS,
+    extra_compile_args={
+        'cxx': COMMON_CXX_FLAGS,
+        'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
+    },
+    extra_link_args=['-lcuda', '-lcudart'],
+)
+
+# ============================================================================
+# 模块 7: hybrid_subspace_kmeans_bench_cpp (CUDA benchmark only)
+# ============================================================================
+hybrid_subspace_kmeans_bench_sources = [
+    str(HERE / 'src' / 'hybrid_subspace_kmeans_bench_bindings.cpp'),
+    str(HERE / 'cuda' / 'hybrid_subspace_kmeans_bench.cu'),
+]
+
+hybrid_subspace_kmeans_bench_ext = CUDAExtension(
+    name='library.AdaptiveIMI.cpp_extensions.hybrid_subspace_kmeans_bench_cpp',
+    sources=hybrid_subspace_kmeans_bench_sources,
     include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
     library_dirs=CUDA_LIB_DIRS,
     extra_compile_args={
@@ -350,6 +382,7 @@ setup(
         copy_ext,
         gemm_softmax_ext,
         hybrid_8way_builder_ext,
+        hybrid_subspace_kmeans_bench_ext,
     ],
     cmdclass={
         'build_ext': BuildExtension,

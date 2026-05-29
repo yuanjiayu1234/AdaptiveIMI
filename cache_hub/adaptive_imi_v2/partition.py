@@ -77,6 +77,11 @@ def load_hybrid_partition_specs(
             raw_head = heads_obj.get(str(head_idx), heads_obj.get(head_idx))
             if raw_head is None:
                 raise ValueError(f"hybrid partition missing head {head_idx}")
+            if isinstance(raw_head, dict) and raw_head.get("dim_groups") is not None:
+                raise ValueError(
+                    "hybrid_8way_v2 currently accepts layer-head RoPE pair 'groups' only; "
+                    f"head {head_idx} provided dim_groups"
+                )
             raw_groups = raw_head.get("groups") if isinstance(raw_head, dict) else raw_head
             heads[str(head_idx)] = {
                 "groups": _validate_head_groups(raw_groups, head_dim=head_dim, m=required_m, head_idx=head_idx)

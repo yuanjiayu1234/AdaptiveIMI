@@ -434,6 +434,9 @@ class AdaptiveIMIRetrievalMixin:
                 gather_ms += retrieval_timing["gather_ms"]
 
             self._append_delta_to_execution(layer_idx, device, selected_cpu)
+            token_reranker = getattr(self, "_rerank_execution_tokens_for_decode", None)
+            if token_reranker is not None:
+                token_reranker(layer_idx, device, query_grouped)
 
             if profile:
                 torch.cuda.synchronize(device)

@@ -2,6 +2,7 @@
 // reorganize_core.cpp - 剥离的Reorganize核心算法（纯功能函数，无封装）
 // ============================================================================
 #include "layer_pipeline.hpp"
+#include "reorder_core.hpp"
 #include <omp.h>
 #include <cstring>
 #include <algorithm>
@@ -280,56 +281,56 @@ std::pair<HeadReorgInput, std::vector<float>> build_compact_reorg_input_m(
         }
     }
 
-    int64_t code_space64 = 1;
-    std::vector<int32_t> strides(M, 1);
+    uint64_t code_space = 1;
+    std::vector<uint64_t> strides(M, 1);
     for (int32_t m = 0; m < M; ++m) {
-        strides[m] = static_cast<int32_t>(code_space64);
-        if (code_space64 > std::numeric_limits<int32_t>::max() / std::max(1, k_values[m])) {
-            throw std::runtime_error("learned M-way dense code space exceeds int32 limit");
+        const uint64_t k = static_cast<uint64_t>(std::max(1, k_values[m]));
+        strides[m] = code_space;
+        if (code_space > std::numeric_limits<uint64_t>::max() / k) {
+            throw std::runtime_error("learned M-way packed code space exceeds uint64 limit");
         }
-        code_space64 *= std::max(1, k_values[m]);
+        code_space *= k;
     }
-    const int32_t code_space = static_cast<int32_t>(code_space64);
-    std::vector<int32_t> dense_counts(code_space, 0);
-    std::vector<int32_t> code_to_compact(code_space, -1);
-    out.final_labels.resize(T);
 
+    std::vector<uint64_t> token_codes(T);
     for (int32_t token = 0; token < T; ++token) {
-        int32_t dense_code = 0;
+        uint64_t code = 0;
         for (int32_t m = 0; m < M; ++m) {
             int32_t label = labels_m[m][token];
             if (label < 0 || label >= k_values[m]) {
                 throw std::runtime_error("learned M-way label out of range");
             }
-            dense_code += label * strides[m];
+            code += static_cast<uint64_t>(label) * strides[m];
         }
-        out.final_labels[token] = dense_code;
-        dense_counts[dense_code]++;
+        token_codes[token] = code;
     }
 
-    out.n_active = 0;
-    for (int32_t code = 0; code < code_space; ++code) {
-        if (dense_counts[code] > 0) {
-            code_to_compact[code] = out.n_active++;
-        }
+    std::vector<uint64_t> active_codes = token_codes;
+    std::sort(active_codes.begin(), active_codes.end());
+    active_codes.erase(std::unique(active_codes.begin(), active_codes.end()), active_codes.end());
+    if (active_codes.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::runtime_error("learned M-way active cluster count exceeds int32 limit");
     }
-    for (int32_t token = 0; token < T; ++token) {
-        out.final_labels[token] = code_to_compact[out.final_labels[token]];
-    }
+    out.n_active = static_cast<int32_t>(active_codes.size());
 
     out.compact_codes.resize(static_cast<size_t>(out.n_active) * M);
     std::vector<int32_t> counts(out.n_active, 0);
-    for (int32_t code = 0; code < code_space; ++code) {
-        const int32_t compact = code_to_compact[code];
-        if (compact < 0) {
-            continue;
-        }
-        counts[compact] = dense_counts[code];
-        int32_t tmp = code;
+    for (int32_t compact = 0; compact < out.n_active; ++compact) {
+        uint64_t tmp = active_codes[compact];
         for (int32_t m = 0; m < M; ++m) {
-            out.compact_codes[static_cast<size_t>(compact) * M + m] = tmp % k_values[m];
-            tmp /= k_values[m];
+            const uint64_t k = static_cast<uint64_t>(k_values[m]);
+            out.compact_codes[static_cast<size_t>(compact) * M + m] =
+                static_cast<int32_t>(tmp % k);
+            tmp /= k;
         }
+    }
+
+    out.final_labels.resize(T);
+    for (int32_t token = 0; token < T; ++token) {
+        auto it = std::lower_bound(active_codes.begin(), active_codes.end(), token_codes[token]);
+        const int32_t compact = static_cast<int32_t>(it - active_codes.begin());
+        out.final_labels[token] = compact;
+        counts[compact]++;
     }
 
     out.cluster_offsets.resize(out.n_active + 1);
@@ -459,18 +460,44 @@ static ReorganizeResult reorganize_single_head(
         reorder_indices[write_pos] = token_idx;
     }
 
-    // 第二遍：按新顺序拷贝，每个位置独立，可并行
-    at::parallel_for(0, static_cast<int64_t>(n_tokens), 1024, [&](int64_t begin, int64_t end) {
-        for (int64_t pos = begin; pos < end; ++pos) {
-            int32_t src_idx = reorder_indices[pos];
-            const char* src_key = src_keys + static_cast<size_t>(src_idx) * source_token_stride_bytes;
-            const char* src_value = src_values + static_cast<size_t>(src_idx) * source_token_stride_bytes;
-            char* dst_key = dst_keys + static_cast<size_t>(pos) * token_bytes;
-            char* dst_value = dst_values + static_cast<size_t>(pos) * token_bytes;
-            std::memcpy(dst_key, src_key, token_bytes);
-            std::memcpy(dst_value, src_value, token_bytes);
-        }
-    });
+    const int32_t row_token_count = n_tokens;
+    if (source_token_stride_bytes == static_cast<size_t>(token_bytes)) {
+        copy_kv_by_token_order_rows_cpu(
+            src_keys,
+            src_values,
+            reorder_indices.data(),
+            &row_token_count,
+            1,
+            n_tokens,
+            n_tokens,
+            dim,
+            element_size,
+            static_cast<size_t>(n_tokens) * token_bytes,
+            static_cast<size_t>(n_tokens) * token_bytes,
+            dst_keys,
+            dst_values,
+            n_tokens
+        );
+    } else {
+        at::parallel_for(0, static_cast<int64_t>(n_tokens), 32, [&](int64_t begin, int64_t end) {
+            for (int64_t dst = begin; dst < end; ++dst) {
+                const int32_t src = reorder_indices[dst];
+                if (src < 0 || src >= n_tokens) {
+                    throw std::runtime_error("token id is out of source range");
+                }
+                std::memcpy(
+                    dst_keys + dst * token_bytes,
+                    src_keys + static_cast<size_t>(src) * source_token_stride_bytes,
+                    static_cast<size_t>(token_bytes)
+                );
+                std::memcpy(
+                    dst_values + dst * token_bytes,
+                    src_values + static_cast<size_t>(src) * source_token_stride_bytes,
+                    static_cast<size_t>(token_bytes)
+                );
+            }
+        });
+    }
 
     if (output_centroids != nullptr) {
         at::parallel_for(0, static_cast<int64_t>(n_clusters), 1, [&](int64_t begin, int64_t end) {

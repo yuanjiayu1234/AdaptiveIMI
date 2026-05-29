@@ -205,6 +205,12 @@ class LLM(PrefillMixin, SamplingMixin):
         streaming_cfg["prefill_chunk_size"] = self.prefill_attn_chunk_size
 
         imi_engine = str(imi_config.get("engine", "") or "").lower()
+        has_learned_partition = bool(imi_config.get("partition_path"))
+        if has_learned_partition and imi_engine != "hybrid_8way_v2":
+            raise ValueError(
+                "AdaptiveIMI learned partition requires engine='hybrid_8way_v2'. "
+                "Set IMI_ENGINE=hybrid_8way_v2 or pass --imi_engine hybrid_8way_v2."
+            )
         if imi_config.get("gpu_only", False) and imi_engine != "hybrid_8way_v2":
             raise ValueError("AdaptiveIMI gpu_only mode is not supported.")
 
@@ -258,7 +264,7 @@ class LLM(PrefillMixin, SamplingMixin):
                 "prefill": imi_config.get("prefill", {}),
                 "streaming": imi_config.get("streaming", {}),
                 "async_update": imi_config.get("async_update", {}),
-                "partition_path": imi_config.get("partition_path") or imi_config.get("learned_partition_path"),
+                "partition_path": imi_config.get("partition_path"),
                 "hybrid_index": imi_config.get("hybrid_index", {}),
                 "decode_search": imi_config.get("decode_search", {}),
             },
@@ -433,7 +439,16 @@ class LLM(PrefillMixin, SamplingMixin):
         logits = self.lm(hidden_states)
         
         return logits
-    def inference(self, inputs_ids, do_sample=False, temperature=0.6, top_p=0.95, top_k=20, ignore_eos=True):
+    def inference(
+        self,
+        inputs_ids,
+        do_sample=False,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        ignore_eos=True,
+        stop_token_ids=None,
+    ):
         outputs_ids = []    # multi iteration, multi request
         output_ids = []     # single iteration, multi request
         
@@ -495,17 +510,21 @@ class LLM(PrefillMixin, SamplingMixin):
         
         stop_tokens = None
         end_of_text = None
+        active_stop_token_ids = []
         if not ignore_eos:
-            stop_token_ids = self._collect_stop_token_ids()
-            if stop_token_ids:
-                token_id_dtype = torch.int64 if not do_sample else torch.int32
-                stop_tokens = torch.tensor(
-                    stop_token_ids,
-                    device=inputs_ids.device,
-                    dtype=token_id_dtype
-                ).view(1, 1, -1)
-                end_of_text = torch.zeros((self.batch_size, 1), dtype=torch.bool, device=inputs_ids.device)
-                end_of_text |= (output_ids.unsqueeze(-1) == stop_tokens).any(-1)
+            active_stop_token_ids.extend(self._collect_stop_token_ids())
+        if stop_token_ids:
+            active_stop_token_ids.extend(int(token_id) for token_id in stop_token_ids if token_id is not None)
+        active_stop_token_ids = list(dict.fromkeys(active_stop_token_ids))
+        if active_stop_token_ids:
+            token_id_dtype = torch.int64 if not do_sample else torch.int32
+            stop_tokens = torch.tensor(
+                active_stop_token_ids,
+                device=inputs_ids.device,
+                dtype=token_id_dtype
+            ).view(1, 1, -1)
+            end_of_text = torch.zeros((self.batch_size, 1), dtype=torch.bool, device=inputs_ids.device)
+            end_of_text |= (output_ids.unsqueeze(-1) == stop_tokens).any(-1)
         
         # Decoding
         print("Start decoding ...")
@@ -557,7 +576,7 @@ class LLM(PrefillMixin, SamplingMixin):
         return outputs_ids
     def generate(self, attention_type, inputs_ids, attention_masks, max_new_length, attn_config,
                  do_sample=False, temperature=0.6, top_p=0.95, top_k=20, ignore_eos=True,
-                 prefill_bsz=1):
+                 prefill_bsz=1, stop_token_ids=None):
         """ LLM Inference.
         Args:
             attention_type: str, Full_Flash_Attn or AdaptiveIMI
@@ -582,8 +601,10 @@ class LLM(PrefillMixin, SamplingMixin):
         del attention_masks
 
         self.prefill_bsz = min(prefill_bsz, self.batch_size)
-        # set prefill batch size to 1 if input sequences are not in the same length
-        if not (valid_start == 0).all():
+        # The chunked prefill path groups rows with the same valid_start, so it
+        # can keep multi-batch execution for left-padded inputs. The legacy
+        # non-chunk path still relies on a single valid_start per prefill call.
+        if not self.enable_prefill_attn_chunk and not (valid_start == 0).all():
             self.prefill_bsz = 1
 
         print("Allocate GPU buffers and CPU pin memory ...")
@@ -595,7 +616,8 @@ class LLM(PrefillMixin, SamplingMixin):
             temperature=temperature, 
             top_p=top_p, 
             top_k=top_k, 
-            ignore_eos=ignore_eos
+            ignore_eos=ignore_eos,
+            stop_token_ids=stop_token_ids,
         )
 
         return outputs

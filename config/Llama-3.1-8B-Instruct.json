@@ -8,7 +8,9 @@
         "retrieval_budget": 0.1,
         "buffer_cluster_num": 32,
         "gpu_only": false,
-        "subspace_parts": 4,
+        "engine": "hybrid_8way_v2",
+        "subspace_parts": 8,
+        "partition_path": "outputs/imi_partition/llama3_partition.json",
         "pipeline": {
             "worker_threads": 24,
             "chunk_buffer_count": 8,

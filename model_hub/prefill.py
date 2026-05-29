@@ -5,6 +5,26 @@ import torch
 
 
 class PrefillMixin:
+    def _prefill_chunked_batch_ranges(self, bsz: int):
+        max_bsz = max(1, min(int(getattr(self, "prefill_bsz", bsz) or bsz), int(bsz)))
+        kv_cache = getattr(self, "kv_cache", None)
+        if kv_cache is None or not hasattr(kv_cache, "valid_start_list"):
+            valid_starts = [0] * int(bsz)
+        else:
+            valid_starts = [int(value) for value in kv_cache.valid_start_list[:bsz]]
+
+        ranges = []
+        start = 0
+        while start < bsz:
+            valid_start = valid_starts[start]
+            end_limit = min(bsz, start + max_bsz)
+            end = start + 1
+            while end < end_limit and valid_starts[end] == valid_start:
+                end += 1
+            ranges.append((start, end, valid_start))
+            start = end
+        return ranges
+
     def _get_prefill_prefix_kv_workspace(self, device: str, bsz: int, seq_len: int):
         pool = self._prefill_prefix_kv_workspace.get(device)
         if pool is None:
@@ -271,7 +291,13 @@ class PrefillMixin:
 
         valid_start = 0
         if kv_cache is not None and hasattr(kv_cache, "valid_start_list"):
-            valid_start = int(kv_cache.valid_start_list[start_bdx])
+            valid_starts = [int(value) for value in kv_cache.valid_start_list[start_bdx : start_bdx + bsz]]
+            valid_start = valid_starts[0]
+            if any(value != valid_start for value in valid_starts):
+                raise ValueError(
+                    "chunked prefill layer received mixed valid_start values; "
+                    "prefill_forward_chunked must group ragged batches before attention"
+                )
 
         for chunk_start in range(0, seq_len, chunk_size):
             chunk_end = min(seq_len, chunk_start + chunk_size)
@@ -352,8 +378,23 @@ class PrefillMixin:
             hidden_cpu[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=True)
         self._log_streaming_progress("[IMI STREAM] embedding_done")
 
+        batch_ranges = self._prefill_chunked_batch_ranges(bsz)
+        if len(batch_ranges) > 1:
+            self._log_streaming_progress(
+                "[IMI STREAM] batch_ranges="
+                + ",".join(f"[{start},{end})@{valid_start}" for start, end, valid_start in batch_ranges)
+            )
+
         for ldx in range(self.num_layers):
-            self.layer_prefill_chunked(ldx, 0, hidden_cpu, next_cpu, seq_len, chunk_size)
+            for start_bdx, end_bdx, _valid_start in batch_ranges:
+                self.layer_prefill_chunked(
+                    ldx,
+                    start_bdx,
+                    hidden_cpu[start_bdx:end_bdx],
+                    next_cpu[start_bdx:end_bdx],
+                    seq_len,
+                    chunk_size,
+                )
             hidden_cpu, next_cpu = next_cpu, hidden_cpu
             if self.num_gpus > 1:
                 next_device = self.layer_mapping[str(ldx + 1)] if str(ldx + 1) in self.layer_mapping else self.layer_mapping[str(0)]

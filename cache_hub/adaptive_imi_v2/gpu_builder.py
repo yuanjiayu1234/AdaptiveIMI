@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
+import os
 import time
 from typing import Dict, List, Optional, Sequence
 
@@ -222,7 +223,8 @@ class HybridLayerBuildJob:
         max_pairs = 1
         max_sub_dim = 1
         for head_idx in range(self.kv_heads):
-            for pairs in heads[str(head_idx)]["groups"]:
+            head_spec = heads[str(head_idx)]
+            for pairs in head_spec["groups"]:
                 max_pairs = max(max_pairs, len(pairs))
                 max_sub_dim = max(max_sub_dim, len(pairs) * 2)
 
@@ -234,7 +236,8 @@ class HybridLayerBuildJob:
         for batch_idx in range(self.batch_size):
             for head_idx in range(self.kv_heads):
                 row_idx = batch_idx * self.kv_heads + head_idx
-                groups = heads[str(head_idx)]["groups"]
+                head_spec = heads[str(head_idx)]
+                groups = head_spec["groups"]
                 for subspace_idx, pairs in enumerate(groups):
                     pair_tensor = torch.tensor(pairs, dtype=torch.int64, device=device)
                     dim_tensor = _pair_dim_indices(pairs, self.head_dim, device)
@@ -258,9 +261,13 @@ class HybridLayerBuildJob:
         spec = self.partition_spec
         k_values = _compute_k_values(spec, int(max(self.token_counts.max().item(), 1)), self.target_cluster_size)
         max_k = max(k_values)
-        dense_code_space = 1
+        packed_code_space = 1
         for value in k_values:
-            dense_code_space *= max(1, int(value))
+            k_value = max(1, int(value))
+            if packed_code_space > ((1 << 64) - 1) // k_value:
+                raise ValueError("hybrid 8-way k_values exceed uint64 packed code range")
+            packed_code_space *= k_value
+        max_compact_clusters = max(1, min(int(packed_code_space), int(max_token_count)))
         ext = _load_hybrid_8way_cuda_extension()
 
         (
@@ -275,10 +282,8 @@ class HybridLayerBuildJob:
         row_token_counts = self._row_token_counts(keys.device)
         k_values_tensor = torch.tensor(k_values, dtype=torch.int32, device=keys.device)
         (
-            _labels_cuda,
             subspace_centroids_cuda,
             subspace_centroid_masks_cuda,
-            token_labels,
             token_ids_by_cluster,
             compact_codes,
             cluster_sizes,
@@ -293,19 +298,14 @@ class HybridLayerBuildJob:
             k_values_tensor,
             int(self.max_iters),
             int(max_k),
-            int(dense_code_space),
+            int(max_compact_clusters),
         )
-        head_indices = torch.arange(rows, dtype=torch.int64, device=keys.device)
         metadata = {
-            "head_indices": head_indices,
-            "batch_indices": torch.div(head_indices, self.kv_heads, rounding_mode="floor"),
-            "local_head_indices": head_indices.remainder(self.kv_heads),
             "token_counts": row_token_counts.to(torch.int32),
             "cluster_counts": cluster_counts.to(torch.int32),
             "cluster_sizes": cluster_sizes.to(torch.int32),
             "cluster_offsets": cluster_offsets.to(torch.int32),
             "centroids": full_centroids.to(torch.float32),
-            "token_labels": token_labels.to(torch.int32),
             "token_ids_by_cluster": token_ids_by_cluster.to(torch.int32),
             "compact_codes": compact_codes.to(torch.int32),
             "subspace_centroids": subspace_centroids_cuda.to(torch.float32),
@@ -334,21 +334,16 @@ class HybridLayerBuildJob:
             raise RuntimeError("hybrid build metadata was not produced")
 
         meta_d2h_start = time.perf_counter()
+        # Only transfer what CPU needs for final list layout and base decode
+        # metadata. subspace_rerank search tensors already exist on GPU, so
+        # keeping a CPU debug copy is optional and disabled by default.
         cpu_metadata_keys = (
-            "head_indices",
-            "batch_indices",
-            "local_head_indices",
             "token_counts",
             "cluster_counts",
             "cluster_sizes",
             "cluster_offsets",
             "centroids",
             "token_ids_by_cluster",
-            "compact_codes",
-            "subspace_centroids",
-            "subspace_centroid_masks",
-            "subspace_dim_ids",
-            "subspace_dim_masks",
         )
         metadata_cpu = {
             key: self._metadata_device[key].detach().cpu()
@@ -377,8 +372,8 @@ class HybridLayerBuildJob:
             cluster_count = int(cluster_counts[row_idx].item())
             structured.append({
                 "head_idx": row_idx,
-                "batch_idx": int(metadata_cpu["batch_indices"][row_idx].item()),
-                "local_head_idx": int(metadata_cpu["local_head_indices"][row_idx].item()),
+                "batch_idx": row_idx // self.kv_heads,
+                "local_head_idx": row_idx % self.kv_heads,
                 "token_count": int(metadata_cpu["token_counts"][row_idx].item()),
                 "cluster_sizes": metadata_cpu["cluster_sizes"][row_idx, :cluster_count],
                 "cluster_offsets": metadata_cpu["cluster_offsets"][row_idx, : cluster_count + 1],
@@ -400,23 +395,33 @@ class HybridLayerBuildJob:
 
         search_cpu = {}
         search_gpu = None
+        search_cpu_d2h_ms = 0.0
         if keep_search_metadata:
-            search_cpu_keys = (
-                "subspace_centroids",
-                "subspace_centroid_masks",
-                "subspace_dim_ids",
-                "subspace_dim_masks",
-                "compact_codes",
-                "token_ids_by_cluster",
-                "cluster_sizes",
-                "cluster_offsets",
-                "cluster_counts",
+            keep_cpu_search_metadata = os.getenv("IMI_HYBRID_KEEP_SEARCH_METADATA_CPU", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
             )
-            search_cpu = {
-                key: metadata_cpu[key]
-                for key in search_cpu_keys
-                if key in metadata_cpu
-            }
+            if keep_cpu_search_metadata:
+                search_cpu_keys = (
+                    "subspace_centroids",
+                    "subspace_centroid_masks",
+                    "subspace_dim_ids",
+                    "subspace_dim_masks",
+                    "compact_codes",
+                    "token_ids_by_cluster",
+                    "cluster_sizes",
+                    "cluster_offsets",
+                    "cluster_counts",
+                )
+                search_cpu_d2h_start = time.perf_counter()
+                search_cpu = {
+                    key: self._metadata_device[key].detach().cpu()
+                    for key in search_cpu_keys
+                    if key in self._metadata_device
+                }
+                search_cpu_d2h_ms = (time.perf_counter() - search_cpu_d2h_start) * 1000.0
             if self.build_device == "gpu":
                 active_clusters = max(int(metadata_cpu["cluster_counts"].max().item()), 1)
                 search_keys = (
@@ -427,6 +432,7 @@ class HybridLayerBuildJob:
                 )
                 search_gpu = {key: self._metadata_device[key] for key in search_keys}
                 search_gpu["compact_codes"] = self._metadata_device["compact_codes"][:, :active_clusters, :]
+        stats["search_cpu_d2h_ms"] = search_cpu_d2h_ms
         self._metadata_device = None
         self._keys_ref = None
         self._values_ref = None

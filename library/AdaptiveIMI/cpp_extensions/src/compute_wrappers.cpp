@@ -71,46 +71,102 @@ void subspace_rerank_coarse_scores_fp16(
     cudaStream_t stream = 0
 );
 
-void subspace_rerank_full_scores_bf16(
-    const void* query_grouped,
-    const float* centroids,
-    const int64_t* candidate_ids,
-    const int32_t* cluster_sizes,
-    float* rerank_scores,
-    int rows,
-    int groups,
-    int dim,
-    int n_clusters,
-    int candidate_limit,
-    cudaStream_t stream = 0
-);
-
-void subspace_rerank_full_scores_fp16(
-    const void* query_grouped,
-    const float* centroids,
-    const int64_t* candidate_ids,
-    const int32_t* cluster_sizes,
-    float* rerank_scores,
-    int rows,
-    int groups,
-    int dim,
-    int n_clusters,
-    int candidate_limit,
-    cudaStream_t stream = 0
-);
-
 void subspace_rerank_select_final(
     const int64_t* candidate_ids,
-    const int64_t* rerank_indices,
     const int32_t* cluster_sizes,
     int64_t* selected,
     int rows,
     int n_clusters,
     int nprobe,
     int candidate_limit,
-    int rerank_limit,
     int max_retrieval_tokens,
     int64_t padding_cluster_id,
+    cudaStream_t stream = 0
+);
+
+void token_rerank_scores_bf16(
+    const void* query_grouped,
+    const void* execution_keys,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    float* scores,
+    int rows,
+    int groups,
+    int dim,
+    int stride,
+    int max_candidates,
+    cudaStream_t stream = 0
+);
+
+void token_rerank_scores_fp16(
+    const void* query_grouped,
+    const void* execution_keys,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    float* scores,
+    int rows,
+    int groups,
+    int dim,
+    int stride,
+    int max_candidates,
+    cudaStream_t stream = 0
+);
+
+void token_rerank_gather_bf16(
+    const void* execution_keys,
+    const void* execution_values,
+    const int64_t* token_indices,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    void* selected_keys,
+    void* selected_values,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
+    cudaStream_t stream = 0
+);
+
+void token_rerank_gather_fp16(
+    const void* execution_keys,
+    const void* execution_values,
+    const int64_t* token_indices,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    void* selected_keys,
+    void* selected_values,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
+    cudaStream_t stream = 0
+);
+
+void token_rerank_scatter_bf16(
+    void* execution_keys,
+    void* execution_values,
+    const void* selected_keys,
+    const void* selected_values,
+    int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
+    cudaStream_t stream = 0
+);
+
+void token_rerank_scatter_fp16(
+    void* execution_keys,
+    void* execution_values,
+    const void* selected_keys,
+    const void* selected_values,
+    int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
     cudaStream_t stream = 0
 );
 
@@ -191,11 +247,9 @@ torch::Tensor fused_subspace_rerank_select(
     const torch::Tensor& subspace_dim_ids,           // [rows, M, max_sub_dim] int64
     const torch::Tensor& subspace_dim_masks,         // [rows, M, max_sub_dim] bool
     const torch::Tensor& compact_codes,              // [rows, active_clusters, M] int32
-    const torch::Tensor& centroids,                  // [rows, n_clusters, dim] FP32
     const torch::Tensor& cluster_sizes,              // [rows, n_clusters] int32
     int64_t nprobe,
     int64_t candidate_limit,
-    int64_t rerank_limit,
     int64_t max_retrieval_tokens,
     int64_t padding_cluster_id
 ) {
@@ -205,7 +259,6 @@ torch::Tensor fused_subspace_rerank_select(
     TORCH_CHECK(subspace_dim_ids.is_cuda(), "subspace_dim_ids must be on GPU");
     TORCH_CHECK(subspace_dim_masks.is_cuda(), "subspace_dim_masks must be on GPU");
     TORCH_CHECK(compact_codes.is_cuda(), "compact_codes must be on GPU");
-    TORCH_CHECK(centroids.is_cuda(), "centroids must be on GPU");
     TORCH_CHECK(cluster_sizes.is_cuda(), "cluster_sizes must be on GPU");
 
     TORCH_CHECK(query_grouped.dim() == 3, "query_grouped must be [rows, groups, dim]");
@@ -214,7 +267,6 @@ torch::Tensor fused_subspace_rerank_select(
     TORCH_CHECK(subspace_dim_ids.dim() == 3, "subspace_dim_ids must be [rows, M, max_sub_dim]");
     TORCH_CHECK(subspace_dim_masks.dim() == 3, "subspace_dim_masks must be [rows, M, max_sub_dim]");
     TORCH_CHECK(compact_codes.dim() == 3, "compact_codes must be [rows, active_clusters, M]");
-    TORCH_CHECK(centroids.dim() == 3, "centroids must be [rows, n_clusters, dim]");
     TORCH_CHECK(cluster_sizes.dim() == 2, "cluster_sizes must be [rows, n_clusters]");
 
     TORCH_CHECK(subspace_centroids.scalar_type() == torch::kFloat32, "subspace_centroids must be FP32");
@@ -222,7 +274,6 @@ torch::Tensor fused_subspace_rerank_select(
     TORCH_CHECK(subspace_dim_ids.scalar_type() == torch::kInt64, "subspace_dim_ids must be int64");
     TORCH_CHECK(subspace_dim_masks.scalar_type() == torch::kBool, "subspace_dim_masks must be bool");
     TORCH_CHECK(compact_codes.scalar_type() == torch::kInt32, "compact_codes must be int32");
-    TORCH_CHECK(centroids.scalar_type() == torch::kFloat32, "centroids must be FP32");
     TORCH_CHECK(cluster_sizes.scalar_type() == torch::kInt32, "cluster_sizes must be int32");
 
     const int rows = static_cast<int>(query_grouped.size(0));
@@ -232,7 +283,7 @@ torch::Tensor fused_subspace_rerank_select(
     const int max_k = static_cast<int>(subspace_centroids.size(2));
     const int max_sub_dim = static_cast<int>(subspace_centroids.size(3));
     const int active_clusters = static_cast<int>(compact_codes.size(1));
-    const int n_clusters = static_cast<int>(centroids.size(1));
+    const int n_clusters = static_cast<int>(cluster_sizes.size(1));
 
     TORCH_CHECK(rows > 0, "rows must be positive");
     TORCH_CHECK(active_clusters > 0, "active_clusters must be positive");
@@ -250,8 +301,6 @@ torch::Tensor fused_subspace_rerank_select(
                 "subspace_dim_masks shape mismatch");
     TORCH_CHECK(compact_codes.size(0) == rows, "compact_codes rows mismatch");
     TORCH_CHECK(compact_codes.size(2) == subspace_parts, "compact_codes M mismatch");
-    TORCH_CHECK(centroids.size(0) == rows, "centroids rows mismatch");
-    TORCH_CHECK(centroids.size(2) == dim, "centroids dim mismatch");
     TORCH_CHECK(cluster_sizes.size(0) == rows, "cluster_sizes rows mismatch");
     TORCH_CHECK(cluster_sizes.size(1) == n_clusters, "cluster_sizes n_clusters mismatch");
 
@@ -259,17 +308,12 @@ torch::Tensor fused_subspace_rerank_select(
         std::max<int>(static_cast<int>(candidate_limit), static_cast<int>(nprobe)),
         active_clusters
     ));
-    const int rerank_k = std::max<int>(1, std::min<int>(
-        std::max<int>(static_cast<int>(rerank_limit), static_cast<int>(nprobe)),
-        candidate_k
-    ));
     const int output_k = static_cast<int>(nprobe);
 
     auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(query_grouped.device());
     auto long_options = torch::TensorOptions().dtype(torch::kInt64).device(query_grouped.device());
 
     auto coarse_scores = torch::empty({rows, active_clusters}, float_options);
-    auto rerank_scores = torch::empty({rows, candidate_k}, float_options);
     auto selected = torch::empty({rows, output_k}, long_options);
 
     c10::cuda::CUDAGuard device_guard(query_grouped.device());
@@ -315,57 +359,187 @@ torch::Tensor fused_subspace_rerank_select(
         TORCH_CHECK(false, "fused_subspace_rerank_select: query dtype must be BF16 or FP16");
     }
 
-    auto coarse_topk = at::topk(coarse_scores, candidate_k, 1, true, false);
+    auto coarse_topk = at::topk(coarse_scores, candidate_k, 1, true, true);
     auto candidate_ids = std::get<1>(coarse_topk).contiguous();
 
-    if (query_grouped.scalar_type() == torch::kBFloat16) {
-        subspace_rerank_full_scores_bf16(
-            query_grouped.data_ptr(),
-            centroids.data_ptr<float>(),
-            candidate_ids.data_ptr<int64_t>(),
-            cluster_sizes.data_ptr<int32_t>(),
-            rerank_scores.data_ptr<float>(),
-            rows,
-            groups,
-            dim,
-            n_clusters,
-            candidate_k,
-            stream.stream()
-        );
-    } else {
-        subspace_rerank_full_scores_fp16(
-            query_grouped.data_ptr(),
-            centroids.data_ptr<float>(),
-            candidate_ids.data_ptr<int64_t>(),
-            cluster_sizes.data_ptr<int32_t>(),
-            rerank_scores.data_ptr<float>(),
-            rows,
-            groups,
-            dim,
-            n_clusters,
-            candidate_k,
-            stream.stream()
-        );
-    }
-
-    auto rerank_topk = at::topk(rerank_scores, rerank_k, 1, true, true);
-    auto rerank_indices = std::get<1>(rerank_topk).contiguous();
     subspace_rerank_select_final(
         candidate_ids.data_ptr<int64_t>(),
-        rerank_indices.data_ptr<int64_t>(),
         cluster_sizes.data_ptr<int32_t>(),
         selected.data_ptr<int64_t>(),
         rows,
         n_clusters,
         output_k,
         candidate_k,
-        rerank_k,
         static_cast<int>(max_retrieval_tokens),
         padding_cluster_id,
         stream.stream()
     );
 
     return selected;
+}
+
+void token_rerank_compact(
+    const torch::Tensor& query_grouped,       // [rows, groups, dim] BF16/FP16
+    torch::Tensor& execution_keys,            // [rows, stride, 1, dim] BF16/FP16
+    torch::Tensor& execution_values,          // [rows, stride, 1, dim] BF16/FP16
+    torch::Tensor& valid_lengths,             // [rows] int32, updated in place
+    const torch::Tensor& static_lengths,      // [rows] int32
+    int64_t token_budget
+) {
+    TORCH_CHECK(query_grouped.is_cuda(), "query_grouped must be on GPU");
+    TORCH_CHECK(execution_keys.is_cuda(), "execution_keys must be on GPU");
+    TORCH_CHECK(execution_values.is_cuda(), "execution_values must be on GPU");
+    TORCH_CHECK(valid_lengths.is_cuda(), "valid_lengths must be on GPU");
+    TORCH_CHECK(static_lengths.is_cuda(), "static_lengths must be on GPU");
+    TORCH_CHECK(query_grouped.dim() == 3, "query_grouped must be [rows, groups, dim]");
+    TORCH_CHECK(execution_keys.dim() == 4, "execution_keys must be [rows, stride, 1, dim]");
+    TORCH_CHECK(execution_values.dim() == 4, "execution_values must be [rows, stride, 1, dim]");
+    TORCH_CHECK(valid_lengths.dim() == 1, "valid_lengths must be [rows]");
+    TORCH_CHECK(static_lengths.dim() == 1, "static_lengths must be [rows]");
+    TORCH_CHECK(execution_keys.size(2) == 1, "execution_keys singleton axis must be 1");
+    TORCH_CHECK(execution_values.size(2) == 1, "execution_values singleton axis must be 1");
+    TORCH_CHECK(execution_keys.scalar_type() == query_grouped.scalar_type(), "execution_keys dtype mismatch");
+    TORCH_CHECK(execution_values.scalar_type() == query_grouped.scalar_type(), "execution_values dtype mismatch");
+    TORCH_CHECK(valid_lengths.scalar_type() == torch::kInt32, "valid_lengths must be int32");
+    TORCH_CHECK(static_lengths.scalar_type() == torch::kInt32, "static_lengths must be int32");
+    TORCH_CHECK(query_grouped.is_contiguous(), "query_grouped must be contiguous");
+    TORCH_CHECK(execution_keys.is_contiguous(), "execution_keys must be contiguous");
+    TORCH_CHECK(execution_values.is_contiguous(), "execution_values must be contiguous");
+
+    const int rows = static_cast<int>(query_grouped.size(0));
+    const int groups = static_cast<int>(query_grouped.size(1));
+    const int dim = static_cast<int>(query_grouped.size(2));
+    const int stride = static_cast<int>(execution_keys.size(1));
+    TORCH_CHECK(rows > 0, "rows must be positive");
+    TORCH_CHECK(dim > 0 && dim <= 1024, "dim must be in (0, 1024]");
+    TORCH_CHECK(execution_keys.size(0) == rows, "execution_keys rows mismatch");
+    TORCH_CHECK(execution_values.size(0) == rows, "execution_values rows mismatch");
+    TORCH_CHECK(execution_values.size(1) == stride, "execution_values stride mismatch");
+    TORCH_CHECK(execution_keys.size(3) == dim, "execution_keys dim mismatch");
+    TORCH_CHECK(execution_values.size(3) == dim, "execution_values dim mismatch");
+    TORCH_CHECK(valid_lengths.size(0) == rows, "valid_lengths rows mismatch");
+    TORCH_CHECK(static_lengths.size(0) == rows, "static_lengths rows mismatch");
+    if (token_budget <= 0 || stride <= 0) {
+        return;
+    }
+
+    auto valid_cpu = valid_lengths.detach().to(torch::kCPU);
+    auto static_cpu = static_lengths.detach().to(torch::kCPU);
+    int max_candidates = 0;
+    int max_selected = 0;
+    const int32_t* valid_ptr = valid_cpu.data_ptr<int32_t>();
+    const int32_t* static_ptr = static_cpu.data_ptr<int32_t>();
+    for (int row = 0; row < rows; ++row) {
+        const int valid_len = std::max(0, std::min(static_cast<int>(valid_ptr[row]), stride));
+        const int static_len = std::max(0, std::min(static_cast<int>(static_ptr[row]), valid_len));
+        const int candidates = std::max(valid_len - static_len, 0);
+        max_candidates = std::max(max_candidates, candidates);
+        max_selected = std::max(max_selected, std::min<int>(candidates, static_cast<int>(token_budget)));
+    }
+    if (max_candidates <= 0 || max_selected <= 0) {
+        return;
+    }
+
+    auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(query_grouped.device());
+    auto scores = torch::empty({rows, max_candidates}, float_options);
+
+    c10::cuda::CUDAGuard device_guard(query_grouped.device());
+    auto stream = c10::cuda::getCurrentCUDAStream(query_grouped.get_device());
+
+    if (query_grouped.scalar_type() == torch::kBFloat16) {
+        token_rerank_scores_bf16(
+            query_grouped.data_ptr(),
+            execution_keys.data_ptr(),
+            valid_lengths.data_ptr<int32_t>(),
+            static_lengths.data_ptr<int32_t>(),
+            scores.data_ptr<float>(),
+            rows,
+            groups,
+            dim,
+            stride,
+            max_candidates,
+            stream.stream()
+        );
+    } else if (query_grouped.scalar_type() == torch::kFloat16) {
+        token_rerank_scores_fp16(
+            query_grouped.data_ptr(),
+            execution_keys.data_ptr(),
+            valid_lengths.data_ptr<int32_t>(),
+            static_lengths.data_ptr<int32_t>(),
+            scores.data_ptr<float>(),
+            rows,
+            groups,
+            dim,
+            stride,
+            max_candidates,
+            stream.stream()
+        );
+    } else {
+        TORCH_CHECK(false, "token_rerank_compact: query dtype must be BF16 or FP16");
+    }
+
+    auto topk = at::topk(scores, max_selected, 1, true, true);
+    auto token_indices = std::get<1>(topk).contiguous();
+    auto selected_keys = torch::empty({rows, max_selected, 1, dim}, execution_keys.options());
+    auto selected_values = torch::empty({rows, max_selected, 1, dim}, execution_values.options());
+
+    if (query_grouped.scalar_type() == torch::kBFloat16) {
+        token_rerank_gather_bf16(
+            execution_keys.data_ptr(),
+            execution_values.data_ptr(),
+            token_indices.data_ptr<int64_t>(),
+            valid_lengths.data_ptr<int32_t>(),
+            static_lengths.data_ptr<int32_t>(),
+            selected_keys.data_ptr(),
+            selected_values.data_ptr(),
+            rows,
+            dim,
+            stride,
+            max_selected,
+            stream.stream()
+        );
+        token_rerank_scatter_bf16(
+            execution_keys.data_ptr(),
+            execution_values.data_ptr(),
+            selected_keys.data_ptr(),
+            selected_values.data_ptr(),
+            valid_lengths.data_ptr<int32_t>(),
+            static_lengths.data_ptr<int32_t>(),
+            rows,
+            dim,
+            stride,
+            max_selected,
+            stream.stream()
+        );
+    } else {
+        token_rerank_gather_fp16(
+            execution_keys.data_ptr(),
+            execution_values.data_ptr(),
+            token_indices.data_ptr<int64_t>(),
+            valid_lengths.data_ptr<int32_t>(),
+            static_lengths.data_ptr<int32_t>(),
+            selected_keys.data_ptr(),
+            selected_values.data_ptr(),
+            rows,
+            dim,
+            stride,
+            max_selected,
+            stream.stream()
+        );
+        token_rerank_scatter_fp16(
+            execution_keys.data_ptr(),
+            execution_values.data_ptr(),
+            selected_keys.data_ptr(),
+            selected_values.data_ptr(),
+            valid_lengths.data_ptr<int32_t>(),
+            static_lengths.data_ptr<int32_t>(),
+            rows,
+            dim,
+            stride,
+            max_selected,
+            stream.stream()
+        );
+    }
 }
 
 } // namespace imi_decode

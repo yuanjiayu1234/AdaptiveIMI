@@ -46,6 +46,7 @@ def _load_learned_partition_specs(
     *,
     layer_num: int,
     kv_heads: int,
+    head_dim: int,
 ) -> List[Optional[Dict[str, object]]]:
     if not partition_path:
         return [None] * layer_num
@@ -80,6 +81,11 @@ def _load_learned_partition_specs(
             raw_head = heads_obj.get(str(head_idx), heads_obj.get(head_idx))
             if raw_head is None:
                 raise ValueError(f"learned partition missing head {head_idx}")
+            if isinstance(raw_head, dict) and raw_head.get("dim_groups") is not None:
+                raise ValueError(
+                    "AdaptiveIMI learned partitions use RoPE pair 'groups'; "
+                    f"head {head_idx} provided dim_groups"
+                )
             if isinstance(raw_head, dict):
                 groups = raw_head.get("groups")
             else:
@@ -173,15 +179,16 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
         self.buffer_cluster_num = buffer_cluster_num
         self._available_cpu_cores = _get_available_cpu_cores()
         runtime_config = runtime_config or {}
-        partition_path = runtime_config.get("partition_path") or runtime_config.get("learned_partition_path")
+        partition_path = runtime_config.get("partition_path")
         self.learned_partition_specs = _load_learned_partition_specs(
             str(partition_path) if partition_path else None,
             layer_num=self.layer_num,
             kv_heads=self.kv_head,
+            head_dim=self.head_dim,
         )
         self.learned_partition_enabled = any(spec is not None for spec in self.learned_partition_specs)
         if subspace_parts not in (0, 2, 4) and not self.learned_partition_enabled:
-            raise ValueError("subspace_parts must be 0, 2 or 4 unless a learned partition_path is provided")
+            raise ValueError("subspace_parts must be 0, 2 or 4 unless partition_path is provided")
         self.subspace_parts = subspace_parts
         prefill_cfg = runtime_config.get("prefill") or {}
         if not isinstance(prefill_cfg, dict):

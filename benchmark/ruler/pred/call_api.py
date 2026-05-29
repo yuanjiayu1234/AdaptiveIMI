@@ -144,7 +144,8 @@ class HuggingFaceModel:
         partition_path=None,
         decode_search_mode=None,
         candidate_clusters=None,
-        rerank_clusters=None,
+        token_rerank_budget_ratio=None,
+        stop_at_period=False,
     ) -> None:
         load_path = model_path or model_name
 
@@ -182,7 +183,8 @@ class HuggingFaceModel:
         self.partition_path = partition_path
         self.decode_search_mode = decode_search_mode
         self.candidate_clusters = candidate_clusters
-        self.rerank_clusters = rerank_clusters
+        self.token_rerank_budget_ratio = token_rerank_budget_ratio
+        self.stop_at_period = stop_at_period
         self._generate_lock = threading.Lock()
 
     def __call__(self, prompt: str, answer_prefix: str = "", **kwargs) -> Dict[str, List[str]]:
@@ -201,10 +203,31 @@ class HuggingFaceModel:
                 partition_path=self.partition_path,
                 decode_search_mode=self.decode_search_mode,
                 candidate_clusters=self.candidate_clusters,
-                rerank_clusters=self.rerank_clusters,
+                token_rerank_budget_ratio=self.token_rerank_budget_ratio,
+                stop_at_period=self.stop_at_period,
             )
 
         return {'text': [generated_text]}
+
+    def generate_batch(self, prompts: List[str], answer_prefixes: List[str]) -> List[str]:
+        with self._generate_lock:
+            return get_pred_batch(
+                self.llm,
+                input_texts=prompts,
+                max_new_tokens=self.max_new_len,
+                attn_type=self.attn_type,
+                model_name=self.model_name,
+                budget_ratio=self.budget_ratio,
+                synthetic_len=self.synthetic_len,
+                answer_prefixes=answer_prefixes,
+                subspace_parts=self.subspace_parts,
+                imi_engine=self.imi_engine,
+                partition_path=self.partition_path,
+                decode_search_mode=self.decode_search_mode,
+                candidate_clusters=self.candidate_clusters,
+                token_rerank_budget_ratio=self.token_rerank_budget_ratio,
+                stop_at_period=self.stop_at_period,
+            )
 
 
 class ServerAction(argparse.Action):
@@ -227,7 +250,8 @@ def get_llm(
     partition_path=None,
     decode_search_mode=None,
     candidate_clusters=None,
-    rerank_clusters=None,
+    token_rerank_budget_ratio=None,
+    stop_at_period=False,
 ):
     if args.server_type == 'hf':
         llm = HuggingFaceModel(
@@ -245,7 +269,8 @@ def get_llm(
             partition_path=partition_path,
             decode_search_mode=decode_search_mode,
             candidate_clusters=candidate_clusters,
-            rerank_clusters=rerank_clusters,
+            token_rerank_budget_ratio=token_rerank_budget_ratio,
+            stop_at_period=stop_at_period,
         )
     else:
         raise RuntimeError(f'Unsupported server type {args.server_type}')
@@ -253,8 +278,52 @@ def get_llm(
     return llm
 
 
-def postprocess_pred(pred: str) -> str:
+def env_flag(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in ("1", "true", "yes", "on", "always"):
+        return True
+    if value in ("0", "false", "no", "off", "never"):
+        return False
+    return None
+
+
+def should_stop_at_period(task_name: str, task_config: dict) -> bool:
+    """Return whether period should terminate generation for this task."""
+    override = env_flag(os.getenv("RULER_STOP_AT_PERIOD"))
+    if override is not None:
+        return override
+
+    # Auto mode: only use '.' as a stop token for NIAH tasks with one requested
+    # value. Multi-value/multi-query and extraction tasks often answer as
+    # numbered lists, so stopping at '.' truncates them to "1".
+    if task_config.get("task") != "niah":
+        return False
+
+    args_cfg = task_config.get("args", {})
+    try:
+        num_needle_v = int(args_cfg.get("num_needle_v", 1))
+        num_needle_q = int(args_cfg.get("num_needle_q", 1))
+    except (TypeError, ValueError):
+        return False
+
+    return num_needle_v == 1 and num_needle_q == 1
+
+
+def postprocess_pred(pred: str, stop_at_period: bool = False) -> str:
     """Post-process prediction to improve string matching accuracy."""
+    # Some chat models continue by emitting prompt/control text again after the
+    # short RULER answer. Drop that suffix before task-level scoring/logging.
+    pred = pred.split('[/INST]', 1)[0].strip()
+    pred = pred.split('<|eot_id|>', 1)[0].strip()
+    pred = pred.split('<|end_of_turn|>', 1)[0].strip()
+
+    if stop_at_period:
+        period_idx = pred.find('.')
+        if period_idx >= 0:
+            pred = pred[: period_idx + 1].strip()
+
     if pred.startswith(': '):
         pred = pred[2:].strip()
     elif pred.startswith(':'):
@@ -286,7 +355,8 @@ def get_pred(
     partition_path: str | None = None,
     decode_search_mode: str | None = None,
     candidate_clusters: int | None = None,
-    rerank_clusters: int | None = None,
+    token_rerank_budget_ratio: float | None = None,
+    stop_at_period: bool = False,
 ) -> str:
 
     # Fix multiple <|begin_of_text|> tags
@@ -307,8 +377,8 @@ def get_pred(
         decode_search = {"mode": decode_search_mode}
         if candidate_clusters is not None:
             decode_search["candidate_clusters"] = int(candidate_clusters)
-        if rerank_clusters is not None:
-            decode_search["rerank_clusters"] = int(rerank_clusters)
+        if token_rerank_budget_ratio is not None:
+            decode_search["token_rerank_budget_ratio"] = float(token_rerank_budget_ratio)
 
     attn_config = generate_config(
         model_name,
@@ -320,6 +390,9 @@ def get_pred(
         partition_path=partition_path,
         decode_search=decode_search,
     )
+    stop_token_ids = None
+    if stop_at_period:
+        stop_token_ids = llm.tokenizer.encode(".", add_special_tokens=False)
     success = False
     try:
         out = llm.generate(
@@ -329,6 +402,7 @@ def get_pred(
             max_new_length=max_new_tokens,
             attn_config=attn_config,
             ignore_eos=False,
+            stop_token_ids=stop_token_ids,
         )
 
         output = llm.tokenizer.batch_decode(out, skip_special_tokens=True)
@@ -336,11 +410,87 @@ def get_pred(
     finally:
         cleanup_kv_cache(llm, force=not success)
 
-    print("Chunked generation:", output[0])
-    return output[0]
+    processed_output = postprocess_pred(output[0], stop_at_period=stop_at_period)
+    print("Chunked generation:", processed_output)
+    return processed_output
 
 
-def get_output(llm, outputs_parallel, idx, index, input, outputs, others, truncation, length, answer_prefix=""):
+def get_pred_batch(
+    llm,
+    input_texts: List[str],
+    max_new_tokens: int,
+    attn_type: str,
+    model_name: str,
+    budget_ratio: float,
+    synthetic_len: int,
+    answer_prefixes: List[str] | None = None,
+    subspace_parts: int = 2,
+    imi_engine: str | None = None,
+    partition_path: str | None = None,
+    decode_search_mode: str | None = None,
+    candidate_clusters: int | None = None,
+    token_rerank_budget_ratio: float | None = None,
+    stop_at_period: bool = False,
+) -> List[str]:
+    answer_prefixes = answer_prefixes or [""] * len(input_texts)
+    prompts = []
+    for input_text, answer_prefix in zip(input_texts, answer_prefixes):
+        prompt = fix_begin_of_text(input_text)
+        if answer_prefix:
+            prompt = prompt + answer_prefix
+        prompts.append(prompt)
+
+    llm.tokenizer.pad_token = llm.tokenizer.eos_token
+    llm.tokenizer.padding_side = "left"
+    inputs = llm.tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids = inputs.input_ids
+    attention_masks = inputs.attention_mask
+
+    decode_search = None
+    if decode_search_mode:
+        decode_search = {"mode": decode_search_mode}
+        if candidate_clusters is not None:
+            decode_search["candidate_clusters"] = int(candidate_clusters)
+        if token_rerank_budget_ratio is not None:
+            decode_search["token_rerank_budget_ratio"] = float(token_rerank_budget_ratio)
+
+    attn_config = generate_config(
+        model_name,
+        input_ids.shape[1],
+        attn_type,
+        retrieval_budget=budget_ratio,
+        subspace_parts=subspace_parts,
+        imi_engine=imi_engine,
+        partition_path=partition_path,
+        decode_search=decode_search,
+    )
+    stop_token_ids = None
+    if stop_at_period:
+        stop_token_ids = llm.tokenizer.encode(".", add_special_tokens=False)
+
+    success = False
+    try:
+        out = llm.generate(
+            attention_type=attn_type,
+            inputs_ids=input_ids.to(llm.layers[0].device),
+            attention_masks=attention_masks.to(llm.layers[0].device),
+            max_new_length=max_new_tokens,
+            attn_config=attn_config,
+            ignore_eos=False,
+            prefill_bsz=len(prompts),
+            stop_token_ids=stop_token_ids,
+        )
+        decoded = llm.tokenizer.batch_decode(out, skip_special_tokens=True)
+        success = True
+    finally:
+        cleanup_kv_cache(llm, force=not success)
+
+    processed = [postprocess_pred(text, stop_at_period=stop_at_period) for text in decoded]
+    print("Chunked batch generation:", processed)
+    return processed
+
+
+def get_output(llm, outputs_parallel, idx, index, input, outputs, others, truncation, length, answer_prefix="", stop_at_period=False):
     while True:
         try:
             pred = llm(prompt=input, answer_prefix=answer_prefix)
@@ -351,7 +501,7 @@ def get_output(llm, outputs_parallel, idx, index, input, outputs, others, trunca
                 raise
 
     if len(pred['text']) > 0:
-        processed_pred = postprocess_pred(pred['text'][0])
+        processed_pred = postprocess_pred(pred['text'][0], stop_at_period=stop_at_period)
         outputs_parallel[idx] = {
             'index': index,
             'pred': processed_pred,
@@ -383,6 +533,7 @@ def main(args):
         
     config = tasks_customized.get(args.task)
     config.update(tasks_base[config['task']])
+    stop_at_period = should_stop_at_period(args.task, config)
 
     task_file = args.data_dir / args.task / f'{args.subset}.jsonl'
     
@@ -394,6 +545,7 @@ def main(args):
     args.model_path = resolve_model_path(args.model_path or args.model_name)
     print(args)
     print(f'Predict {args.task} \nfrom {task_file}\nto {pred_file}')
+    print(f"RULER period stop for {args.task}: {stop_at_period}")
     pred_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Load data
@@ -424,13 +576,42 @@ def main(args):
         partition_path=args.partition_path,
         decode_search_mode=args.decode_search_mode,
         candidate_clusters=args.candidate_clusters,
-        rerank_clusters=args.rerank_clusters,
+        token_rerank_budget_ratio=args.token_rerank_budget_ratio,
+        stop_at_period=stop_at_period,
     )
 
     threads = []
     outputs_parallel = [{} for _ in range(len(data))]
     # setting buffering=1 to force to dump the output after every line, so that we can see intermediate generations
     with open(pred_file, 'at', encoding="utf-8", buffering=1) as fout:
+        if args.batch_size > 1:
+            batch_size = max(int(args.batch_size), 1)
+            for batch_start in tqdm(range(0, len(data), batch_size), total=(len(data) + batch_size - 1) // batch_size):
+                batch = data[batch_start : batch_start + batch_size]
+                try:
+                    preds = llm.generate_batch(
+                        [sample["input"] for sample in batch],
+                        [sample.get("answer_prefix", "") for sample in batch],
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    raise
+
+                for sample, pred in zip(batch, preds):
+                    if len(pred) == 0:
+                        continue
+                    fout.write(json.dumps({
+                        'index': sample['index'],
+                        'pred': pred,
+                        'input': sample['input'],
+                        'outputs': sample['outputs'],
+                        'others': sample.get('others', {}),
+                        'truncation': sample.get('truncation', -1),
+                        'length': sample.get('length', -1),
+                    }) + '\n')
+            print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
+            return
+
         for idx, data_point in tqdm(enumerate(data), total=len(data)):
             thread = threading.Thread(
                 target=get_output,
@@ -445,6 +626,7 @@ def main(args):
                     truncation=data_point.get('truncation', -1),
                     length=data_point.get('length', -1),
                     answer_prefix=data_point.get('answer_prefix', ''),
+                    stop_at_period=stop_at_period,
                 ),
             )
             thread.start()
@@ -522,9 +704,14 @@ if __name__ == '__main__':
     parser.add_argument("--subspace_parts", type=int, default=2, help="IMI subspace parts (0, 2 or 4)")
     parser.add_argument("--imi_engine", type=str, default=None, choices=[None, "hybrid_8way_v2"])
     parser.add_argument("--partition_path", type=str, default=None, help="Learned partition JSON for AdaptiveIMI hybrid v2")
-    parser.add_argument("--decode_search_mode", type=str, default=None, choices=[None, "flat", "subspace", "subspace_rerank", "hybrid"])
+    parser.add_argument(
+        "--decode_search_mode",
+        type=str,
+        default=None,
+        choices=[None, "flat", "subspace_rerank"],
+    )
     parser.add_argument("--candidate_clusters", type=int, default=None)
-    parser.add_argument("--rerank_clusters", type=int, default=None)
+    parser.add_argument("--token_rerank_budget_ratio", type=float, default=None, help="Final token rerank budget ratio; <=0 disables token rerank")
 
     args = parser.parse_args()
     print(args)

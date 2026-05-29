@@ -185,70 +185,14 @@ __global__ void subspace_rerank_coarse_kernel(
     row_scores[cluster] = valid ? score : -FLT_MAX;
 }
 
-template<typename InputT>
-__global__ void subspace_rerank_full_kernel(
-    const InputT* __restrict__ query_grouped,     // [rows, groups, dim]
-    const float* __restrict__ centroids,          // [rows, n_clusters, dim]
-    const int64_t* __restrict__ candidate_ids,    // [rows, candidate_limit]
-    const int32_t* __restrict__ cluster_sizes,    // [rows, n_clusters]
-    float* __restrict__ rerank_scores,            // [rows, candidate_limit]
-    int rows,
-    int groups,
-    int dim,
-    int n_clusters,
-    int candidate_limit
-) {
-    extern __shared__ float shared_query[];
-
-    const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    const InputT* row_query = query_grouped + row * groups * dim;
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int g = 0; g < groups; ++g) {
-            acc += to_float(row_query[g * dim + d]);
-        }
-        shared_query[d] = acc;
-    }
-    __syncthreads();
-
-    const float* row_centroids = centroids + row * n_clusters * dim;
-    const int64_t* row_candidates = candidate_ids + row * candidate_limit;
-    const int32_t* row_sizes = cluster_sizes + row * n_clusters;
-    float* row_scores = rerank_scores + row * candidate_limit;
-
-    const int idx = blockIdx.y * blockDim.x + threadIdx.x;
-    if (idx >= candidate_limit) {
-        return;
-    }
-
-    const int cluster = static_cast<int>(row_candidates[idx]);
-    if (cluster < 0 || cluster >= n_clusters || row_sizes[cluster] <= 0) {
-        row_scores[idx] = -FLT_MAX;
-        return;
-    }
-
-    const float* centroid = row_centroids + cluster * dim;
-    float score = 0.0f;
-    for (int d = 0; d < dim; ++d) {
-        score += shared_query[d] * centroid[d];
-    }
-    row_scores[idx] = score;
-}
-
 __global__ void subspace_rerank_select_final_kernel(
     const int64_t* __restrict__ candidate_ids,     // [rows, candidate_limit]
-    const int64_t* __restrict__ rerank_indices,    // [rows, rerank_limit]
     const int32_t* __restrict__ cluster_sizes,     // [rows, n_clusters]
     int64_t* __restrict__ selected,                // [rows, nprobe]
     int rows,
     int n_clusters,
     int nprobe,
     int candidate_limit,
-    int rerank_limit,
     int max_retrieval_tokens,
     int64_t padding_cluster_id
 ) {
@@ -268,18 +212,12 @@ __global__ void subspace_rerank_select_final_kernel(
     }
 
     const int64_t* row_candidates = candidate_ids + row * candidate_limit;
-    const int64_t* row_rerank = rerank_indices + row * rerank_limit;
     const int32_t* row_sizes = cluster_sizes + row * n_clusters;
 
     int prefix_tokens = 0;
-    const int selected_width = nprobe < rerank_limit ? nprobe : rerank_limit;
+    const int selected_width = nprobe < candidate_limit ? nprobe : candidate_limit;
     for (int idx = 0; idx < selected_width; ++idx) {
-        const int candidate_pos = static_cast<int>(row_rerank[idx]);
-        if (candidate_pos < 0 || candidate_pos >= candidate_limit) {
-            row_selected[idx] = padding_cluster_id;
-            continue;
-        }
-        const int cluster = static_cast<int>(row_candidates[candidate_pos]);
+        const int cluster = static_cast<int>(row_candidates[idx]);
         if (cluster < 0 || cluster >= n_clusters) {
             row_selected[idx] = padding_cluster_id;
             continue;
@@ -293,6 +231,127 @@ __global__ void subspace_rerank_select_final_kernel(
         if (size > 0) {
             prefix_tokens += size;
         }
+    }
+}
+
+template<typename InputT>
+__global__ void token_rerank_scores_kernel(
+    const InputT* __restrict__ query_grouped,      // [rows, groups, dim]
+    const InputT* __restrict__ execution_keys,     // [rows, stride, 1, dim]
+    const int32_t* __restrict__ valid_lengths,     // [rows]
+    const int32_t* __restrict__ static_lengths,    // [rows]
+    float* __restrict__ scores,                    // [rows, max_candidates]
+    int rows,
+    int groups,
+    int dim,
+    int stride,
+    int max_candidates
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const int idx = blockIdx.y * blockDim.x + threadIdx.x;
+    if (idx >= max_candidates) {
+        return;
+    }
+
+    const int valid_len = max(0, min(static_cast<int>(valid_lengths[row]), stride));
+    const int static_len = max(0, min(static_cast<int>(static_lengths[row]), valid_len));
+    const int candidate_count = max(valid_len - static_len, 0);
+    float* row_scores = scores + row * max_candidates;
+    if (idx >= candidate_count) {
+        row_scores[idx] = -FLT_MAX;
+        return;
+    }
+
+    const InputT* row_query = query_grouped + row * groups * dim;
+    const InputT* key = execution_keys + (static_cast<int64_t>(row) * stride + static_len + idx) * dim;
+    float score = 0.0f;
+    for (int g = 0; g < groups; ++g) {
+        const InputT* query = row_query + g * dim;
+        for (int d = 0; d < dim; ++d) {
+            score += to_float(query[d]) * to_float(key[d]);
+        }
+    }
+    row_scores[idx] = score;
+}
+
+template<typename InputT>
+__global__ void token_rerank_gather_kernel(
+    const InputT* __restrict__ execution_keys,      // [rows, stride, 1, dim]
+    const InputT* __restrict__ execution_values,    // [rows, stride, 1, dim]
+    const int64_t* __restrict__ token_indices,      // [rows, topk]
+    const int32_t* __restrict__ valid_lengths,      // [rows]
+    const int32_t* __restrict__ static_lengths,     // [rows]
+    InputT* __restrict__ selected_keys,             // [rows, topk, 1, dim]
+    InputT* __restrict__ selected_values,           // [rows, topk, 1, dim]
+    int rows,
+    int dim,
+    int stride,
+    int topk
+) {
+    const int row = blockIdx.x;
+    const int token_pos = blockIdx.y;
+    const int d = threadIdx.x;
+    if (row >= rows || token_pos >= topk || d >= dim) {
+        return;
+    }
+
+    const int valid_len = max(0, min(static_cast<int>(valid_lengths[row]), stride));
+    const int static_len = max(0, min(static_cast<int>(static_lengths[row]), valid_len));
+    const int candidate_count = max(valid_len - static_len, 0);
+    if (token_pos >= candidate_count) {
+        return;
+    }
+
+    const int idx = static_cast<int>(token_indices[row * topk + token_pos]);
+    if (idx < 0 || idx >= candidate_count) {
+        return;
+    }
+    const int src = static_len + idx;
+    const int64_t src_offset = (static_cast<int64_t>(row) * stride + src) * dim + d;
+    const int64_t dst_offset = (static_cast<int64_t>(row) * topk + token_pos) * dim + d;
+    selected_keys[dst_offset] = execution_keys[src_offset];
+    selected_values[dst_offset] = execution_values[src_offset];
+}
+
+template<typename InputT>
+__global__ void token_rerank_scatter_kernel(
+    InputT* __restrict__ execution_keys,            // [rows, stride, 1, dim]
+    InputT* __restrict__ execution_values,          // [rows, stride, 1, dim]
+    const InputT* __restrict__ selected_keys,       // [rows, topk, 1, dim]
+    const InputT* __restrict__ selected_values,     // [rows, topk, 1, dim]
+    int32_t* __restrict__ valid_lengths,            // [rows]
+    const int32_t* __restrict__ static_lengths,     // [rows]
+    int rows,
+    int dim,
+    int stride,
+    int topk
+) {
+    const int row = blockIdx.x;
+    const int token_pos = blockIdx.y;
+    const int d = threadIdx.x;
+    if (row >= rows || token_pos >= topk || d >= dim) {
+        return;
+    }
+
+    const int old_valid_len = max(0, min(static_cast<int>(valid_lengths[row]), stride));
+    const int static_len = max(0, min(static_cast<int>(static_lengths[row]), old_valid_len));
+    const int candidate_count = max(old_valid_len - static_len, 0);
+    const int selected_count = min(topk, candidate_count);
+    if (token_pos >= selected_count) {
+        return;
+    }
+
+    const int dst = static_len + token_pos;
+    const int64_t src_offset = (static_cast<int64_t>(row) * topk + token_pos) * dim + d;
+    const int64_t dst_offset = (static_cast<int64_t>(row) * stride + dst) * dim + d;
+    execution_keys[dst_offset] = selected_keys[src_offset];
+    execution_values[dst_offset] = selected_values[src_offset];
+    if (token_pos == 0 && d == 0) {
+        valid_lengths[row] = static_len + selected_count;
     }
 }
 
@@ -436,76 +495,14 @@ void subspace_rerank_coarse_scores_fp16(
     );
 }
 
-void subspace_rerank_full_scores_bf16(
-    const void* query_grouped,
-    const float* centroids,
-    const int64_t* candidate_ids,
-    const int32_t* cluster_sizes,
-    float* rerank_scores,
-    int rows,
-    int groups,
-    int dim,
-    int n_clusters,
-    int candidate_limit,
-    cudaStream_t stream
-) {
-    constexpr int threads = 256;
-    const size_t shared_mem = static_cast<size_t>(dim) * sizeof(float);
-    dim3 grid(rows, (candidate_limit + threads - 1) / threads);
-    subspace_rerank_full_kernel<__nv_bfloat16><<<grid, threads, shared_mem, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(query_grouped),
-        centroids,
-        candidate_ids,
-        cluster_sizes,
-        rerank_scores,
-        rows,
-        groups,
-        dim,
-        n_clusters,
-        candidate_limit
-    );
-}
-
-void subspace_rerank_full_scores_fp16(
-    const void* query_grouped,
-    const float* centroids,
-    const int64_t* candidate_ids,
-    const int32_t* cluster_sizes,
-    float* rerank_scores,
-    int rows,
-    int groups,
-    int dim,
-    int n_clusters,
-    int candidate_limit,
-    cudaStream_t stream
-) {
-    constexpr int threads = 256;
-    const size_t shared_mem = static_cast<size_t>(dim) * sizeof(float);
-    dim3 grid(rows, (candidate_limit + threads - 1) / threads);
-    subspace_rerank_full_kernel<__half><<<grid, threads, shared_mem, stream>>>(
-        reinterpret_cast<const __half*>(query_grouped),
-        centroids,
-        candidate_ids,
-        cluster_sizes,
-        rerank_scores,
-        rows,
-        groups,
-        dim,
-        n_clusters,
-        candidate_limit
-    );
-}
-
 void subspace_rerank_select_final(
     const int64_t* candidate_ids,
-    const int64_t* rerank_indices,
     const int32_t* cluster_sizes,
     int64_t* selected,
     int rows,
     int n_clusters,
     int nprobe,
     int candidate_limit,
-    int rerank_limit,
     int max_retrieval_tokens,
     int64_t padding_cluster_id,
     cudaStream_t stream
@@ -513,16 +510,188 @@ void subspace_rerank_select_final(
     constexpr int threads = 256;
     subspace_rerank_select_final_kernel<<<rows, threads, 0, stream>>>(
         candidate_ids,
-        rerank_indices,
         cluster_sizes,
         selected,
         rows,
         n_clusters,
         nprobe,
         candidate_limit,
-        rerank_limit,
         max_retrieval_tokens,
         padding_cluster_id
+    );
+}
+
+void token_rerank_scores_bf16(
+    const void* query_grouped,
+    const void* execution_keys,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    float* scores,
+    int rows,
+    int groups,
+    int dim,
+    int stride,
+    int max_candidates,
+    cudaStream_t stream
+) {
+    constexpr int threads = 128;
+    dim3 grid(rows, (max_candidates + threads - 1) / threads);
+    token_rerank_scores_kernel<__nv_bfloat16><<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(query_grouped),
+        reinterpret_cast<const __nv_bfloat16*>(execution_keys),
+        valid_lengths,
+        static_lengths,
+        scores,
+        rows,
+        groups,
+        dim,
+        stride,
+        max_candidates
+    );
+}
+
+void token_rerank_scores_fp16(
+    const void* query_grouped,
+    const void* execution_keys,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    float* scores,
+    int rows,
+    int groups,
+    int dim,
+    int stride,
+    int max_candidates,
+    cudaStream_t stream
+) {
+    constexpr int threads = 128;
+    dim3 grid(rows, (max_candidates + threads - 1) / threads);
+    token_rerank_scores_kernel<__half><<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const __half*>(query_grouped),
+        reinterpret_cast<const __half*>(execution_keys),
+        valid_lengths,
+        static_lengths,
+        scores,
+        rows,
+        groups,
+        dim,
+        stride,
+        max_candidates
+    );
+}
+
+void token_rerank_gather_bf16(
+    const void* execution_keys,
+    const void* execution_values,
+    const int64_t* token_indices,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    void* selected_keys,
+    void* selected_values,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
+    cudaStream_t stream
+) {
+    dim3 grid(rows, topk);
+    token_rerank_gather_kernel<__nv_bfloat16><<<grid, dim, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(execution_keys),
+        reinterpret_cast<const __nv_bfloat16*>(execution_values),
+        token_indices,
+        valid_lengths,
+        static_lengths,
+        reinterpret_cast<__nv_bfloat16*>(selected_keys),
+        reinterpret_cast<__nv_bfloat16*>(selected_values),
+        rows,
+        dim,
+        stride,
+        topk
+    );
+}
+
+void token_rerank_gather_fp16(
+    const void* execution_keys,
+    const void* execution_values,
+    const int64_t* token_indices,
+    const int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    void* selected_keys,
+    void* selected_values,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
+    cudaStream_t stream
+) {
+    dim3 grid(rows, topk);
+    token_rerank_gather_kernel<__half><<<grid, dim, 0, stream>>>(
+        reinterpret_cast<const __half*>(execution_keys),
+        reinterpret_cast<const __half*>(execution_values),
+        token_indices,
+        valid_lengths,
+        static_lengths,
+        reinterpret_cast<__half*>(selected_keys),
+        reinterpret_cast<__half*>(selected_values),
+        rows,
+        dim,
+        stride,
+        topk
+    );
+}
+
+void token_rerank_scatter_bf16(
+    void* execution_keys,
+    void* execution_values,
+    const void* selected_keys,
+    const void* selected_values,
+    int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
+    cudaStream_t stream
+) {
+    dim3 grid(rows, topk);
+    token_rerank_scatter_kernel<__nv_bfloat16><<<grid, dim, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(execution_keys),
+        reinterpret_cast<__nv_bfloat16*>(execution_values),
+        reinterpret_cast<const __nv_bfloat16*>(selected_keys),
+        reinterpret_cast<const __nv_bfloat16*>(selected_values),
+        valid_lengths,
+        static_lengths,
+        rows,
+        dim,
+        stride,
+        topk
+    );
+}
+
+void token_rerank_scatter_fp16(
+    void* execution_keys,
+    void* execution_values,
+    const void* selected_keys,
+    const void* selected_values,
+    int32_t* valid_lengths,
+    const int32_t* static_lengths,
+    int rows,
+    int dim,
+    int stride,
+    int topk,
+    cudaStream_t stream
+) {
+    dim3 grid(rows, topk);
+    token_rerank_scatter_kernel<__half><<<grid, dim, 0, stream>>>(
+        reinterpret_cast<__half*>(execution_keys),
+        reinterpret_cast<__half*>(execution_values),
+        reinterpret_cast<const __half*>(selected_keys),
+        reinterpret_cast<const __half*>(selected_values),
+        valid_lengths,
+        static_lengths,
+        rows,
+        dim,
+        stride,
+        topk
     );
 }
 

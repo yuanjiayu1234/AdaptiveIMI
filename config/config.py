@@ -264,15 +264,21 @@ def generate_config(
         _config = json.load(f)
     
     if attn_type == "AdaptiveIMI":
-        imi_engine = str(imi_engine or "").lower()
+        base_config = _clone_attn_config_section(_config.get("AdaptiveIMI"))
+        config_partition_path = base_config.get("partition_path")
+        if partition_path is None:
+            partition_path = config_partition_path
+        if partition_path and not os.path.isabs(str(partition_path)):
+            partition_path = os.path.join(PROJECT_ROOT, str(partition_path))
+
+        imi_engine = str(imi_engine or base_config.get("engine") or "").lower()
         if imi_engine != "hybrid_8way_v2" and subspace_parts not in (0, 2, 4):
             raise ValueError("subspace_parts must be 0, 2 or 4")
         if imi_engine == "hybrid_8way_v2":
             subspace_parts = 8
             if not partition_path:
-                raise ValueError("hybrid_8way_v2 requires partition_path or learned_partition_path")
+                raise ValueError("hybrid_8way_v2 requires partition_path")
 
-        base_config = _clone_attn_config_section(_config.get("AdaptiveIMI"))
         if retrieval_budget is None:
             retrieval_budget = base_config.get("retrieval_budget", 0.018)
         if cache_ratio is None:
@@ -288,7 +294,6 @@ def generate_config(
             base_config["engine"] = imi_engine
         if partition_path:
             base_config["partition_path"] = partition_path
-            base_config["learned_partition_path"] = partition_path
         if hybrid_index is not None:
             base_config["hybrid_index"] = hybrid_index
         elif imi_engine == "hybrid_8way_v2":

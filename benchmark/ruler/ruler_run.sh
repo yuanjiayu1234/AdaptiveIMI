@@ -15,31 +15,74 @@
 
 set -e
 
+# Model and Tokenizer
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-if [ $# -ne 7 ]; then
-    echo "Usage: $0 <model_name> <benchmark_name> <attn_type> <context_length> <task> <dtype> <budget_ratio>"
+# Defaults for the common AdaptiveIMI hybrid 8-way RULER run. Passing all seven
+# positional arguments keeps the original interface; passing only <task> uses
+# these defaults for everything else.
+DEFAULT_MODEL_NAME="${DEFAULT_MODEL_NAME:-llama-3.1-8b}"
+DEFAULT_BENCHMARK="${DEFAULT_BENCHMARK:-synthetic}"
+DEFAULT_ATTN_TYPE="${DEFAULT_ATTN_TYPE:-AdaptiveIMI}"
+DEFAULT_CONTEXT_LENGTH="${DEFAULT_CONTEXT_LENGTH:-98304}"
+DEFAULT_DTYPE="${DEFAULT_DTYPE:-bf16}"
+DEFAULT_BUDGET_RATIO="${DEFAULT_BUDGET_RATIO:-0.1}"
+
+if [ $# -eq 0 ]; then
+    MODEL_ARG="${DEFAULT_MODEL_NAME}"
+    BENCHMARK_ARG="${DEFAULT_BENCHMARK}"
+    ATTN_TYPE_ARG="${DEFAULT_ATTN_TYPE}"
+    CONTEXT_LENGTH_ARG="${DEFAULT_CONTEXT_LENGTH}"
+    TASK_ARG="all"
+    DTYPE_ARG="${DEFAULT_DTYPE}"
+    BUDGET_RATIO_ARG="${DEFAULT_BUDGET_RATIO}"
+elif [ $# -eq 1 ]; then
+    MODEL_ARG="${DEFAULT_MODEL_NAME}"
+    BENCHMARK_ARG="${DEFAULT_BENCHMARK}"
+    ATTN_TYPE_ARG="${DEFAULT_ATTN_TYPE}"
+    CONTEXT_LENGTH_ARG="${DEFAULT_CONTEXT_LENGTH}"
+    TASK_ARG="${1}"
+    DTYPE_ARG="${DEFAULT_DTYPE}"
+    BUDGET_RATIO_ARG="${DEFAULT_BUDGET_RATIO}"
+elif [ $# -eq 7 ]; then
+    MODEL_ARG="${1}"
+    BENCHMARK_ARG="${2}"
+    ATTN_TYPE_ARG="${3}"
+    CONTEXT_LENGTH_ARG="${4}"
+    TASK_ARG="${5}"
+    DTYPE_ARG="${6}"
+    BUDGET_RATIO_ARG="${7}"
+else
+    echo "Usage: $0 [task]"
+    echo "   or: $0 <model_name> <benchmark_name> <attn_type> <context_length> <task> <dtype> <budget_ratio>"
     exit 1
 fi
 
 # Root Directories
 ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and model predictions.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-NUM_SAMPLES=${NUM_SAMPLES:-200}
-MAX_SEQ_LENGTH=${4}
-ATTN_TYPE=${3}
+NUM_SAMPLES=${NUM_SAMPLES:-50}
+BATCH_SIZE=${BATCH_SIZE:-1}
+MAX_SEQ_LENGTH=${CONTEXT_LENGTH_ARG}
+ATTN_TYPE=${ATTN_TYPE_ARG}
 DEVICE=${DEVICE:-cuda:0}
-BUDGET_RATIO=${7}
-SUBSPACE_PARTS=${SUBSPACE_PARTS:-2}
-IMI_ENGINE=${IMI_ENGINE:-}
+BUDGET_RATIO=${BUDGET_RATIO_ARG}
+SUBSPACE_PARTS=${SUBSPACE_PARTS:-8}
+IMI_ENGINE=${IMI_ENGINE:-hybrid_8way_v2}
 PARTITION_PATH=${PARTITION_PATH:-}
-DECODE_SEARCH_MODE=${DECODE_SEARCH_MODE:-}
+DECODE_SEARCH_MODE=${DECODE_SEARCH_MODE:-flat}
 CANDIDATE_CLUSTERS=${CANDIDATE_CLUSTERS:-}
-RERANK_CLUSTERS=${RERANK_CLUSTERS:-}
-RULER_RESUME=${RULER_RESUME:-0}
+TOKEN_RERANK_BUDGET_RATIO=${TOKEN_RERANK_BUDGET_RATIO:-}
+RULER_RESUME=${RULER_RESUME:-1}
+RULER_USE_SOURCE_CACHE="${RULER_USE_SOURCE_CACHE:-1}"
+GPU_ONLY=${GPU_ONLY:-1}
+if [[ "${GPU_ONLY}" == "1" || "${GPU_ONLY,,}" == "true" || "${GPU_ONLY,,}" == "yes" || "${GPU_ONLY,,}" == "on" ]]; then
+    export IMI_HYBRID_INDEX_POLICY="${IMI_HYBRID_INDEX_POLICY:-gpu_only}"
+fi
+export RULER_DATA_ROOT="${RULER_DATA_ROOT:-/root/RULER}"
+export MODEL_PATH_OVERRIDE="${MODEL_PATH_OVERRIDE:-/root/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
 
-# Model and Tokenizer
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export PYTHONPATH="$(dirname "${PROJECT_ROOT}"):${PROJECT_ROOT}:${PYTHONPATH:-}"
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${PROJECT_ROOT}/outputs/flashinfer}"
 mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
@@ -142,7 +185,7 @@ MODEL_SELECT() {
     echo "$MODEL_PATH:$MODEL_TEMPLATE_TYPE:$MODEL_FRAMEWORK:$TOKENIZER_PATH:$TOKENIZER_TYPE"
 }
 
-MODEL_NAME=${1}
+MODEL_NAME=${MODEL_ARG}
 MODEL_CONFIG=$(MODEL_SELECT ${MODEL_NAME})
 IFS=":" read MODEL_PATH MODEL_TEMPLATE_TYPE MODEL_FRAMEWORK TOKENIZER_PATH TOKENIZER_TYPE <<< "$MODEL_CONFIG"
 if [[ -n "${MODEL_PATH_OVERRIDE:-}" ]]; then
@@ -165,7 +208,7 @@ fi
 
 # Benchmark and Tasks
 source "${SCRIPT_DIR}/ruler_config_tasks.sh"
-BENCHMARK=${2}
+BENCHMARK=${BENCHMARK_ARG}
 declare -n TASKS=$BENCHMARK
 if [ -z "${TASKS}" ]; then
     echo "Benchmark: ${BENCHMARK} is not supported"
@@ -174,7 +217,7 @@ fi
 
 # Start client (prepare data / call model API / obtain final metrics)
     
-RUN_TAG="${ATTN_TYPE}-br${BUDGET_RATIO}-sp${SUBSPACE_PARTS}"
+RUN_TAG="${ATTN_TYPE}-br${BUDGET_RATIO}-sp${SUBSPACE_PARTS}-bs${BATCH_SIZE}-n${NUM_SAMPLES}"
 if [[ -n "${IMI_ENGINE}" ]]; then
     RUN_TAG="${RUN_TAG}-${IMI_ENGINE}"
 fi
@@ -188,17 +231,16 @@ fi
 mkdir -p ${DATA_DIR}
 mkdir -p ${PRED_DIR}
 
-REQUESTED_TASK=${5}
+REQUESTED_TASK=${TASK_ARG}
 if [ "${REQUESTED_TASK}" = "all" ]; then
     TASK_LIST=("${TASKS[@]}")
 else
     TASK_LIST=("${REQUESTED_TASK}")
 fi
 
-DTYPE=${6}
+DTYPE=${DTYPE_ARG}
 SUBSET="validation"
 RULER_DATA_ROOT="${RULER_DATA_ROOT:-${PROJECT_ROOT}/data/RULER}"
-RULER_USE_SOURCE_CACHE="${RULER_USE_SOURCE_CACHE:-0}"
 
 jsonl_count() {
     local file="$1"
@@ -250,30 +292,35 @@ for TASK in "${TASK_LIST[@]}"; do
     TARGET_DATA="${DATA_DIR}/${TASK}/${SUBSET}.jsonl"
     PRED_FILE="${PRED_DIR}/${TASK}.jsonl"
 
+    NEED_DATA=1
     if [[ "${RULER_RESUME}" = "1" && -f "${TARGET_DATA}" ]]; then
         TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
-        if [[ "${TARGET_COUNT}" -ne "${NUM_SAMPLES}" ]]; then
-            echo "Existing dataset at ${TARGET_DATA} has ${TARGET_COUNT} samples, but NUM_SAMPLES=${NUM_SAMPLES}."
-            echo "Refusing to resume with a different sample count. Use the same NUM_SAMPLES, or remove/use a different results directory."
-            exit 1
+        if [[ "${TARGET_COUNT}" -eq "${NUM_SAMPLES}" ]]; then
+            echo "Found existing dataset at ${TARGET_DATA}, reusing for resume..."
+            NEED_DATA=0
+        else
+            echo "Existing dataset at ${TARGET_DATA} has ${TARGET_COUNT} samples; rebuilding ${NUM_SAMPLES}-sample target data."
         fi
-        echo "Found existing dataset at ${TARGET_DATA}, reusing for resume..."
-    elif [[ "${RULER_USE_SOURCE_CACHE}" = "1" && -f "${SOURCE_DATA}" ]]; then
-        echo "Found cached dataset at ${SOURCE_DATA}, copying..."
-        mkdir -p "$(dirname "${TARGET_DATA}")"
-        cp "${SOURCE_DATA}" "${TARGET_DATA}"
-    else
-        echo "Generating ${TASK} with template ${MODEL_TEMPLATE_TYPE} ..."
-        python -u "${SCRIPT_DIR}/data/prepare.py" \
-            --save_dir ${DATA_DIR} \
-            --benchmark ${BENCHMARK} \
-            --task ${TASK} \
-            --tokenizer_path ${TOKENIZER_PATH} \
-            --tokenizer_type ${TOKENIZER_TYPE} \
-            --max_seq_length ${MAX_SEQ_LENGTH} \
-            --model_template_type ${MODEL_TEMPLATE_TYPE} \
-            --num_samples ${NUM_SAMPLES} \
-            ${REMOVE_NEWLINE_TAB}
+    fi
+
+    if [[ "${NEED_DATA}" = "1" ]]; then
+        if [[ "${RULER_USE_SOURCE_CACHE}" = "1" && -f "${SOURCE_DATA}" ]]; then
+            echo "Found cached dataset at ${SOURCE_DATA}, copying first ${NUM_SAMPLES} samples..."
+            mkdir -p "$(dirname "${TARGET_DATA}")"
+            head -n "${NUM_SAMPLES}" "${SOURCE_DATA}" > "${TARGET_DATA}"
+        else
+            echo "Generating ${TASK} with template ${MODEL_TEMPLATE_TYPE} ..."
+            python -u "${SCRIPT_DIR}/data/prepare.py" \
+                --save_dir ${DATA_DIR} \
+                --benchmark ${BENCHMARK} \
+                --task ${TASK} \
+                --tokenizer_path ${TOKENIZER_PATH} \
+                --tokenizer_type ${TOKENIZER_TYPE} \
+                --max_seq_length ${MAX_SEQ_LENGTH} \
+                --model_template_type ${MODEL_TEMPLATE_TYPE} \
+                --num_samples ${NUM_SAMPLES} \
+                ${REMOVE_NEWLINE_TAB}
+        fi
     fi
 
     TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
@@ -296,8 +343,8 @@ for TASK in "${TASK_LIST[@]}"; do
     if [[ -n "${CANDIDATE_CLUSTERS}" ]]; then
         EXTRA_IMI_ARGS+=(--candidate_clusters "${CANDIDATE_CLUSTERS}")
     fi
-    if [[ -n "${RERANK_CLUSTERS}" ]]; then
-        EXTRA_IMI_ARGS+=(--rerank_clusters "${RERANK_CLUSTERS}")
+    if [[ -n "${TOKEN_RERANK_BUDGET_RATIO}" ]]; then
+        EXTRA_IMI_ARGS+=(--token_rerank_budget_ratio "${TOKEN_RERANK_BUDGET_RATIO}")
     fi
 
     python -u "${SCRIPT_DIR}/pred/call_api.py" \
@@ -305,7 +352,7 @@ for TASK in "${TASK_LIST[@]}"; do
         --model_path ${TOKENIZER_PATH} \
         --attn_type ${ATTN_TYPE} \
         --max_len ${MAX_SEQ_LENGTH} \
-        --batch_size 1 \
+        --batch_size ${BATCH_SIZE} \
         --data_dir ${DATA_DIR} \
         --save_dir ${PRED_DIR} \
         --benchmark ${BENCHMARK} \

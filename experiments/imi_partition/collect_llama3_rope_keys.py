@@ -11,6 +11,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from config import resolve_model_path
 
 
+def _progress(iterable, *, total: Optional[int], desc: str, enabled: bool):
+    if not enabled:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True)
+
+
 class RopeKeyCollector:
     def __init__(
         self,
@@ -145,6 +155,59 @@ def _resolve_modeling_module(model_path: str, model_name: str):
     return importlib.import_module("transformers.models.llama.modeling_llama")
 
 
+def _patch_mlp_chunking(model, chunk_size: int):
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        return lambda: None
+
+    original_forwards = []
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+        required = ("gate_proj", "up_proj", "down_proj", "act_fn")
+        if not all(hasattr(mlp, name) for name in required):
+            continue
+        original_forward = mlp.forward
+        original_forwards.append((mlp, original_forward))
+
+        def make_forward(module):
+            def chunked_forward(x):
+                if x.dim() < 3 or int(x.size(-2)) <= chunk_size:
+                    return module.down_proj(module.act_fn(module.gate_proj(x)) * module.up_proj(x))
+                chunks = []
+                for start in range(0, int(x.size(-2)), chunk_size):
+                    part = x[..., start : start + chunk_size, :]
+                    chunks.append(module.down_proj(module.act_fn(module.gate_proj(part)) * module.up_proj(part)))
+                return torch.cat(chunks, dim=-2)
+
+            return chunked_forward
+
+        mlp.forward = make_forward(mlp)
+
+    def restore() -> None:
+        for mlp, original_forward in original_forwards:
+            mlp.forward = original_forward
+
+    print(f"[collect] enabled MLP sequence chunking chunk_size={chunk_size} layers={len(original_forwards)}", flush=True)
+    return restore
+
+
+def _forward_last_logits(model, **kwargs):
+    try:
+        return model(**kwargs, logits_to_keep=1)
+    except TypeError:
+        pass
+    try:
+        return model(**kwargs, num_logits_to_keep=1)
+    except TypeError:
+        pass
+    raise RuntimeError(
+        "This transformers model does not accept logits_to_keep/num_logits_to_keep; "
+        "refusing to compute full-sequence vocabulary logits during key collection."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect RoPE-applied Llama keys for IMI partition experiments.")
     parser.add_argument("--model", type=str, default="llama-3-8b-1048k")
@@ -161,7 +224,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-end", type=int, default=1024)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--attn-implementation", type=str, default="", help="Optional HF attention backend, e.g. flash_attention_2 or sdpa.")
+    parser.add_argument("--mlp-chunk-size", type=int, default=0, help="Chunk MLP along sequence dimension to reduce 128k prefill peak memory.")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--no-progress", dest="progress", action="store_false", help="Disable tqdm progress bars.")
+    parser.set_defaults(progress=True)
     return parser.parse_args()
 
 
@@ -170,11 +237,15 @@ def main() -> None:
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     model_path = resolve_model_path(args.model)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model_kwargs = {"torch_dtype": dtype}
+    if str(args.attn_implementation):
+        model_kwargs["attn_implementation"] = str(args.attn_implementation)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=dtype,
+        **model_kwargs,
     ).to(args.device)
     model.eval()
+    restore_mlp_chunking = _patch_mlp_chunking(model, int(args.mlp_chunk_size))
 
     num_layers = int(model.config.num_hidden_layers)
     layer_ids = _parse_layers(args.layers, num_layers)
@@ -217,7 +288,14 @@ def main() -> None:
     prompt_count = 0
     try:
         with torch.inference_mode():
-            for prompt in _iter_prompts(args):
+            prompt_total = int(args.limit) if int(args.limit) > 0 else None
+            prompts = _progress(
+                _iter_prompts(args),
+                total=prompt_total,
+                desc="collect keys",
+                enabled=bool(args.progress),
+            )
+            for prompt in prompts:
                 encoded = tokenizer(
                     prompt,
                     return_tensors="pt",
@@ -228,7 +306,8 @@ def main() -> None:
                 attention_mask = encoded.get("attention_mask")
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(args.device)
-                model(
+                _forward_last_logits(
+                    model,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     use_cache=False,
@@ -236,6 +315,7 @@ def main() -> None:
                 prompt_count += 1
                 print(f"[collect] prompt={prompt_count} tokens={int(input_ids.size(1))}", flush=True)
     finally:
+        restore_mlp_chunking()
         llama_modeling.apply_rotary_pos_emb = original_apply_rope
         for attention, original_forward in original_forwards:
             attention.forward = original_forward
@@ -257,7 +337,9 @@ def main() -> None:
         },
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(output, args.out)
+    tmp_out = args.out.with_suffix(args.out.suffix + ".tmp")
+    torch.save(output, tmp_out)
+    tmp_out.replace(args.out)
     print(f"[collect] wrote {args.out} shape={tuple(keys.shape)}", flush=True)
 
 

@@ -328,6 +328,9 @@ class IMIPipeline:
 
         pipeline = self._get_pipeline()
         if not pipeline.wait_ready(timeout_sec=max(60.0, token_count / 1024.0 * 5.0)):
+            error = pipeline.error_message()
+            if error:
+                raise RuntimeError(f"IMI pipeline failed: {error}")
             raise RuntimeError("IMI pipeline did not finish in time")
 
         stats = pipeline.get_pipeline_stats()

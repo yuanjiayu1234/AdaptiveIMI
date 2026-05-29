@@ -80,8 +80,19 @@ class QwenModel(LLM):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path) if tokenizer is None else tokenizer
         self.config = AutoConfig.from_pretrained(self.model_path)
         self._populate_common_config_fields()
-        self.base = getattr(self.config, "rope_theta", None) or self.config.to_dict().get("rope_theta", 1000000)
-        self.yarn_factor = 4         # # qwen2.5 use yarn in context length larger than 32768
+        self.head_dim = getattr(self.config, "head_dim", self.hidden_size // self.num_heads)
+        rope_parameters = getattr(self.config, "rope_parameters", None) or {}
+        self.base = getattr(self.config, "rope_theta", None) or rope_parameters.get("rope_theta", 1000000)
+        rope_scaling = getattr(self.config, "rope_scaling", None) or {}
+        if rope_parameters.get("rope_type") == "yarn":
+            rope_scaling = rope_parameters
+        self.yarn_factor = float(rope_scaling.get("factor", 4.0))
+        self.original_max_position_embeddings = int(
+            rope_scaling.get(
+                "original_max_position_embeddings",
+                32768 if getattr(self.config, "model_type", "") == "qwen3" else self.max_position_embeddings,
+            )
+        )
         self.eos_tokens = [self.config.eos_token_id]
         self.init_model()
 
@@ -114,7 +125,13 @@ class QwenModel(LLM):
             inv_freq_extrapolation = 1.0 / pos_freqs
             inv_freq_interpolation = 1.0 / (self.yarn_factor * pos_freqs)
 
-            low, high = find_correction_range(beta_fast, beta_slow, self.head_dim, self.base, self.max_position_embeddings)
+            low, high = find_correction_range(
+                beta_fast,
+                beta_slow,
+                self.head_dim,
+                self.base,
+                self.original_max_position_embeddings,
+            )
 
             inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, self.head_dim // 2).float().to(self.inv_freq.device)
             inv_freq = (

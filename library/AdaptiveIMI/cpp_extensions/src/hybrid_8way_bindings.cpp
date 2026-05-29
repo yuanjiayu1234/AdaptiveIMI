@@ -1,7 +1,6 @@
+#include "reorder_core.hpp"
 #include <torch/extension.h>
-#include <ATen/Parallel.h>
 #include <pybind11/pybind11.h>
-#include <cstring>
 #include <vector>
 
 namespace py = pybind11;
@@ -16,7 +15,7 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     const torch::Tensor& k_values,
     int64_t max_iters,
     int64_t max_k,
-    int64_t dense_code_space
+    int64_t max_compact_clusters
 );
 
 void reorder_raw_kv_by_token_ids_cpu(
@@ -75,14 +74,6 @@ void reorder_raw_kv_by_token_ids_cpu(
     TORCH_CHECK(row_token_counts.numel() == rows, "row_token_counts row mismatch");
 
     const auto element_size = keys_cpu.element_size();
-    const int64_t src_row_bytes = max_tokens * head_dim * static_cast<int64_t>(element_size);
-    const int64_t out_row_bytes = out_capacity * head_dim * static_cast<int64_t>(element_size);
-    const int64_t token_bytes = head_dim * static_cast<int64_t>(element_size);
-    const char* keys_base = static_cast<const char*>(keys_cpu.data_ptr());
-    const char* values_base = static_cast<const char*>(values_cpu.data_ptr());
-    char* out_keys_base = static_cast<char*>(out_keys_cpu.data_ptr());
-    char* out_values_base = static_cast<char*>(out_values_cpu.data_ptr());
-    const int32_t* ids_base = token_ids_by_cluster.data_ptr<int32_t>();
     const int32_t* counts = row_token_counts.data_ptr<int32_t>();
     for (int64_t row = 0; row < rows; ++row) {
         TORCH_CHECK(counts[row] >= 0 && counts[row] <= max_tokens, "row_token_counts entry out of range");
@@ -92,25 +83,22 @@ void reorder_raw_kv_by_token_ids_cpu(
         );
     }
 
-    at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t row = begin; row < end; ++row) {
-            const int32_t token_count = counts[row];
-            const char* row_keys = keys_base + row * src_row_bytes;
-            const char* row_values = values_base + row * src_row_bytes;
-            char* row_out_keys = out_keys_base + row * out_row_bytes;
-            char* row_out_values = out_values_base + row * out_row_bytes;
-            const int32_t* row_ids = ids_base + row * token_ids_by_cluster.size(1);
-            for (int32_t dst = 0; dst < token_count; ++dst) {
-                const int32_t src = row_ids[dst];
-                std::memcpy(row_out_keys + static_cast<int64_t>(dst) * token_bytes,
-                            row_keys + static_cast<int64_t>(src) * token_bytes,
-                            static_cast<size_t>(token_bytes));
-                std::memcpy(row_out_values + static_cast<int64_t>(dst) * token_bytes,
-                            row_values + static_cast<int64_t>(src) * token_bytes,
-                            static_cast<size_t>(token_bytes));
-            }
-        }
-    });
+    imi::copy_kv_by_token_order_rows_cpu(
+        keys_cpu.data_ptr(),
+        values_cpu.data_ptr(),
+        token_ids_by_cluster.data_ptr<int32_t>(),
+        counts,
+        rows,
+        max_tokens,
+        out_capacity,
+        head_dim,
+        element_size,
+        static_cast<size_t>(max_tokens * head_dim * static_cast<int64_t>(element_size)),
+        static_cast<size_t>(out_capacity * head_dim * static_cast<int64_t>(element_size)),
+        out_keys_cpu.data_ptr(),
+        out_values_cpu.data_ptr(),
+        token_ids_by_cluster.size(1)
+    );
 }
 
 } // namespace imi_hybrid
@@ -128,7 +116,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("k_values"),
         py::arg("max_iters"),
         py::arg("max_k"),
-        py::arg("dense_code_space"),
+        py::arg("max_compact_clusters"),
         R"pbdoc(
             Learned 8-way batched k-means for hybrid AdaptiveIMI.
 
@@ -140,13 +128,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 k_values: [8] int32 CUDA tensor.
                 max_iters: Lloyd iterations.
                 max_k: max(k_values), supplied by Python to avoid GPU scalar sync.
-                dense_code_space: product(k_values), supplied by Python to avoid GPU scalar sync.
+                max_compact_clusters: min(prod(k_values), max_tokens), supplied by Python to avoid GPU scalar sync.
 
             Returns:
-                labels_m: int32[batch_groups, 8, max_tokens]
                 subspace_centroids: float32[batch_groups, 8, max_k, max_sub_dim]
                 subspace_centroid_masks: bool[batch_groups, 8, max_k]
-                token_labels: int32[batch_groups, max_tokens]
                 token_ids_by_cluster: int32[batch_groups, max_tokens]
                 compact_codes: int32[batch_groups, max_compact_clusters, 8]
                 cluster_sizes: int32[batch_groups, max_compact_clusters]

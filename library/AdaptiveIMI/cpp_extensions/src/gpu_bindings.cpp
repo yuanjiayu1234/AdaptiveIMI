@@ -17,13 +17,18 @@ namespace imi_decode {
                                                const torch::Tensor& subspace_dim_ids,
                                                const torch::Tensor& subspace_dim_masks,
                                                const torch::Tensor& compact_codes,
-                                               const torch::Tensor& centroids,
                                                const torch::Tensor& cluster_sizes,
                                                int64_t nprobe,
                                                int64_t candidate_limit,
-                                               int64_t rerank_limit,
                                                int64_t max_retrieval_tokens,
                                                int64_t padding_cluster_id);
+
+    void token_rerank_compact(const torch::Tensor& query_grouped,
+                              torch::Tensor& execution_keys,
+                              torch::Tensor& execution_values,
+                              torch::Tensor& valid_lengths,
+                              const torch::Tensor& static_lengths,
+                              int64_t token_budget);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -63,11 +68,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            const torch::Tensor& subspace_dim_ids,
            const torch::Tensor& subspace_dim_masks,
            const torch::Tensor& compact_codes,
-           const torch::Tensor& centroids,
            const torch::Tensor& cluster_sizes,
            int64_t nprobe,
            int64_t candidate_limit,
-           int64_t rerank_limit,
            int64_t max_retrieval_tokens,
            int64_t padding_cluster_id) {
             return imi_decode::fused_subspace_rerank_select(
@@ -77,11 +80,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 subspace_dim_ids,
                 subspace_dim_masks,
                 compact_codes,
-                centroids,
                 cluster_sizes,
                 nprobe,
                 candidate_limit,
-                rerank_limit,
                 max_retrieval_tokens,
                 padding_cluster_id
             );
@@ -92,18 +93,46 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("subspace_dim_ids"),
         py::arg("subspace_dim_masks"),
         py::arg("compact_codes"),
-        py::arg("centroids"),
         py::arg("cluster_sizes"),
         py::arg("nprobe"),
         py::arg("candidate_limit"),
-        py::arg("rerank_limit"),
         py::arg("max_retrieval_tokens"),
         py::arg("padding_cluster_id"),
         R"pbdoc(
             Hybrid 8-way decode fast path:
-            subspace coarse scoring -> candidate topk -> true full-centroid rerank -> token-budget cluster selection.
+            subspace coarse scoring -> candidate topk -> token-budget cluster selection.
 
             Returns:
                 [rows, nprobe] int64 selected cluster ids
+        )pbdoc");
+
+    m.def("token_rerank_compact",
+        [](const torch::Tensor& query_grouped,
+           torch::Tensor& execution_keys,
+           torch::Tensor& execution_values,
+           torch::Tensor& valid_lengths,
+           const torch::Tensor& static_lengths,
+           int64_t token_budget) {
+            imi_decode::token_rerank_compact(
+                query_grouped,
+                execution_keys,
+                execution_values,
+                valid_lengths,
+                static_lengths,
+                token_budget
+            );
+        },
+        py::arg("query_grouped"),
+        py::arg("execution_keys"),
+        py::arg("execution_values"),
+        py::arg("valid_lengths"),
+        py::arg("static_lengths"),
+        py::arg("token_budget"),
+        R"pbdoc(
+            Token-level rerank after coarse cluster retrieval.
+
+            Computes QK scores for gathered non-static tokens, keeps top token_budget
+            tokens per row, compacts K/V in-place after static tokens, and updates
+            valid_lengths.
         )pbdoc");
 }

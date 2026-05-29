@@ -8,8 +8,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
-#include <iostream>
-#include <iomanip>
 #include <atomic>  
 #include <unordered_set>
 #include <c10/core/ScalarType.h>
@@ -66,8 +64,6 @@ static LloydRuntimeConfig load_lloyd_runtime_config(const LayerPipelineRuntimeCo
 namespace {
 
 std::atomic<int> g_active_kmeans{0};
-std::atomic<int> g_kmeans_budget_logs{0};
-std::atomic<int> g_kmeans_active_logs{0};
 
 class KmeansConcurrencyGuard {
 public:
@@ -103,32 +99,6 @@ void compute_kmeans_thread_budget(
     int min_threads = std::max(1, std::min(min_threads_per_phase, available));
     effective_min_threads = std::min(min_threads, effective_threads);
 }
-
-void log_kmeans_active(
-    int active_kmeans,
-    int worker_threads,
-    int effective_threads,
-    int effective_min_threads,
-    int32_t kv_heads,
-    int32_t n_tokens
-) {
-    if (std::getenv("IMI_DEBUG_KMEANS_ACTIVE") == nullptr) {
-        return;
-    }
-    int log_id = g_kmeans_active_logs.fetch_add(1, std::memory_order_relaxed);
-    if (log_id >= 128) {
-        return;
-    }
-    std::cout << "[KMeansActive] active=" << active_kmeans
-              << ", worker_threads=" << worker_threads
-              << ", effective_threads=" << effective_threads
-              << ", min_threads_per_phase=" << effective_min_threads
-              << ", kv_heads=" << kv_heads
-              << ", n_tokens=" << n_tokens
-              << "\n";
-}
-
-
 
 } // namespace
 
@@ -250,14 +220,6 @@ static void lloyd_iteration(
         const bool reach_rel_tol = relative_change <= std::max(0.0f, early_stop_rel_tol);
         const bool reach_abs_tol = inertia_change <= std::max(0.0f, tol);
         if (reached_min_iter && (reach_rel_tol || reach_abs_tol)) {
-            static std::atomic<int> convergence_count{0};
-            if (convergence_count < 3) {
-                std::cout << "[Lloyd] Converged early: iter=" << actual_iters
-                          << ", n_samples=" << n_samples
-                          << ", k=" << k
-                          << ", relative_change=" << relative_change * 100 << "%\n";
-                convergence_count.fetch_add(1);
-            }
             break;
         }
         prev_inertia = inertia;
@@ -377,6 +339,576 @@ static void run_imi_single_phase_from_subvec(
         runtime_cfg.early_stop_rel_tol
     );
 }
+
+static inline float fp16_to_fp32_kmeans_local(uint16_t h) {
+    union { uint32_t i; float f; } u;
+
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp = (h & 0x7C00) >> 10;
+    uint32_t mantissa = (h & 0x03FF) << 13;
+
+    if (exp == 0x1F) {
+        u.i = sign | 0x7F800000 | mantissa;
+    } else if (exp == 0) {
+        if (mantissa == 0) {
+            u.i = sign;
+        } else {
+            exp = 1;
+            while ((mantissa & 0x800000) == 0) {
+                mantissa <<= 1;
+                exp--;
+            }
+            mantissa &= 0x7FFFFF;
+            u.i = sign | ((exp + 127 - 15) << 23) | mantissa;
+        }
+    } else {
+        u.i = sign | ((exp + 127 - 15) << 23) | mantissa;
+    }
+    return u.f;
+}
+
+static inline float bf16_to_fp32_kmeans_local(uint16_t h) {
+    union { uint32_t i; float f; } u;
+    u.i = static_cast<uint32_t>(h) << 16;
+    return u.f;
+}
+
+static inline float load_kv16_as_float(
+    const uint16_t* keys_u16,
+    c10::ScalarType dtype,
+    int32_t kv_heads,
+    int32_t n_tokens,
+    int32_t dim,
+    int32_t head,
+    int32_t token,
+    int32_t d,
+    bool sequence_major
+) {
+    const size_t index = sequence_major
+        ? (static_cast<size_t>(token) * kv_heads + head) * dim + d
+        : (static_cast<size_t>(head) * n_tokens + token) * dim + d;
+    const uint16_t raw = keys_u16[index];
+    return dtype == c10::ScalarType::Half
+        ? fp16_to_fp32_kmeans_local(raw)
+        : bf16_to_fp32_kmeans_local(raw);
+}
+
+static inline void convert_kv16_row_to_fp32(
+    const uint16_t* src,
+    c10::ScalarType dtype,
+    int32_t dim,
+    float* dst
+) {
+    int32_t d = 0;
+    if (dtype == c10::ScalarType::Half) {
+#if defined(__F16C__)
+        for (; d + 7 < dim; d += 8) {
+            __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + d));
+            __m256 fp32 = _mm256_cvtph_ps(raw);
+            _mm256_storeu_ps(dst + d, fp32);
+        }
+#endif
+        for (; d < dim; ++d) {
+            dst[d] = fp16_to_fp32_kmeans_local(src[d]);
+        }
+    } else {
+#if defined(__AVX2__)
+        const __m128i zero = _mm_setzero_si128();
+        for (; d + 7 < dim; d += 8) {
+            __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + d));
+            __m128i lo = _mm_unpacklo_epi16(raw, zero);
+            __m128i hi = _mm_unpackhi_epi16(raw, zero);
+            lo = _mm_slli_epi32(lo, 16);
+            hi = _mm_slli_epi32(hi, 16);
+            __m256 fp32 = _mm256_castps128_ps256(_mm_castsi128_ps(lo));
+            fp32 = _mm256_insertf128_ps(fp32, _mm_castsi128_ps(hi), 1);
+            _mm256_storeu_ps(dst + d, fp32);
+        }
+#endif
+        for (; d < dim; ++d) {
+            dst[d] = bf16_to_fp32_kmeans_local(src[d]);
+        }
+    }
+}
+
+static inline void load_head_token_tile_fp32(
+    const uint16_t* keys_u16,
+    c10::ScalarType dtype,
+    int32_t kv_heads,
+    int32_t n_tokens,
+    int32_t dim,
+    int32_t head,
+    int32_t token_begin,
+    int32_t token_end,
+    bool sequence_major,
+    std::vector<float>& tile
+) {
+    const int32_t tile_tokens = token_end - token_begin;
+    tile.resize(static_cast<size_t>(tile_tokens) * dim);
+    for (int32_t local = 0; local < tile_tokens; ++local) {
+        const int32_t token = token_begin + local;
+        float* dst = tile.data() + static_cast<size_t>(local) * dim;
+        const size_t src_base = sequence_major
+            ? (static_cast<size_t>(token) * kv_heads + head) * dim
+            : (static_cast<size_t>(head) * n_tokens + token) * dim;
+        convert_kv16_row_to_fp32(keys_u16 + src_base, dtype, dim, dst);
+    }
+}
+
+static inline void gather_dim_ids_sample(
+    const uint16_t* keys_u16,
+    c10::ScalarType dtype,
+    int32_t kv_heads,
+    int32_t n_tokens,
+    int32_t dim,
+    int32_t head,
+    int32_t token,
+    const int32_t* dim_ids,
+    int32_t dim_count,
+    bool sequence_major,
+    float* dst
+) {
+    for (int32_t d = 0; d < dim_count; ++d) {
+        dst[d] = load_kv16_as_float(
+            keys_u16, dtype, kv_heads, n_tokens, dim,
+            head, token, dim_ids[d], sequence_major
+        );
+    }
+}
+
+static inline float distance_dim_ids(
+    const float* token_fp32,
+    const int32_t* dim_ids,
+    int32_t dim_count,
+    const float* centroid
+) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    int32_t d = 0;
+    for (; d + 7 < dim_count; d += 8) {
+        __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dim_ids + d));
+        __m256 x = _mm256_i32gather_ps(token_fp32, idx, 4);
+        __m256 c = _mm256_loadu_ps(centroid + d);
+        __m256 diff = _mm256_sub_ps(x, c);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum4 = _mm_add_ps(lo, hi);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    float dist = _mm_cvtss_f32(sum4);
+    for (; d < dim_count; ++d) {
+        float diff = token_fp32[dim_ids[d]] - centroid[d];
+        dist += diff * diff;
+    }
+    return dist;
+#else
+    float dist = 0.0f;
+    for (int32_t d = 0; d < dim_count; ++d) {
+        float diff = token_fp32[dim_ids[d]] - centroid[d];
+        dist += diff * diff;
+    }
+    return dist;
+#endif
+}
+
+static inline float distance_source_dim_ids(
+    const uint16_t* keys_u16,
+    c10::ScalarType dtype,
+    int32_t kv_heads,
+    int32_t n_tokens,
+    int32_t dim,
+    int32_t head,
+    int32_t token,
+    const int32_t* dim_ids,
+    int32_t dim_count,
+    bool sequence_major,
+    const float* centroid
+) {
+    float dist = 0.0f;
+    for (int32_t d = 0; d < dim_count; ++d) {
+        const float value = load_kv16_as_float(
+            keys_u16, dtype, kv_heads, n_tokens, dim,
+            head, token, dim_ids[d], sequence_major
+        );
+        float diff = value - centroid[d];
+        dist += diff * diff;
+    }
+    return dist;
+}
+
+static inline void add_dim_ids_to_sum(
+    const float* token_fp32,
+    const int32_t* dim_ids,
+    int32_t dim_count,
+    float* sum
+) {
+#if defined(__AVX2__)
+    int32_t d = 0;
+    for (; d + 7 < dim_count; d += 8) {
+        __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dim_ids + d));
+        __m256 x = _mm256_i32gather_ps(token_fp32, idx, 4);
+        __m256 old = _mm256_loadu_ps(sum + d);
+        _mm256_storeu_ps(sum + d, _mm256_add_ps(old, x));
+    }
+    for (; d < dim_count; ++d) {
+        sum[d] += token_fp32[dim_ids[d]];
+    }
+#else
+    for (int32_t d = 0; d < dim_count; ++d) {
+        sum[d] += token_fp32[dim_ids[d]];
+    }
+#endif
+}
+
+class KmeansExecutor8WayFused {
+public:
+    static std::unique_ptr<KmeansResult> execute(
+        const uint16_t* keys_u16,
+        c10::ScalarType dtype,
+        int32_t kv_heads,
+        int32_t n_tokens,
+        int32_t dim,
+        const std::vector<int32_t>& k_values,
+        const std::vector<std::vector<std::vector<int32_t>>>& head_pair_groups,
+        int32_t worker_threads,
+        const LloydRuntimeConfig& runtime_cfg,
+        bool sequence_major
+    ) {
+        constexpr int32_t kStages = 8;
+        if (dim % 2 != 0) {
+            throw std::invalid_argument("8-way fused K-means requires even head dim");
+        }
+        if (n_tokens <= 0) {
+            throw std::invalid_argument("8-way fused K-means requires positive token count");
+        }
+        if (static_cast<int32_t>(k_values.size()) != kStages) {
+            throw std::invalid_argument("8-way fused K-means requires exactly 8 k_values");
+        }
+        if (static_cast<int32_t>(head_pair_groups.size()) != kv_heads) {
+            throw std::invalid_argument("8-way fused K-means partition head count mismatch");
+        }
+
+        const int32_t half = dim / 2;
+        int32_t max_k = 1;
+        int32_t max_sub_dim = 1;
+        uint64_t packed_code_space = 1;
+        std::vector<int32_t> sub_dims(static_cast<size_t>(kv_heads) * kStages, 0);
+        for (int32_t stage = 0; stage < kStages; ++stage) {
+            const uint64_t k = static_cast<uint64_t>(std::max(1, k_values[stage]));
+            if (packed_code_space > std::numeric_limits<uint64_t>::max() / k) {
+                throw std::invalid_argument("8-way fused K-means k_values exceed uint64 packed code range");
+            }
+            packed_code_space *= k;
+        }
+        for (int32_t head = 0; head < kv_heads; ++head) {
+            if (static_cast<int32_t>(head_pair_groups[head].size()) != kStages) {
+                throw std::invalid_argument("8-way fused K-means requires 8 subspaces for every head");
+            }
+            std::vector<uint8_t> seen(half, 0);
+            int32_t covered = 0;
+            for (int32_t stage = 0; stage < kStages; ++stage) {
+                const auto& pairs = head_pair_groups[head][stage];
+                if (pairs.empty()) {
+                    throw std::invalid_argument("8-way fused K-means contains empty subspace");
+                }
+                for (int32_t pair : pairs) {
+                    if (pair < 0 || pair >= half) {
+                        throw std::invalid_argument("8-way fused K-means pair index out of range");
+                    }
+                    if (seen[pair]) {
+                        throw std::invalid_argument("8-way fused K-means pair index appears more than once");
+                    }
+                    seen[pair] = 1;
+                    ++covered;
+                }
+                if (k_values[stage] <= 0) {
+                    throw std::invalid_argument("8-way fused K-means k_values must be positive");
+                }
+                const int32_t sub_dim = static_cast<int32_t>(pairs.size()) * 2;
+                sub_dims[static_cast<size_t>(head) * kStages + stage] = sub_dim;
+                max_sub_dim = std::max(max_sub_dim, sub_dim);
+                max_k = std::max(max_k, k_values[stage]);
+            }
+            if (covered != half) {
+                throw std::invalid_argument("8-way fused K-means partition must cover every RoPE pair exactly once");
+            }
+        }
+
+        const int32_t total_tasks = kv_heads * kStages;
+        std::vector<int32_t> dim_counts(total_tasks, 0);
+        std::vector<int32_t> dim_ids_flat(static_cast<size_t>(total_tasks) * max_sub_dim, 0);
+        for (int32_t head = 0; head < kv_heads; ++head) {
+            for (int32_t stage = 0; stage < kStages; ++stage) {
+                const int32_t task = head * kStages + stage;
+                const auto& pairs = head_pair_groups[head][stage];
+                int32_t offset = 0;
+                int32_t* dst = dim_ids_flat.data() + static_cast<size_t>(task) * max_sub_dim;
+                for (int32_t pair : pairs) {
+                    dst[offset++] = pair;
+                    dst[offset++] = pair + half;
+                }
+                dim_counts[task] = offset;
+            }
+        }
+
+        auto result = std::make_unique<KmeansResult>();
+        result->kv_heads = kv_heads;
+        result->n_tokens = n_tokens;
+        result->dim = dim;
+        result->subspace_parts = kStages;
+        result->per_head_labels_m.resize(kv_heads);
+        result->per_head_centroids_m.resize(kv_heads);
+        result->per_head_subspace_dims.resize(kv_heads);
+        result->per_head_n_clusters.assign(kv_heads, 0);
+        for (int32_t head = 0; head < kv_heads; ++head) {
+            result->per_head_labels_m[head].resize(kStages);
+            result->per_head_centroids_m[head].resize(kStages);
+            result->per_head_subspace_dims[head].resize(kStages);
+            for (int32_t stage = 0; stage < kStages; ++stage) {
+                const int32_t sub_dim = sub_dims[static_cast<size_t>(head) * kStages + stage];
+                result->per_head_subspace_dims[head][stage] = sub_dim;
+                result->per_head_labels_m[head][stage].resize(n_tokens);
+                result->per_head_centroids_m[head][stage].resize(static_cast<size_t>(k_values[stage]) * sub_dim);
+            }
+        }
+
+        std::vector<int32_t> labels_flat(static_cast<size_t>(total_tasks) * n_tokens, 0);
+        std::vector<float> centroids_flat(static_cast<size_t>(total_tasks) * max_k * max_sub_dim, 0.0f);
+        const int32_t available_threads = std::max<int32_t>(1, worker_threads);
+        const int32_t init_threads = std::max<int32_t>(1, std::min(available_threads, total_tasks));
+        std::vector<float> min_dists(static_cast<size_t>(total_tasks) * n_tokens);
+
+        #pragma omp parallel for num_threads(init_threads) schedule(dynamic, 1)
+        for (int32_t task = 0; task < total_tasks; ++task) {
+            const int32_t head = task / kStages;
+            const int32_t stage = task % kStages;
+            const int32_t sub_dim = dim_counts[task];
+            const int32_t k = k_values[stage];
+            const int32_t* dim_ids = dim_ids_flat.data() + static_cast<size_t>(task) * max_sub_dim;
+            float* centroids = centroids_flat.data() + static_cast<size_t>(task) * max_k * max_sub_dim;
+            float* task_min_dists = min_dists.data() + static_cast<size_t>(task) * n_tokens;
+            std::fill(task_min_dists, task_min_dists + n_tokens, std::numeric_limits<float>::max());
+
+            std::mt19937_64 rng(static_cast<uint64_t>(42 + stage));
+            std::uniform_int_distribution<int32_t> uniform_dist(0, n_tokens - 1);
+            int32_t first_idx = uniform_dist(rng);
+            gather_dim_ids_sample(
+                keys_u16, dtype, kv_heads, n_tokens, dim,
+                head, first_idx, dim_ids, sub_dim, sequence_major, centroids
+            );
+
+            for (int32_t c = 1; c < k; ++c) {
+                double total_weight = 0.0;
+                const float* last_centroid = centroids + static_cast<size_t>(c - 1) * max_sub_dim;
+                for (int32_t token = 0; token < n_tokens; ++token) {
+                    float dist = distance_source_dim_ids(
+                        keys_u16, dtype, kv_heads, n_tokens, dim,
+                        head, token, dim_ids, sub_dim, sequence_major, last_centroid
+                    );
+                    if (dist < task_min_dists[token]) {
+                        task_min_dists[token] = dist;
+                    }
+                    total_weight += task_min_dists[token];
+                }
+                std::uniform_real_distribution<double> real_dist(0.0, total_weight);
+                double target = real_dist(rng);
+                double cumsum = 0.0;
+                int32_t selected_idx = 0;
+                for (int32_t token = 0; token < n_tokens; ++token) {
+                    cumsum += task_min_dists[token];
+                    if (cumsum >= target) {
+                        selected_idx = token;
+                        break;
+                    }
+                }
+                gather_dim_ids_sample(
+                    keys_u16, dtype, kv_heads, n_tokens, dim,
+                    head, selected_idx, dim_ids, sub_dim, sequence_major,
+                    centroids + static_cast<size_t>(c) * max_sub_dim
+                );
+            }
+        }
+
+        const size_t centroid_stride = static_cast<size_t>(max_k) * max_sub_dim;
+        const size_t count_stride = static_cast<size_t>(max_k);
+        const size_t total_sum_elems = static_cast<size_t>(total_tasks) * centroid_stride;
+        const size_t total_count_elems = static_cast<size_t>(total_tasks) * count_stride;
+        const int32_t thread_count = available_threads;
+        std::vector<float> thread_sums(static_cast<size_t>(thread_count) * total_sum_elems, 0.0f);
+        std::vector<int32_t> thread_counts(static_cast<size_t>(thread_count) * total_count_elems, 0);
+        std::vector<float> global_sums(total_sum_elems, 0.0f);
+        std::vector<int32_t> global_counts(total_count_elems, 0);
+
+        const int32_t tile_tokens = 32;
+        const int32_t tiles_per_head = (n_tokens + tile_tokens - 1) / tile_tokens;
+        const int32_t tile_tasks = kv_heads * tiles_per_head;
+        float prev_inertia = std::numeric_limits<float>::max();
+
+        for (int32_t iter = 0; iter < runtime_cfg.max_iters; ++iter) {
+            std::fill(thread_sums.begin(), thread_sums.end(), 0.0f);
+            std::fill(thread_counts.begin(), thread_counts.end(), 0);
+            double inertia = 0.0;
+
+            #pragma omp parallel num_threads(thread_count) reduction(+:inertia)
+            {
+                const int32_t tid = omp_get_thread_num();
+                float* local_sums = thread_sums.data() + static_cast<size_t>(tid) * total_sum_elems;
+                int32_t* local_counts = thread_counts.data() + static_cast<size_t>(tid) * total_count_elems;
+                std::vector<float> tile;
+
+                #pragma omp for schedule(static)
+                for (int32_t tile_task = 0; tile_task < tile_tasks; ++tile_task) {
+                    const int32_t head = tile_task / tiles_per_head;
+                    const int32_t tile_idx = tile_task - head * tiles_per_head;
+                    const int32_t token_begin = tile_idx * tile_tokens;
+                    const int32_t token_end = std::min(n_tokens, token_begin + tile_tokens);
+                    load_head_token_tile_fp32(
+                        keys_u16, dtype, kv_heads, n_tokens, dim,
+                        head, token_begin, token_end, sequence_major, tile
+                    );
+
+                    for (int32_t local = 0; local < token_end - token_begin; ++local) {
+                        const int32_t token = token_begin + local;
+                        const float* token_fp32 = tile.data() + static_cast<size_t>(local) * dim;
+                        for (int32_t stage = 0; stage < kStages; ++stage) {
+                            const int32_t task = head * kStages + stage;
+                            const int32_t sub_dim = dim_counts[task];
+                            const int32_t k = k_values[stage];
+                            const int32_t* dim_ids = dim_ids_flat.data() + static_cast<size_t>(task) * max_sub_dim;
+                            const float* centroids = centroids_flat.data() + static_cast<size_t>(task) * centroid_stride;
+                            float best_dist = std::numeric_limits<float>::max();
+                            int32_t best_cluster = 0;
+                            for (int32_t c = 0; c < k; ++c) {
+                                float dist = distance_dim_ids(
+                                    token_fp32,
+                                    dim_ids,
+                                    sub_dim,
+                                    centroids + static_cast<size_t>(c) * max_sub_dim
+                                );
+                                if (dist < best_dist) {
+                                    best_dist = dist;
+                                    best_cluster = c;
+                                }
+                            }
+
+                            labels_flat[static_cast<size_t>(task) * n_tokens + token] = best_cluster;
+                            inertia += best_dist;
+                            local_counts[static_cast<size_t>(task) * count_stride + best_cluster]++;
+                            float* sum = local_sums
+                                + static_cast<size_t>(task) * centroid_stride
+                                + static_cast<size_t>(best_cluster) * max_sub_dim;
+                            add_dim_ids_to_sum(token_fp32, dim_ids, sub_dim, sum);
+                        }
+                    }
+                }
+            }
+
+            const float inertia_change = std::abs(prev_inertia - static_cast<float>(inertia));
+            const float relative_change = (prev_inertia > 0.0f) ? (inertia_change / prev_inertia) : 0.0f;
+            if (iter + 1 >= std::max<int32_t>(1, runtime_cfg.early_stop_min_iter) &&
+                (relative_change <= std::max(0.0f, runtime_cfg.early_stop_rel_tol) ||
+                 inertia_change <= std::max(0.0f, runtime_cfg.tol))) {
+                break;
+            }
+            prev_inertia = static_cast<float>(inertia);
+
+            #pragma omp parallel for num_threads(thread_count) schedule(static)
+            for (size_t i = 0; i < total_sum_elems; ++i) {
+                float value = 0.0f;
+                for (int32_t tid = 0; tid < thread_count; ++tid) {
+                    value += thread_sums[static_cast<size_t>(tid) * total_sum_elems + i];
+                }
+                global_sums[i] = value;
+            }
+            #pragma omp parallel for num_threads(thread_count) schedule(static)
+            for (size_t i = 0; i < total_count_elems; ++i) {
+                int32_t value = 0;
+                for (int32_t tid = 0; tid < thread_count; ++tid) {
+                    value += thread_counts[static_cast<size_t>(tid) * total_count_elems + i];
+                }
+                global_counts[i] = value;
+            }
+
+            for (int32_t task = 0; task < total_tasks; ++task) {
+                const int32_t head = task / kStages;
+                const int32_t stage = task % kStages;
+                const int32_t sub_dim = dim_counts[task];
+                const int32_t k = k_values[stage];
+                const int32_t* dim_ids = dim_ids_flat.data() + static_cast<size_t>(task) * max_sub_dim;
+                float* centroids = centroids_flat.data() + static_cast<size_t>(task) * centroid_stride;
+                std::mt19937 rng(iter * 131 + task + 12345);
+                std::uniform_int_distribution<int32_t> sample_dist(0, n_tokens - 1);
+                for (int32_t c = 0; c < k; ++c) {
+                    const int32_t count = global_counts[static_cast<size_t>(task) * count_stride + c];
+                    float* centroid = centroids + static_cast<size_t>(c) * max_sub_dim;
+                    if (count > 0) {
+                        const float inv = 1.0f / static_cast<float>(count);
+                        const float* sum = global_sums.data()
+                            + static_cast<size_t>(task) * centroid_stride
+                            + static_cast<size_t>(c) * max_sub_dim;
+                        for (int32_t d = 0; d < sub_dim; ++d) {
+                            centroid[d] = sum[d] * inv;
+                        }
+                    } else {
+                        gather_dim_ids_sample(
+                            keys_u16, dtype, kv_heads, n_tokens, dim,
+                            head, sample_dist(rng), dim_ids, sub_dim,
+                            sequence_major, centroid
+                        );
+                    }
+                }
+            }
+        }
+
+        for (int32_t head = 0; head < kv_heads; ++head) {
+            std::vector<uint64_t> codes(n_tokens);
+            for (int32_t token = 0; token < n_tokens; ++token) {
+                uint64_t code = 0;
+                uint64_t stride = 1;
+                for (int32_t stage = 0; stage < kStages; ++stage) {
+                    const int32_t task = head * kStages + stage;
+                    const uint64_t k = static_cast<uint64_t>(k_values[stage]);
+                    const uint64_t label = static_cast<uint64_t>(
+                        labels_flat[static_cast<size_t>(task) * n_tokens + token]
+                    );
+                    code += label * stride;
+                    stride *= k;
+                }
+                codes[token] = code;
+            }
+            std::sort(codes.begin(), codes.end());
+            result->per_head_n_clusters[head] = static_cast<int32_t>(
+                std::unique(codes.begin(), codes.end()) - codes.begin()
+            );
+        }
+
+        for (int32_t head = 0; head < kv_heads; ++head) {
+            for (int32_t stage = 0; stage < kStages; ++stage) {
+                const int32_t task = head * kStages + stage;
+                const int32_t sub_dim = dim_counts[task];
+                const int32_t k = k_values[stage];
+                std::memcpy(
+                    result->per_head_labels_m[head][stage].data(),
+                    labels_flat.data() + static_cast<size_t>(task) * n_tokens,
+                    static_cast<size_t>(n_tokens) * sizeof(int32_t)
+                );
+                const float* src_centroids = centroids_flat.data() + static_cast<size_t>(task) * centroid_stride;
+                float* dst_centroids = result->per_head_centroids_m[head][stage].data();
+                for (int32_t c = 0; c < k; ++c) {
+                    std::memcpy(
+                        dst_centroids + static_cast<size_t>(c) * sub_dim,
+                        src_centroids + static_cast<size_t>(c) * max_sub_dim,
+                        static_cast<size_t>(sub_dim) * sizeof(float)
+                    );
+                }
+            }
+        }
+
+        return result;
+    }
+};
 
 // ════════════════════════════════════════════════════════════════════════
 // K-means Executor: Parallel execution of K-means with 8 heads
@@ -773,154 +1305,6 @@ public:
     }
 };
 
-class KmeansExecutorM {
-public:
-    static std::unique_ptr<KmeansResult> execute(
-        const float* keys_fp32,     // [kv_heads, n_tokens, dim] or [n_tokens, kv_heads, dim]
-        int32_t kv_heads,
-        int32_t n_tokens,
-        int32_t dim,
-        const std::vector<int32_t>& k_values,
-        const std::vector<std::vector<std::vector<int32_t>>>& head_pair_groups,
-        int32_t worker_threads = 12,
-        int32_t min_threads_per_phase = 1,
-        const LloydRuntimeConfig& runtime_cfg = LloydRuntimeConfig(),
-        bool sequence_major = false
-    ) {
-        if (dim % 2 != 0) {
-            throw std::invalid_argument("KmeansExecutorM requires even head dim");
-        }
-        if (static_cast<int32_t>(head_pair_groups.size()) != kv_heads) {
-            throw std::invalid_argument("learned partition head count must match kv_heads");
-        }
-        if (head_pair_groups.empty() || head_pair_groups[0].empty()) {
-            throw std::invalid_argument("learned partition must contain at least one subspace");
-        }
-
-        const int32_t stages = static_cast<int32_t>(head_pair_groups[0].size());
-        if (stages <= 0) {
-            throw std::invalid_argument("learned partition stage count must be positive");
-        }
-        if (k_values.empty() || static_cast<int32_t>(k_values.size()) != stages) {
-            throw std::invalid_argument("learned k_values length must match subspace count");
-        }
-
-        const int32_t half = dim / 2;
-        for (int32_t head = 0; head < kv_heads; ++head) {
-            if (static_cast<int32_t>(head_pair_groups[head].size()) != stages) {
-                throw std::invalid_argument("all heads must use the same learned subspace count");
-            }
-            std::vector<uint8_t> seen(half, 0);
-            int32_t covered = 0;
-            for (int32_t stage = 0; stage < stages; ++stage) {
-                const auto& group = head_pair_groups[head][stage];
-                if (group.empty()) {
-                    throw std::invalid_argument("learned partition contains an empty subspace");
-                }
-                for (int32_t pair : group) {
-                    if (pair < 0 || pair >= half) {
-                        throw std::invalid_argument("learned partition pair index out of range");
-                    }
-                    if (seen[pair]) {
-                        throw std::invalid_argument("learned partition pair index appears more than once");
-                    }
-                    seen[pair] = 1;
-                    ++covered;
-                }
-            }
-            if (covered != half) {
-                throw std::invalid_argument("learned partition must cover every RoPE pair exactly once");
-            }
-        }
-
-        auto result = std::make_unique<KmeansResult>();
-        result->kv_heads = kv_heads;
-        result->n_tokens = n_tokens;
-        result->dim = dim;
-        result->subspace_parts = stages;
-
-        result->per_head_labels_m.resize(kv_heads);
-        result->per_head_centroids_m.resize(kv_heads);
-        result->per_head_subspace_dims.resize(kv_heads);
-        result->per_head_n_clusters.assign(kv_heads, 0);
-
-        const int32_t total_tasks = kv_heads * stages;
-        std::vector<std::vector<float>> subvecs(total_tasks);
-        std::vector<std::vector<float>> min_dists_per_task(total_tasks);
-
-        for (int32_t head = 0; head < kv_heads; ++head) {
-            result->per_head_labels_m[head].resize(stages);
-            result->per_head_centroids_m[head].resize(stages);
-            result->per_head_subspace_dims[head].resize(stages);
-            for (int32_t stage = 0; stage < stages; ++stage) {
-                const int32_t task = head * stages + stage;
-                const int32_t sub_dim = static_cast<int32_t>(head_pair_groups[head][stage].size()) * 2;
-                const int32_t k = k_values[stage];
-                if (k <= 0) {
-                    throw std::invalid_argument("learned k_values must be positive");
-                }
-                result->per_head_subspace_dims[head][stage] = sub_dim;
-                result->per_head_labels_m[head][stage].resize(n_tokens);
-                result->per_head_centroids_m[head][stage].resize(static_cast<size_t>(k) * sub_dim);
-                subvecs[task].resize(static_cast<size_t>(n_tokens) * sub_dim);
-                min_dists_per_task[task].resize(n_tokens);
-            }
-        }
-
-        int32_t available_threads = std::max<int32_t>(1, worker_threads);
-        int32_t extract_threads = std::max<int32_t>(1, std::min(available_threads, total_tasks));
-        #pragma omp parallel for num_threads(extract_threads) schedule(static)
-        for (int32_t task = 0; task < total_tasks; ++task) {
-            const int32_t head = task / stages;
-            const int32_t stage = task % stages;
-            const auto& pairs = head_pair_groups[head][stage];
-            const int32_t sub_dim = static_cast<int32_t>(pairs.size()) * 2;
-            auto& subvec = subvecs[task];
-            for (int32_t token = 0; token < n_tokens; ++token) {
-                const float* src = sequence_major
-                    ? keys_fp32 + (static_cast<size_t>(token) * kv_heads + head) * dim
-                    : keys_fp32 + (static_cast<size_t>(head) * n_tokens + token) * dim;
-                float* dst = subvec.data() + static_cast<size_t>(token) * sub_dim;
-                int32_t offset = 0;
-                for (int32_t pair : pairs) {
-                    dst[offset++] = src[pair];
-                    dst[offset++] = src[pair + half];
-                }
-            }
-        }
-
-        int32_t min_threads = std::max<int32_t>(1, std::min(min_threads_per_phase, available_threads));
-        int32_t max_concurrent_phases = std::max<int32_t>(
-            1,
-            std::min(total_tasks, available_threads / min_threads)
-        );
-        int32_t threads_per_phase = std::max<int32_t>(1, available_threads / max_concurrent_phases);
-        threads_per_phase = std::max<int32_t>(threads_per_phase, min_threads);
-
-        #pragma omp parallel for num_threads(max_concurrent_phases) schedule(dynamic, 1)
-        for (int32_t task = 0; task < total_tasks; ++task) {
-            const int32_t head = task / stages;
-            const int32_t stage = task % stages;
-            const int32_t sub_dim = result->per_head_subspace_dims[head][stage];
-            const int32_t k = k_values[stage];
-            run_imi_single_phase_from_subvec(
-                subvecs[task].data(),
-                n_tokens,
-                sub_dim,
-                k,
-                static_cast<uint64_t>(42 + stage),
-                result->per_head_labels_m[head][stage].data(),
-                result->per_head_centroids_m[head][stage].data(),
-                threads_per_phase,
-                runtime_cfg,
-                min_dists_per_task[task]
-            );
-        }
-
-        return result;
-    }
-};
-
 } // namespace imi
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1004,15 +1388,6 @@ std::unique_ptr<KmeansResult> kmeans_execute(
         effective_threads,
         effective_min_threads
     );
-    log_kmeans_active(
-        guard.active(),
-        worker_threads,
-        effective_threads,
-        effective_min_threads,
-        kv_heads,
-        n_tokens
-    );
-
 
     struct AlignedFloatBuffer {
         float* data = nullptr;
@@ -1124,15 +1499,6 @@ std::unique_ptr<KmeansResult> kmeans_execute_4(
         effective_threads,
         effective_min_threads
     );
-    log_kmeans_active(
-        guard.active(),
-        worker_threads,
-        effective_threads,
-        effective_min_threads,
-        kv_heads,
-        n_tokens
-    );
-
 
     struct AlignedFloatBuffer {
         float* data = nullptr;
@@ -1221,7 +1587,6 @@ std::unique_ptr<KmeansResult> kmeans_execute_m(
     const LayerPipelineRuntimeConfig& runtime_config,
     bool sequence_major
 ) {
-    size_t total_elements = static_cast<size_t>(kv_heads) * n_tokens * dim;
     size_t element_size = c10::elementSize(kv_dtype);
     if (element_size != 2) {
         throw std::invalid_argument("kmeans_execute_m only supports 16-bit inputs (fp16/bf16)");
@@ -1245,85 +1610,23 @@ std::unique_ptr<KmeansResult> kmeans_execute_m(
         effective_threads,
         effective_min_threads
     );
-    log_kmeans_active(
-        guard.active(),
-        worker_threads,
-        effective_threads,
-        effective_min_threads,
-        kv_heads,
-        n_tokens
-    );
-
-    struct AlignedFloatBuffer {
-        float* data = nullptr;
-        size_t capacity = 0;
-
-        ~AlignedFloatBuffer() {
-            if (data) {
-                free(data);
-            }
-        }
-
-        void ensure(size_t count) {
-            if (count <= capacity) {
-                return;
-            }
-            if (data) {
-                free(data);
-                data = nullptr;
-            }
-            size_t bytes = count * sizeof(float);
-            size_t aligned_bytes = ((bytes + 63) / 64) * 64;
-            data = static_cast<float*>(aligned_alloc(64, aligned_bytes));
-            if (!data) {
-                throw std::runtime_error("Failed to allocate FP32 buffer for learned M-way K-means");
-            }
-            capacity = aligned_bytes / sizeof(float);
-        }
-    };
-
-    static thread_local AlignedFloatBuffer keys_fp32_buffer;
-    keys_fp32_buffer.ensure(total_elements);
-    float* keys_fp32 = keys_fp32_buffer.data;
-
-    size_t chunk_elems = std::max<size_t>(1, static_cast<size_t>(runtime_config.fp32_convert_chunk_elems));
-    chunk_elems = std::min(chunk_elems, total_elements);
-    const size_t num_chunks = (total_elements + chunk_elems - 1) / chunk_elems;
-
-    if (kv_dtype == torch::kFloat16) {
-        #pragma omp parallel for num_threads(effective_threads) schedule(static)
-        for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-            const size_t start = chunk_idx * chunk_elems;
-            const size_t end = std::min(total_elements, start + chunk_elems);
-            for (size_t i = start; i < end; ++i) {
-                keys_fp32[i] = fp16_to_fp32(keys_u16[i]);
-            }
-        }
-    } else {
-        #pragma omp parallel for num_threads(effective_threads) schedule(static)
-        for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-            const size_t start = chunk_idx * chunk_elems;
-            const size_t end = std::min(total_elements, start + chunk_elems);
-            for (size_t i = start; i < end; ++i) {
-                keys_fp32[i] = bf16_to_fp32(keys_u16[i]);
-            }
-        }
+    auto runtime_cfg = load_lloyd_runtime_config(runtime_config);
+    if (static_cast<int32_t>(k_values.size()) == 8) {
+        return KmeansExecutor8WayFused::execute(
+            keys_u16,
+            kv_dtype,
+            kv_heads,
+            n_tokens,
+            dim,
+            k_values,
+            head_pair_groups,
+            effective_threads,
+            runtime_cfg,
+            sequence_major
+        );
     }
 
-    auto runtime_cfg = load_lloyd_runtime_config(runtime_config);
-
-    return KmeansExecutorM::execute(
-        keys_fp32,
-        kv_heads,
-        n_tokens,
-        dim,
-        k_values,
-        head_pair_groups,
-        effective_threads,
-        effective_min_threads,
-        runtime_cfg,
-        sequence_major
-    );
+    throw std::invalid_argument("learned CPU K-means is 8-way only in hybrid_8way_v2");
 }
 
 std::unique_ptr<KmeansResult> kmeans_execute_ivf(
@@ -1360,15 +1663,6 @@ std::unique_ptr<KmeansResult> kmeans_execute_ivf(
         effective_threads,
         effective_min_threads
     );
-    log_kmeans_active(
-        guard.active(),
-        worker_threads,
-        effective_threads,
-        effective_min_threads,
-        kv_heads,
-        n_tokens
-    );
-
 
     struct AlignedFloatBuffer {
         float* data = nullptr;

@@ -40,7 +40,7 @@ class LayerBuildScheduler:
                 explicit[int(key)] = str(value).lower()
         return cls(
             layer_num,
-            policy=str(cfg.get("policy", "cpu_only")),
+            policy=str(cfg.get("policy", "alternate")),
             start=str(cfg.get("start", "cpu")),
             gpu_every=int(cfg.get("gpu_every", cfg.get("gpu_every_n", 0)) or 0),
             explicit=explicit,
