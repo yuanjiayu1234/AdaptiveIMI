@@ -258,7 +258,7 @@ BATCH_SIZE=3
 ### Phase 0: 恢复保守行为
 
 - 撤掉激进的 `gpu_only -> interval=1` 默认行为。
-- 保留环境变量覆盖能力。
+- 删除容易误导的并发环境变量覆盖。CPU finish 并发只能来自配置，真正的 raw build 并发由 build slot 控制。
 - 默认不要让 GPU-only 在没有预算控制时大量 overlap。
 
 ### Phase 1: 补日志和预算
@@ -314,6 +314,60 @@ policy = dynamic_bounded
 GPU 空闲且 slot 足够 -> GPU
 CPU 空闲且 CPU buffer 足够 -> CPU
 都满 -> 等待
+```
+
+### Phase 3.5: CPU build slot 池
+
+CPU slot 控制的是“允许多少层同时进入 raw KV 构建生命周期”，不是 KMeans worker 并发。
+
+插入点必须在 `begin_index_stream_batch()` 之前：
+
+```text
+_begin_hybrid_cpu_chunk_stream()
+  -> acquire_cpu_build_slot(layer_idx, raw_bytes)
+  -> pipeline.begin_index_stream_batch(...)
+  -> submit_index_stream_raw_sequence_batch_chunk(...)
+  -> _finish_hybrid_cpu_chunk_stream()
+  -> _schedule_hybrid_layer_finish()
+  -> _finish_pipeline_layer_index()
+  -> release_cpu_build_slot(layer_idx)
+```
+
+slot 持有周期覆盖 C++ pipeline 内的大对象：
+
+```text
+keys_buffer_ / values_buffer_
+chunk_keys_pool_ / chunk_values_pool_
+pending source refs
+```
+
+推荐第一版只做轻量状态，不新建多层 scheduler：
+
+```text
+hybrid_cpu_build_cv
+hybrid_cpu_build_slots: List[_CpuBuildSlot]
+hybrid_cpu_build_layer_to_slot: List[Optional[int]]
+hybrid_cpu_raw_bytes_inflight
+```
+
+默认 slot 数按内存估算，而不是按 CPU 线程估算：
+
+```text
+raw_bytes_per_layer = batch_size * kv_head * max_middle_len * head_dim * element_size * 2
+slot_count = min(cpu_build_slots_config, memory_budget // raw_bytes_per_layer)
+```
+
+如果 `cpu_raw_build_slots` 配成 `"auto"`，单 batch 默认解析为 `2`，多 batch 默认解析为 `1`，并用系统 memlock 对每个 slot 的 pinned D2H staging 估算做上限。KMeans finish 并发仍可保持 `3` 或配置值，这样不会把计算并发和 raw buffer 生命周期混在一起。
+
+所有会改变内存/并发行为的参数都写在模型 JSON 的 `AdaptiveIMI.hybrid_index` 或 `AdaptiveIMI.pipeline` 中，不再通过 `IMI_HYBRID_*` 环境变量覆盖。环境变量只保留调试/日志类开关。
+
+释放点要在 `_finish_pipeline_layer_index()` 的 `finally` 中执行，保证失败也归还 slot：
+
+```text
+try:
+    finish_index(...)
+finally:
+    release_cpu_build_slot(layer_idx)
 ```
 
 ### Phase 4: CPU batch-aware 扩展

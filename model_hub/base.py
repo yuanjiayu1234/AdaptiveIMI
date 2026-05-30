@@ -35,7 +35,6 @@ class LLM(PrefillMixin, SamplingMixin):
         self.device_map = device_map
         self.prefill_chunk_size = 65536
         self.prefill_attn_chunk_size = self.prefill_chunk_size
-        self.enable_prefill_attn_chunk = True
         self.profile_prefill_gpu = os.getenv("IMI_PROFILE_PREFILL_GPU", "0") == "1"
         self.prefill_gpu_layer_rows = []
         self._prefill_gpu_attn_events = {}
@@ -204,20 +203,16 @@ class LLM(PrefillMixin, SamplingMixin):
         streaming_cfg = imi_config.setdefault("streaming", {})
         streaming_cfg["prefill_chunk_size"] = self.prefill_attn_chunk_size
 
-        imi_engine = str(imi_config.get("engine", "") or "").lower()
-        has_learned_partition = bool(imi_config.get("partition_path"))
-        if has_learned_partition and imi_engine != "hybrid_8way_v2":
+        imi_engine = str(imi_config.get("engine", "hybrid_8way_v2") or "hybrid_8way_v2").lower()
+        if imi_engine != "hybrid_8way_v2":
             raise ValueError(
-                "AdaptiveIMI learned partition requires engine='hybrid_8way_v2'. "
-                "Set IMI_ENGINE=hybrid_8way_v2 or pass --imi_engine hybrid_8way_v2."
+                "AdaptiveIMI now supports only engine='hybrid_8way_v2'. "
+                "Set IMI_ENGINE=hybrid_8way_v2 and provide partition_path."
             )
-        if imi_config.get("gpu_only", False) and imi_engine != "hybrid_8way_v2":
-            raise ValueError("AdaptiveIMI gpu_only mode is not supported.")
+        if not imi_config.get("partition_path"):
+            raise ValueError("AdaptiveIMI hybrid_8way_v2 requires partition_path.")
 
-        if imi_engine == "hybrid_8way_v2":
-            from cache_hub.adaptive_imi_v2.cache import Hybrid8WayIMICache as imi_cache_cls
-        else:
-            from cache_hub.adaptive_imi.cache import adpimi_cache as imi_cache_cls
+        from cache_hub.adaptive_imi_v2.cache import Hybrid8WayIMICache as imi_cache_cls
 
         existing_cache = getattr(self, "kv_cache", None)
         if isinstance(existing_cache, imi_cache_cls) and existing_cache.can_reuse_for_next_sequence(
@@ -255,7 +250,7 @@ class LLM(PrefillMixin, SamplingMixin):
             prefill_bsz=self.prefill_bsz if adaptive_prefill_bsz is None else adaptive_prefill_bsz,
             num_gpus=self.num_gpus,
             model_size=self._infer_model_size_b(),
-            subspace_parts=imi_config.get("subspace_parts", 2),
+            subspace_parts=8,
             runtime_config={
                 "cpu_threads": imi_config.get("cpu_threads"),
                 "pipeline": imi_config.get("pipeline", {}),
@@ -295,8 +290,6 @@ class LLM(PrefillMixin, SamplingMixin):
                 self.prefill_chunk_size = chunk_size
                 self.prefill_attn_chunk_size = chunk_size
 
-        if "enable_prefill_attn_chunk" in prefill_cfg:
-            self.enable_prefill_attn_chunk = bool(prefill_cfg.get("enable_prefill_attn_chunk"))
     def _reset_prefill_gpu_profile(self):
         self.prefill_gpu_layer_rows = []
         self._prefill_gpu_attn_events = {}
@@ -601,11 +594,6 @@ class LLM(PrefillMixin, SamplingMixin):
         del attention_masks
 
         self.prefill_bsz = min(prefill_bsz, self.batch_size)
-        # The chunked prefill path groups rows with the same valid_start, so it
-        # can keep multi-batch execution for left-padded inputs. The legacy
-        # non-chunk path still relies on a single valid_start per prefill call.
-        if not self.enable_prefill_attn_chunk and not (valid_start == 0).all():
-            self.prefill_bsz = 1
 
         print("Allocate GPU buffers and CPU pin memory ...")
         self.init_kv_cache(valid_start, attn_config)

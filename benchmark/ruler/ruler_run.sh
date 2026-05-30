@@ -19,32 +19,38 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# Defaults for the common AdaptiveIMI hybrid 8-way RULER run. Passing all seven
-# positional arguments keeps the original interface; passing only <task> uses
-# these defaults for everything else.
+# Defaults for the common AdaptiveIMI RULER run. Passing only <task> uses
+# these defaults; AdaptiveIMI parameters come from config unless overridden.
 DEFAULT_MODEL_NAME="${DEFAULT_MODEL_NAME:-llama-3.1-8b}"
 DEFAULT_BENCHMARK="${DEFAULT_BENCHMARK:-synthetic}"
 DEFAULT_ATTN_TYPE="${DEFAULT_ATTN_TYPE:-AdaptiveIMI}"
-DEFAULT_CONTEXT_LENGTH="${DEFAULT_CONTEXT_LENGTH:-98304}"
+DEFAULT_CONTEXT_LENGTHS="${DEFAULT_CONTEXT_LENGTHS:-${DEFAULT_CONTEXT_LENGTH:-98304 16384}}"
 DEFAULT_DTYPE="${DEFAULT_DTYPE:-bf16}"
-DEFAULT_BUDGET_RATIO="${DEFAULT_BUDGET_RATIO:-0.1}"
 
 if [ $# -eq 0 ]; then
     MODEL_ARG="${DEFAULT_MODEL_NAME}"
     BENCHMARK_ARG="${DEFAULT_BENCHMARK}"
     ATTN_TYPE_ARG="${DEFAULT_ATTN_TYPE}"
-    CONTEXT_LENGTH_ARG="${DEFAULT_CONTEXT_LENGTH}"
+    CONTEXT_LENGTH_ARG="${DEFAULT_CONTEXT_LENGTHS}"
     TASK_ARG="all"
     DTYPE_ARG="${DEFAULT_DTYPE}"
-    BUDGET_RATIO_ARG="${DEFAULT_BUDGET_RATIO}"
+    BUDGET_RATIO_ARG=""
 elif [ $# -eq 1 ]; then
     MODEL_ARG="${DEFAULT_MODEL_NAME}"
     BENCHMARK_ARG="${DEFAULT_BENCHMARK}"
     ATTN_TYPE_ARG="${DEFAULT_ATTN_TYPE}"
-    CONTEXT_LENGTH_ARG="${DEFAULT_CONTEXT_LENGTH}"
+    CONTEXT_LENGTH_ARG="${DEFAULT_CONTEXT_LENGTHS}"
     TASK_ARG="${1}"
     DTYPE_ARG="${DEFAULT_DTYPE}"
-    BUDGET_RATIO_ARG="${DEFAULT_BUDGET_RATIO}"
+    BUDGET_RATIO_ARG=""
+elif [ $# -eq 6 ]; then
+    MODEL_ARG="${1}"
+    BENCHMARK_ARG="${2}"
+    ATTN_TYPE_ARG="${3}"
+    CONTEXT_LENGTH_ARG="${4}"
+    TASK_ARG="${5}"
+    DTYPE_ARG="${6}"
+    BUDGET_RATIO_ARG=""
 elif [ $# -eq 7 ]; then
     MODEL_ARG="${1}"
     BENCHMARK_ARG="${2}"
@@ -55,7 +61,14 @@ elif [ $# -eq 7 ]; then
     BUDGET_RATIO_ARG="${7}"
 else
     echo "Usage: $0 [task]"
-    echo "   or: $0 <model_name> <benchmark_name> <attn_type> <context_length> <task> <dtype> <budget_ratio>"
+    echo "   or: $0 <model_name> <benchmark_name> <attn_type> <context_length[,context_length...]> <task> <dtype> [budget_ratio]"
+    exit 1
+fi
+
+CONTEXT_LENGTH_ARG="${CONTEXT_LENGTH_ARG//,/ }"
+read -r -a CONTEXT_LENGTHS <<< "${CONTEXT_LENGTH_ARG}"
+if [[ "${#CONTEXT_LENGTHS[@]}" -eq 0 ]]; then
+    echo "No context lengths specified"
     exit 1
 fi
 
@@ -64,30 +77,30 @@ ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 NUM_SAMPLES=${NUM_SAMPLES:-50}
 BATCH_SIZE=${BATCH_SIZE:-1}
-MAX_SEQ_LENGTH=${CONTEXT_LENGTH_ARG}
 ATTN_TYPE=${ATTN_TYPE_ARG}
 DEVICE=${DEVICE:-cuda:0}
-BUDGET_RATIO=${BUDGET_RATIO_ARG}
-SUBSPACE_PARTS=${SUBSPACE_PARTS:-8}
-IMI_ENGINE=${IMI_ENGINE:-hybrid_8way_v2}
+BUDGET_RATIO=${BUDGET_RATIO:-${BUDGET_RATIO_ARG}}
+SUBSPACE_PARTS=${SUBSPACE_PARTS:-}
+IMI_ENGINE=${IMI_ENGINE:-}
 PARTITION_PATH=${PARTITION_PATH:-}
-DECODE_SEARCH_MODE=${DECODE_SEARCH_MODE:-flat}
+DECODE_SEARCH_MODE=${DECODE_SEARCH_MODE:-}
 CANDIDATE_CLUSTERS=${CANDIDATE_CLUSTERS:-}
 TOKEN_RERANK_BUDGET_RATIO=${TOKEN_RERANK_BUDGET_RATIO:-}
 RULER_RESUME=${RULER_RESUME:-1}
+# Keep prompt templates comparable with RetrievalAttention by default. The
+# shared /root/RULER cache may have been generated with a different chat
+# template, so only reuse it when explicitly requested.
 RULER_USE_SOURCE_CACHE="${RULER_USE_SOURCE_CACHE:-1}"
-GPU_ONLY=${GPU_ONLY:-1}
+GPU_ONLY=${GPU_ONLY:-0}
 if [[ "${GPU_ONLY}" == "1" || "${GPU_ONLY,,}" == "true" || "${GPU_ONLY,,}" == "yes" || "${GPU_ONLY,,}" == "on" ]]; then
     export IMI_HYBRID_INDEX_POLICY="${IMI_HYBRID_INDEX_POLICY:-gpu_only}"
 fi
 export RULER_DATA_ROOT="${RULER_DATA_ROOT:-/root/RULER}"
-export MODEL_PATH_OVERRIDE="${MODEL_PATH_OVERRIDE:-/root/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
+export MODEL_PATH_OVERRIDE="${MODEL_PATH_OVERRIDE:-}"
 
 export PYTHONPATH="$(dirname "${PROJECT_ROOT}"):${PROJECT_ROOT}:${PYTHONPATH:-}"
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${PROJECT_ROOT}/outputs/flashinfer}"
 mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
-
-MODEL2PATH_FILE="${SCRIPT_DIR}/model2path.json"
 
 resolve_repo_model_path() {
     local model_key="$1"
@@ -109,84 +122,28 @@ print(resolved, end="")
 PY
 }
 
-get_local_model_path() {
-    local model_key="$1"
-    local resolved_path=""
-
-    if [[ -f "${MODEL2PATH_FILE}" ]]; then
-        resolved_path=$(python - "${MODEL2PATH_FILE}" "${model_key}" <<'PY'
-import json
-import sys
-
-file_path = sys.argv[1]
-model_key = sys.argv[2]
-
-with open(file_path, "r") as fin:
-    mapping = json.load(fin)
-
-print(mapping.get(model_key, ""), end="")
-PY
-)
-    fi
-
-    echo "${resolved_path}"
-}
-
 MODEL_SELECT() {
     MODEL_NAME=$1
 
     case $MODEL_NAME in
-        qwen2.5-7b)
-            REMOTE_MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"
-            MODEL_TEMPLATE_TYPE="meta-chat"
-            MODEL_FRAMEWORK="hf"
-            ;;
-        qwen3-8b|Qwen/Qwen3-8B)
-            REMOTE_MODEL_PATH="Qwen/Qwen3-8B"
+        qwen3-8b|Qwen3-8B|Qwen/Qwen3-8B|qwen/qwen3-8b)
             MODEL_TEMPLATE_TYPE="hf-chat"
-            MODEL_FRAMEWORK="hf"
-            ;;
-        llama-3-8b-1048k|gradientai/Llama-3-8B-Instruct-Gradient-1048k|Llama-3-8B-Instruct-Gradient-1048k)
-            REMOTE_MODEL_PATH="gradientai/Llama-3-8B-Instruct-Gradient-1048k"
-            MODEL_TEMPLATE_TYPE="meta-chat"
-            MODEL_FRAMEWORK="hf"
-            ;;
-        llama-3.1-8b|meta-llama/Llama-3.1-8B-Instruct|Llama-3.1-8B-Instruct)
-            REMOTE_MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
-            MODEL_TEMPLATE_TYPE="meta-chat"
-            MODEL_FRAMEWORK="hf"
-            ;;
-        qwen2.5-72b)
-            REMOTE_MODEL_PATH="Qwen/Qwen2.5-72B-Instruct"
-            MODEL_TEMPLATE_TYPE="meta-chat"
-            MODEL_FRAMEWORK="hf"
             ;;
         *)
-            REMOTE_MODEL_PATH=""
+            MODEL_TEMPLATE_TYPE="meta-chat"
             ;;
     esac
 
     MODEL_PATH=$(resolve_repo_model_path "${MODEL_NAME}")
-
-    LOCAL_MODEL_PATH=$(get_local_model_path "${MODEL_NAME}")
-    if [[ -z "${LOCAL_MODEL_PATH}" && -n "${REMOTE_MODEL_PATH}" ]]; then
-        LOCAL_MODEL_PATH=$(get_local_model_path "${REMOTE_MODEL_PATH}")
-    fi
-    if [[ -n "${LOCAL_MODEL_PATH}" ]]; then
-        MODEL_PATH=${LOCAL_MODEL_PATH}
-    fi
-    if [[ -z "${MODEL_PATH}" ]]; then
-        MODEL_PATH=${REMOTE_MODEL_PATH}
-    fi
-
     TOKENIZER_PATH=${MODEL_PATH}
+    MODEL_FRAMEWORK="hf"
     TOKENIZER_TYPE="hf"
 
     echo "$MODEL_PATH:$MODEL_TEMPLATE_TYPE:$MODEL_FRAMEWORK:$TOKENIZER_PATH:$TOKENIZER_TYPE"
 }
 
 MODEL_NAME=${MODEL_ARG}
-MODEL_CONFIG=$(MODEL_SELECT ${MODEL_NAME})
+MODEL_CONFIG=$(MODEL_SELECT "${MODEL_NAME}")
 IFS=":" read MODEL_PATH MODEL_TEMPLATE_TYPE MODEL_FRAMEWORK TOKENIZER_PATH TOKENIZER_TYPE <<< "$MODEL_CONFIG"
 if [[ -n "${MODEL_PATH_OVERRIDE:-}" ]]; then
     MODEL_PATH="${MODEL_PATH_OVERRIDE}"
@@ -217,20 +174,6 @@ fi
 
 # Start client (prepare data / call model API / obtain final metrics)
     
-RUN_TAG="${ATTN_TYPE}-br${BUDGET_RATIO}-sp${SUBSPACE_PARTS}-bs${BATCH_SIZE}-n${NUM_SAMPLES}"
-if [[ -n "${IMI_ENGINE}" ]]; then
-    RUN_TAG="${RUN_TAG}-${IMI_ENGINE}"
-fi
-RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${RUN_TAG}"
-DATA_DIR="${RESULTS_DIR}/data"
-PRED_DIR="${RESULTS_DIR}/pred"
-if [[ "${RULER_RESUME}" != "1" ]]; then
-    rm -rf "${DATA_DIR}"
-    rm -rf "${PRED_DIR}"
-fi
-mkdir -p ${DATA_DIR}
-mkdir -p ${PRED_DIR}
-
 REQUESTED_TASK=${TASK_ARG}
 if [ "${REQUESTED_TASK}" = "all" ]; then
     TASK_LIST=("${TASKS[@]}")
@@ -281,91 +224,124 @@ print(len(indices))
 PY
 }
 
-for TASK in "${TASK_LIST[@]}"; do
-    if [[ ! " ${TASKS[*]} " =~ " ${TASK} " ]]; then
-        echo "Task: ${TASK} is not supported in benchmark ${BENCHMARK}"
+for MAX_SEQ_LENGTH in "${CONTEXT_LENGTHS[@]}"; do
+    if [[ ! "${MAX_SEQ_LENGTH}" =~ ^[0-9]+$ ]]; then
+        echo "Context length must be an integer, got: ${MAX_SEQ_LENGTH}"
         exit 1
     fi
 
-    echo "Running task ${TASK} ..."
-    SOURCE_DATA="${RULER_DATA_ROOT}/${MAX_SEQ_LENGTH}/${TASK}/${SUBSET}.jsonl"
-    TARGET_DATA="${DATA_DIR}/${TASK}/${SUBSET}.jsonl"
-    PRED_FILE="${PRED_DIR}/${TASK}.jsonl"
+    echo "Running context length ${MAX_SEQ_LENGTH} ..."
 
-    NEED_DATA=1
-    if [[ "${RULER_RESUME}" = "1" && -f "${TARGET_DATA}" ]]; then
-        TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
-        if [[ "${TARGET_COUNT}" -eq "${NUM_SAMPLES}" ]]; then
-            echo "Found existing dataset at ${TARGET_DATA}, reusing for resume..."
-            NEED_DATA=0
-        else
-            echo "Existing dataset at ${TARGET_DATA} has ${TARGET_COUNT} samples; rebuilding ${NUM_SAMPLES}-sample target data."
-        fi
+    RUN_TAG="${ATTN_TYPE}-config-bs${BATCH_SIZE}-n${NUM_SAMPLES}"
+    if [[ -n "${BUDGET_RATIO}" ]]; then
+        RUN_TAG="${RUN_TAG}-br${BUDGET_RATIO}"
     fi
-
-    if [[ "${NEED_DATA}" = "1" ]]; then
-        if [[ "${RULER_USE_SOURCE_CACHE}" = "1" && -f "${SOURCE_DATA}" ]]; then
-            echo "Found cached dataset at ${SOURCE_DATA}, copying first ${NUM_SAMPLES} samples..."
-            mkdir -p "$(dirname "${TARGET_DATA}")"
-            head -n "${NUM_SAMPLES}" "${SOURCE_DATA}" > "${TARGET_DATA}"
-        else
-            echo "Generating ${TASK} with template ${MODEL_TEMPLATE_TYPE} ..."
-            python -u "${SCRIPT_DIR}/data/prepare.py" \
-                --save_dir ${DATA_DIR} \
-                --benchmark ${BENCHMARK} \
-                --task ${TASK} \
-                --tokenizer_path ${TOKENIZER_PATH} \
-                --tokenizer_type ${TOKENIZER_TYPE} \
-                --max_seq_length ${MAX_SEQ_LENGTH} \
-                --model_template_type ${MODEL_TEMPLATE_TYPE} \
-                --num_samples ${NUM_SAMPLES} \
-                ${REMOVE_NEWLINE_TAB}
-        fi
+    if [[ -n "${SUBSPACE_PARTS}" ]]; then
+        RUN_TAG="${RUN_TAG}-sp${SUBSPACE_PARTS}"
     fi
-
-    TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
-    PRED_COUNT=$(pred_unique_count "${PRED_FILE}")
-    if [[ "${RULER_RESUME}" = "1" && "${TARGET_COUNT}" -gt 0 && "${PRED_COUNT}" -ge "${TARGET_COUNT}" ]]; then
-        echo "Prediction for ${TASK} is complete (${PRED_COUNT}/${TARGET_COUNT}), skipping..."
-        continue
-    fi
-
-    EXTRA_IMI_ARGS=()
     if [[ -n "${IMI_ENGINE}" ]]; then
-        EXTRA_IMI_ARGS+=(--imi_engine "${IMI_ENGINE}")
+        RUN_TAG="${RUN_TAG}-${IMI_ENGINE}"
     fi
-    if [[ -n "${PARTITION_PATH}" ]]; then
-        EXTRA_IMI_ARGS+=(--partition_path "${PARTITION_PATH}")
+    RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${RUN_TAG}"
+    DATA_DIR="${RESULTS_DIR}/data"
+    PRED_DIR="${RESULTS_DIR}/pred"
+    if [[ "${RULER_RESUME}" != "1" ]]; then
+        rm -rf "${DATA_DIR}"
+        rm -rf "${PRED_DIR}"
     fi
-    if [[ -n "${DECODE_SEARCH_MODE}" ]]; then
-        EXTRA_IMI_ARGS+=(--decode_search_mode "${DECODE_SEARCH_MODE}")
-    fi
-    if [[ -n "${CANDIDATE_CLUSTERS}" ]]; then
-        EXTRA_IMI_ARGS+=(--candidate_clusters "${CANDIDATE_CLUSTERS}")
-    fi
-    if [[ -n "${TOKEN_RERANK_BUDGET_RATIO}" ]]; then
-        EXTRA_IMI_ARGS+=(--token_rerank_budget_ratio "${TOKEN_RERANK_BUDGET_RATIO}")
-    fi
+    mkdir -p ${DATA_DIR}
+    mkdir -p ${PRED_DIR}
 
-    python -u "${SCRIPT_DIR}/pred/call_api.py" \
-        --model_name ${MODEL_NAME} \
-        --model_path ${TOKENIZER_PATH} \
-        --attn_type ${ATTN_TYPE} \
-        --max_len ${MAX_SEQ_LENGTH} \
-        --batch_size ${BATCH_SIZE} \
-        --data_dir ${DATA_DIR} \
-        --save_dir ${PRED_DIR} \
-        --benchmark ${BENCHMARK} \
-        --task ${TASK} \
-        --dtype ${DTYPE} \
-        --server_type ${MODEL_FRAMEWORK} \
-        --device ${DEVICE} \
-        --budget_ratio ${BUDGET_RATIO} \
-        --synthetic_len ${MAX_SEQ_LENGTH} \
-        --subspace_parts ${SUBSPACE_PARTS} \
-        "${EXTRA_IMI_ARGS[@]}"
+    for TASK in "${TASK_LIST[@]}"; do
+        if [[ ! " ${TASKS[*]} " =~ " ${TASK} " ]]; then
+            echo "Task: ${TASK} is not supported in benchmark ${BENCHMARK}"
+            exit 1
+        fi
+
+        echo "Running task ${TASK} at length ${MAX_SEQ_LENGTH} ..."
+        SOURCE_DATA="${RULER_DATA_ROOT}/${MAX_SEQ_LENGTH}/${TASK}/${SUBSET}.jsonl"
+        TARGET_DATA="${DATA_DIR}/${TASK}/${SUBSET}.jsonl"
+        PRED_FILE="${PRED_DIR}/${TASK}.jsonl"
+
+        NEED_DATA=1
+        if [[ "${RULER_RESUME}" = "1" && -f "${TARGET_DATA}" ]]; then
+            TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
+            if [[ "${TARGET_COUNT}" -eq "${NUM_SAMPLES}" ]]; then
+                echo "Found existing dataset at ${TARGET_DATA}, reusing for resume..."
+                NEED_DATA=0
+            else
+                echo "Existing dataset at ${TARGET_DATA} has ${TARGET_COUNT} samples; rebuilding ${NUM_SAMPLES}-sample target data."
+            fi
+        fi
+
+        if [[ "${NEED_DATA}" = "1" ]]; then
+            if [[ "${RULER_USE_SOURCE_CACHE}" = "1" && -f "${SOURCE_DATA}" ]]; then
+                echo "Found cached dataset at ${SOURCE_DATA}, copying first ${NUM_SAMPLES} samples..."
+                mkdir -p "$(dirname "${TARGET_DATA}")"
+                head -n "${NUM_SAMPLES}" "${SOURCE_DATA}" > "${TARGET_DATA}"
+            else
+                echo "Generating ${TASK} with template ${MODEL_TEMPLATE_TYPE} ..."
+                python -u "${SCRIPT_DIR}/data/prepare.py" \
+                    --save_dir ${DATA_DIR} \
+                    --benchmark ${BENCHMARK} \
+                    --task ${TASK} \
+                    --tokenizer_path ${TOKENIZER_PATH} \
+                    --tokenizer_type ${TOKENIZER_TYPE} \
+                    --max_seq_length ${MAX_SEQ_LENGTH} \
+                    --model_template_type ${MODEL_TEMPLATE_TYPE} \
+                    --num_samples ${NUM_SAMPLES} \
+                    ${REMOVE_NEWLINE_TAB}
+            fi
+        fi
+
+        TARGET_COUNT=$(jsonl_count "${TARGET_DATA}")
+        PRED_COUNT=$(pred_unique_count "${PRED_FILE}")
+        if [[ "${RULER_RESUME}" = "1" && "${TARGET_COUNT}" -gt 0 && "${PRED_COUNT}" -ge "${TARGET_COUNT}" ]]; then
+            echo "Prediction for ${TASK} at length ${MAX_SEQ_LENGTH} is complete (${PRED_COUNT}/${TARGET_COUNT}), skipping..."
+            continue
+        fi
+
+        EXTRA_IMI_ARGS=()
+        if [[ -n "${BUDGET_RATIO}" ]]; then
+            EXTRA_IMI_ARGS+=(--budget_ratio "${BUDGET_RATIO}")
+        fi
+        if [[ -n "${SUBSPACE_PARTS}" ]]; then
+            EXTRA_IMI_ARGS+=(--subspace_parts "${SUBSPACE_PARTS}")
+        fi
+        if [[ -n "${IMI_ENGINE}" ]]; then
+            EXTRA_IMI_ARGS+=(--imi_engine "${IMI_ENGINE}")
+        fi
+        if [[ -n "${PARTITION_PATH}" ]]; then
+            EXTRA_IMI_ARGS+=(--partition_path "${PARTITION_PATH}")
+        fi
+        if [[ -n "${DECODE_SEARCH_MODE}" ]]; then
+            EXTRA_IMI_ARGS+=(--decode_search_mode "${DECODE_SEARCH_MODE}")
+        fi
+        if [[ -n "${CANDIDATE_CLUSTERS}" ]]; then
+            EXTRA_IMI_ARGS+=(--candidate_clusters "${CANDIDATE_CLUSTERS}")
+        fi
+        if [[ -n "${TOKEN_RERANK_BUDGET_RATIO}" ]]; then
+            EXTRA_IMI_ARGS+=(--token_rerank_budget_ratio "${TOKEN_RERANK_BUDGET_RATIO}")
+        fi
+
+        python -u "${SCRIPT_DIR}/pred/call_api.py" \
+            --model_name ${MODEL_NAME} \
+            --model_path ${TOKENIZER_PATH} \
+            --attn_type ${ATTN_TYPE} \
+            --max_len ${MAX_SEQ_LENGTH} \
+            --batch_size ${BATCH_SIZE} \
+            --data_dir ${DATA_DIR} \
+            --save_dir ${PRED_DIR} \
+            --benchmark ${BENCHMARK} \
+            --task ${TASK} \
+            --dtype ${DTYPE} \
+            --server_type ${MODEL_FRAMEWORK} \
+            --device ${DEVICE} \
+            --synthetic_len ${MAX_SEQ_LENGTH} \
+            "${EXTRA_IMI_ARGS[@]}"
+    done
+
+    python -u "${SCRIPT_DIR}/eval/evaluate.py" \
+        --data_dir ${PRED_DIR} \
+        --benchmark ${BENCHMARK}
 done
-
-python -u "${SCRIPT_DIR}/eval/evaluate.py" \
-    --data_dir ${PRED_DIR} \
-    --benchmark ${BENCHMARK}

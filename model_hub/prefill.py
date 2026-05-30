@@ -63,80 +63,6 @@ class PrefillMixin:
         value_states = workspace["value"][:bsz, :seq_len, :, :]
         return key_states, value_states
 
-    def layer_prefill(self, layer_idx, start_bdx, hidden_states):
-        # print(f'Layer = {layer_idx}, start_bdx = {start_bdx}')
-
-        bsz, seq_len, dim = hidden_states.shape
-        layer = self.layers[layer_idx]
-
-        pre_attn_total_start = self._start_prefill_gpu_segment()
-        temp_hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
-
-        query_states, key_states, value_states = self.wqkv(temp_hidden_states, layer)
-        query_states, key_states = self.position_embedd(query_states, key_states)
-
-        query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
-
-        if self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI":
-            valid_start = 0
-            if hasattr(self.kv_cache, "valid_start_list"):
-                valid_start = int(self.kv_cache.valid_start_list[start_bdx])
-            key_states = key_states[:, valid_start:, :, :]
-            value_states = value_states[:, valid_start:, :, :]
-        else:
-            key_states, value_states = self.kv_cache.prefill_update_kv_cache(
-                query_states,
-                key_states,
-                value_states,
-                layer_idx,
-                start_bdx,
-            )
-
-        attn_total_start = self._start_prefill_gpu_segment()
-        start_event = None
-        end_event = None
-        if self.profile_prefill_gpu:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-        temp_attn_out = self.prefill_attention(
-            query_states,
-            key_states,
-            value_states,
-            layer_idx,
-        )
-        if self.profile_prefill_gpu:
-            end_event.record()
-            self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
-        hidden_states += self.wo(temp_attn_out, layer, bsz, seq_len, dim)
-        del temp_attn_out
-        self._finish_prefill_gpu_total_segment(layer_idx, attn_total_start)
-
-        if not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI"):
-            self.kv_cache.sync(layer_idx, start_bdx)
-        del query_states, key_states, value_states
-
-        del temp_hidden_states
-
-        post_attn_total_start = self._start_prefill_gpu_segment()
-        hidden_states_norm = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
-        # faster when split batches
-        for batch_idx in range(0, bsz, 1):
-            # chunk for lower memory comsumption, especially for 1M context
-            for start_idx in range(0, seq_len, self.prefill_chunk_size):
-                end_idx = min(seq_len, start_idx + self.prefill_chunk_size)
-                residual_chunk = hidden_states[batch_idx:batch_idx+1, start_idx:end_idx, :]
-                mlp_out = self.mlp(hidden_states_norm[batch_idx:batch_idx+1, start_idx:end_idx, :], layer)
-                hidden_states[batch_idx:batch_idx+1, start_idx:end_idx, :] = residual_chunk + mlp_out
-                del mlp_out
-        del hidden_states_norm
-        self._finish_prefill_gpu_total_segment(layer_idx, post_attn_total_start)
-        self._flush_prefill_gpu_layer_events(layer_idx)
-
-        return hidden_states
     def _streaming_build_kv_chunk(
         self,
         hidden_cpu,
@@ -173,20 +99,6 @@ class PrefillMixin:
 
         key_states[:, chunk_start:chunk_end, :, :].copy_(key_chunk)
         value_states[:, chunk_start:chunk_end, :, :].copy_(value_chunk)
-        kv_cache = getattr(self, "kv_cache", None)
-        if (
-            kv_cache is not None
-            and hasattr(kv_cache, "prefill_submit_kv_chunk")
-            and not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI")
-        ):
-            kv_cache.prefill_submit_kv_chunk(
-                key_states,
-                value_states,
-                layer_idx,
-                start_bdx,
-                chunk_start,
-                chunk_end,
-            )
         self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
 
         return hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk
@@ -313,6 +225,19 @@ class PrefillMixin:
                 key_states,
                 value_states,
             )
+            if (
+                kv_cache is not None
+                and hasattr(kv_cache, "prefill_submit_kv_chunk")
+                and not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI")
+            ):
+                kv_cache.prefill_submit_kv_chunk(
+                    key_states,
+                    value_states,
+                    layer_idx,
+                    start_bdx,
+                    chunk_start,
+                    chunk_end,
+                )
             self._streaming_finish_chunk(
                 layer,
                 layer_idx,
@@ -408,29 +333,4 @@ class PrefillMixin:
         logits = self.lm(last_hidden)
         return logits
     def prefill_forward(self, inputs_ids):
-        self._reset_prefill_gpu_profile()
-        bsz, seq_len = inputs_ids.shape
-        device = inputs_ids.device
-
-        if self.enable_prefill_attn_chunk:
-            return self.prefill_forward_chunked(inputs_ids)
-
-        last_hidden_states = torch.empty((bsz, 1, self.hidden_size), dtype=self.dtype, device=device).contiguous()
-        for start_bdx in range(0, bsz, self.prefill_bsz):
-            end_bdx = min(bsz, start_bdx + self.prefill_bsz)
-            hidden_states = self.word_embedding(inputs_ids[start_bdx:end_bdx])  # [prefill_batch_size, seq_len, hidden_size]
-
-            if self.num_gpus > 1:
-                for ldx in range(self.num_layers):
-                    hidden_states = self.layer_prefill(ldx, start_bdx, hidden_states)
-                    hidden_states = self.parameter_move(hidden_states, ldx)
-                last_hidden_states[start_bdx:end_bdx] = hidden_states[:, -1:, :].to(self.layers[0].device)
-            else:
-                for ldx in range(self.num_layers):
-                    hidden_states = self.layer_prefill(ldx, start_bdx, hidden_states)
-                last_hidden_states[start_bdx:end_bdx] = hidden_states[:, -1:, :]
-        
-        last_hidden_states = self.layernorm(last_hidden_states, self.norm_variance_epsilon, self.norm_weight)
-        logits = self.lm(last_hidden_states)
-        
-        return logits
+        return self.prefill_forward_chunked(inputs_ids)

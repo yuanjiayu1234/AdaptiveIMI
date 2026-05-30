@@ -29,10 +29,11 @@ fi
 
 # task name in `synthetic.yaml`
 synthetic=(
+    "niah_single_1"
     "niah_multivalue"
     "niah_multiquery"
     "vt"
-    # "cwe"
+    "cwe"
     "fwe"
     "qa_1"
     "qa_2"

@@ -9,11 +9,12 @@
       "buffer_cluster_num": 32,
       "use_cuda_graph": false,
       "gpu_only": false,
-      "subspace_parts": 4,
+      "engine": "hybrid_8way_v2",
+      "subspace_parts": 8,
       "kmeans": {
-        "max_iters": 20,
+        "max_iters": 10,
         "tol": 0.0005,
-        "early_stop_min_iter": 20,
+        "early_stop_min_iter": 10,
         "early_stop_rel_tol": 0.0005,
         "fp32_convert_chunk_elems": 1048576
       },
@@ -25,12 +26,7 @@
         "tiles_per_layer": 1
       },
       "prefill": {
-        "prefill_chunk_size": 4096,
-        "enable_prefill_attn_chunk": true,
-        "streaming": {
-          "prefill_queue_depth": 8,
-          "prefill_stage_slots": 8
-        }
+        "prefill_chunk_size": 4096
       },
       "async_update": {
         "enabled": true,

@@ -385,6 +385,119 @@ __global__ void assign_reduce_tiled_kernel(
 }
 
 template <typename scalar_t>
+__global__ void assign_reduce_tiled_warp_private_kernel(
+    const scalar_t* __restrict__ keys,
+    const int32_t* __restrict__ row_token_counts,
+    const int64_t* __restrict__ dim_ids,
+    const bool* __restrict__ dim_masks,
+    const int32_t* __restrict__ k_values,
+    const float* __restrict__ centroids,
+    int32_t* __restrict__ labels,
+    float* __restrict__ partial_sums,
+    float* __restrict__ partial_counts,
+    int rows,
+    int subspaces,
+    int kv_heads,
+    int max_tokens,
+    int head_dim,
+    int max_k,
+    int max_sub_dim,
+    int tile_tokens,
+    int tiles_per_task
+) {
+    extern __shared__ float shared[];
+    const int warp_count = (blockDim.x + 31) / 32;
+    const int warp_id = threadIdx.x >> 5;
+
+    float* warp_sums = shared;
+    float* warp_counts = warp_sums + warp_count * max_k * max_sub_dim;
+    float* shared_centroids = warp_counts + warp_count * max_k;
+    int* shared_dim_ids = reinterpret_cast<int*>(shared_centroids + max_k * max_sub_dim);
+
+    const int tile = blockIdx.x % tiles_per_task;
+    const int task = blockIdx.x / tiles_per_task;
+    const int row = task / subspaces;
+    const int subspace = task - row * subspaces;
+    if (row >= rows) {
+        return;
+    }
+
+    const int dim_base = (row * subspaces + subspace) * max_sub_dim;
+    const int sub_dim = subspace_dim_count(dim_masks, dim_base, max_sub_dim);
+    const int kval = k_values[subspace];
+    const int token_count = row_token_counts[row];
+    const int b = row / kv_heads;
+    const int h = row - b * kv_heads;
+
+    const int warp_sum_total = warp_count * max_k * max_sub_dim;
+    const int warp_count_total = warp_count * max_k;
+    for (int idx = threadIdx.x; idx < warp_sum_total; idx += blockDim.x) {
+        warp_sums[idx] = 0.0f;
+    }
+    for (int idx = threadIdx.x; idx < warp_count_total; idx += blockDim.x) {
+        warp_counts[idx] = 0.0f;
+    }
+    for (int idx = threadIdx.x; idx < max_k * max_sub_dim; idx += blockDim.x) {
+        shared_centroids[idx] = centroids[((row * subspaces + subspace) * max_k * max_sub_dim) + idx];
+    }
+    for (int idx = threadIdx.x; idx < max_sub_dim; idx += blockDim.x) {
+        shared_dim_ids[idx] = (idx < sub_dim) ? static_cast<int>(dim_ids[dim_base + idx]) : 0;
+    }
+    __syncthreads();
+
+    const int tile_start = tile * tile_tokens;
+    const int tile_end = min(tile_start + tile_tokens, token_count);
+    for (int token = tile_start + threadIdx.x; token < tile_end; token += blockDim.x) {
+        float best_dist = FLT_MAX;
+        int best_k = 0;
+        for (int k = 0; k < kval; ++k) {
+            float dist = 0.0f;
+            for (int d = 0; d < sub_dim; ++d) {
+                const int source_dim = shared_dim_ids[d];
+                const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+                const float c = shared_centroids[k * max_sub_dim + d];
+                const float diff = x - c;
+                dist += diff * diff;
+            }
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_k = k;
+            }
+        }
+
+        labels[(row * subspaces + subspace) * max_tokens + token] = best_k;
+        atomicAdd(&warp_counts[warp_id * max_k + best_k], 1.0f);
+        const int sum_base = (warp_id * max_k + best_k) * max_sub_dim;
+        for (int d = 0; d < sub_dim; ++d) {
+            const int source_dim = shared_dim_ids[d];
+            const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+            atomicAdd(&warp_sums[sum_base + d], x);
+        }
+    }
+    __syncthreads();
+
+    const int64_t partial_count_base = static_cast<int64_t>(blockIdx.x) * max_k;
+    for (int k = threadIdx.x; k < max_k; k += blockDim.x) {
+        float total = 0.0f;
+        for (int warp = 0; warp < warp_count; ++warp) {
+            total += warp_counts[warp * max_k + k];
+        }
+        partial_counts[partial_count_base + k] = total;
+    }
+
+    const int64_t partial_sum_base = static_cast<int64_t>(blockIdx.x) * max_k * max_sub_dim;
+    for (int idx = threadIdx.x; idx < max_k * max_sub_dim; idx += blockDim.x) {
+        const int d = idx % max_sub_dim;
+        const int k = idx / max_sub_dim;
+        float total = 0.0f;
+        for (int warp = 0; warp < warp_count; ++warp) {
+            total += warp_sums[(warp * max_k + k) * max_sub_dim + d];
+        }
+        partial_sums[partial_sum_base + idx] = total;
+    }
+}
+
+template <typename scalar_t>
 __global__ void reduce_update_tiled_kernel(
     const scalar_t* __restrict__ keys,
     const int32_t* __restrict__ row_token_counts,
@@ -622,6 +735,7 @@ std::vector<torch::Tensor> run_subspace_kmeans_only_cuda(
     const int tile_tokens = 512;
     const int tiles_per_task = static_cast<int>((max_tokens + tile_tokens - 1) / tile_tokens);
     const bool use_tiled_reduce = max_k <= 32 && max_sub_dim <= 64;
+    const bool use_warp_private_reduce = use_tiled_reduce && max_k <= 16 && max_sub_dim <= 32;
     const int64_t partial_tasks = static_cast<int64_t>(rows) * subspaces * tiles_per_task;
     torch::Tensor partial_sums;
     torch::Tensor partial_counts;
@@ -644,36 +758,64 @@ std::vector<torch::Tensor> run_subspace_kmeans_only_cuda(
         if (use_tiled_reduce) {
             cudaMemsetAsync(counts.data_ptr<float>(), 0, counts.numel() * sizeof(float), stream);
 
-            const size_t tiled_shared_bytes =
-                (static_cast<size_t>(2) * static_cast<size_t>(max_k) * static_cast<size_t>(max_sub_dim) +
-                 static_cast<size_t>(max_k)) * sizeof(float) +
-                static_cast<size_t>(max_sub_dim) * sizeof(int);
+            const int warp_count = (threads + 31) / 32;
+            const size_t tiled_shared_bytes = use_warp_private_reduce
+                ? ((static_cast<size_t>(warp_count) * static_cast<size_t>(max_k) * static_cast<size_t>(max_sub_dim) +
+                    static_cast<size_t>(warp_count) * static_cast<size_t>(max_k) +
+                    static_cast<size_t>(max_k) * static_cast<size_t>(max_sub_dim)) * sizeof(float) +
+                   static_cast<size_t>(max_sub_dim) * sizeof(int))
+                : ((static_cast<size_t>(2) * static_cast<size_t>(max_k) * static_cast<size_t>(max_sub_dim) +
+                    static_cast<size_t>(max_k)) * sizeof(float) +
+                   static_cast<size_t>(max_sub_dim) * sizeof(int));
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 at::ScalarType::Half,
                 at::ScalarType::BFloat16,
                 keys.scalar_type(),
                 "subspace_bench_assign_reduce_tiled",
                 [&] {
-                    assign_reduce_tiled_kernel<scalar_t><<<static_cast<unsigned int>(partial_tasks), threads, tiled_shared_bytes, stream>>>(
-                        keys.data_ptr<scalar_t>(),
-                        row_token_counts.data_ptr<int32_t>(),
-                        subspace_dim_ids.data_ptr<int64_t>(),
-                        subspace_dim_masks.data_ptr<bool>(),
-                        k_values.data_ptr<int32_t>(),
-                        centroids.data_ptr<float>(),
-                        labels.data_ptr<int32_t>(),
-                        partial_sums.data_ptr<float>(),
-                        partial_counts.data_ptr<float>(),
-                        rows,
-                        subspaces,
-                        static_cast<int>(kv_heads),
-                        static_cast<int>(max_tokens),
-                        static_cast<int>(head_dim),
-                        max_k,
-                        max_sub_dim,
-                        tile_tokens,
-                        tiles_per_task
-                    );
+                    if (use_warp_private_reduce) {
+                        assign_reduce_tiled_warp_private_kernel<scalar_t><<<static_cast<unsigned int>(partial_tasks), threads, tiled_shared_bytes, stream>>>(
+                            keys.data_ptr<scalar_t>(),
+                            row_token_counts.data_ptr<int32_t>(),
+                            subspace_dim_ids.data_ptr<int64_t>(),
+                            subspace_dim_masks.data_ptr<bool>(),
+                            k_values.data_ptr<int32_t>(),
+                            centroids.data_ptr<float>(),
+                            labels.data_ptr<int32_t>(),
+                            partial_sums.data_ptr<float>(),
+                            partial_counts.data_ptr<float>(),
+                            rows,
+                            subspaces,
+                            static_cast<int>(kv_heads),
+                            static_cast<int>(max_tokens),
+                            static_cast<int>(head_dim),
+                            max_k,
+                            max_sub_dim,
+                            tile_tokens,
+                            tiles_per_task
+                        );
+                    } else {
+                        assign_reduce_tiled_kernel<scalar_t><<<static_cast<unsigned int>(partial_tasks), threads, tiled_shared_bytes, stream>>>(
+                            keys.data_ptr<scalar_t>(),
+                            row_token_counts.data_ptr<int32_t>(),
+                            subspace_dim_ids.data_ptr<int64_t>(),
+                            subspace_dim_masks.data_ptr<bool>(),
+                            k_values.data_ptr<int32_t>(),
+                            centroids.data_ptr<float>(),
+                            labels.data_ptr<int32_t>(),
+                            partial_sums.data_ptr<float>(),
+                            partial_counts.data_ptr<float>(),
+                            rows,
+                            subspaces,
+                            static_cast<int>(kv_heads),
+                            static_cast<int>(max_tokens),
+                            static_cast<int>(head_dim),
+                            max_k,
+                            max_sub_dim,
+                            tile_tokens,
+                            tiles_per_task
+                        );
+                    }
                 }
             );
             C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -193,8 +193,13 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
         prefill_cfg = runtime_config.get("prefill") or {}
         if not isinstance(prefill_cfg, dict):
             prefill_cfg = {}
-        if not prefill_cfg and isinstance(runtime_config.get("streaming"), dict):
-            prefill_cfg = {"streaming": runtime_config.get("streaming")}
+        streaming_cfg = {}
+        if isinstance(runtime_config.get("streaming"), dict):
+            streaming_cfg.update(runtime_config.get("streaming") or {})
+        if isinstance(prefill_cfg.get("streaming"), dict):
+            streaming_cfg.update(prefill_cfg.get("streaming") or {})
+        if prefill_cfg.get("prefill_chunk_size") is not None:
+            streaming_cfg["prefill_chunk_size"] = prefill_cfg.get("prefill_chunk_size")
 
         kmeans_cfg = dict(runtime_config.get("kmeans") or {})
         max_partition_m = max(
@@ -222,7 +227,7 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
             "pipeline": pipeline_cfg,
             "kmeans": kmeans_cfg,
             "prefetch": dict(runtime_config.get("prefetch") or {}),
-            "streaming": dict(prefill_cfg.get("streaming")or {}),
+            "streaming": streaming_cfg,
             "async_update": dict(runtime_config.get("async_update") or {}),
             "partition_path": str(partition_path) if partition_path else None,
         }
@@ -330,10 +335,12 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
                         self._ensure_list_storage(ldx)
                         key_storage = self.list_keys[ldx]
                         value_storage = self.list_values[ldx]
+                        key_rows = key_storage.view(self.batch_groups, self.list_capacity, self.head_dim)
+                        value_rows = value_storage.view(self.batch_groups, self.list_capacity, self.head_dim)
                         results = []
-                        for head_idx, required_tokens in heads_info:
-                            key_buffer = key_storage[0, head_idx]
-                            value_buffer = value_storage[0, head_idx]
+                        for row_idx, required_tokens in heads_info:
+                            key_buffer = key_rows[row_idx]
+                            value_buffer = value_rows[row_idx]
                             capacity = int(key_buffer.size(0))
                             if required_tokens > capacity:
                                 raise ValueError(
@@ -446,9 +453,6 @@ class adpimi_cache(AdaptiveIMIIndexingMixin, AdaptiveIMIPrefetchMixin, AdaptiveI
         self.prefill_stream_started = [False] * self.layer_num
         self.prefill_stream_chunk_ids = [0] * self.layer_num
         self.prefill_stream_end_submitted = [False] * self.layer_num
-
-        self.prefill_stream_queue_depth = max(int(self.runtime_config["streaming"].get("prefill_queue_depth", 8)), 1)
-        self.prefill_stream_stage_slots = max(int(self.runtime_config["streaming"].get("prefill_stage_slots", 8)), 1)
 
         self.prefill_stream_copy_streams = [None] * self.layer_num
         self.prefill_stream_main_events = [None] * self.layer_num

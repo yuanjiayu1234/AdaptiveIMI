@@ -51,26 +51,16 @@ LayerPipeline::LayerPipeline(
         throw std::invalid_argument(
             "[LayerPipeline] Only torch.float16 and torch.bfloat16 are supported for KV dtype");
     }
-    if (
-        !runtime_config_.learned_partition_enabled &&
-        subspace_parts_ != 0 &&
-        subspace_parts_ != 2 &&
-        subspace_parts_ != 4
-    ) {
-        throw std::invalid_argument("[LayerPipeline] subspace_parts must be 0, 2 or 4 unless learned_partition is enabled");
+    if (!runtime_config_.learned_partition_enabled) {
+        throw std::invalid_argument("[LayerPipeline] hybrid_8way_v2 requires learned_partition");
     }
-    if (subspace_parts_ == 4 && dim_ % 4 != 0) {
-        throw std::invalid_argument("[LayerPipeline] dim must be divisible by 4 when subspace_parts=4");
+    if (runtime_config_.learned_subspace_parts <= 0) {
+        runtime_config_.learned_subspace_parts = subspace_parts_;
     }
-    if (runtime_config_.learned_partition_enabled) {
-        if (runtime_config_.learned_subspace_parts <= 0) {
-            runtime_config_.learned_subspace_parts = subspace_parts_;
-        }
-        if (runtime_config_.learned_subspace_parts <= 0) {
-            throw std::invalid_argument("[LayerPipeline] learned_partition requires positive subspace_parts");
-        }
-        subspace_parts_ = runtime_config_.learned_subspace_parts;
+    if (runtime_config_.learned_subspace_parts != 8) {
+        throw std::invalid_argument("[LayerPipeline] hybrid_8way_v2 CPU path supports learned 8-way only");
     }
+    subspace_parts_ = runtime_config_.learned_subspace_parts;
     kv_element_size_bytes_ = c10::elementSize(kv_dtype_);
 
     // ✅ Set CUDA device
@@ -208,67 +198,6 @@ int determine_worker_threads(const LayerPipelineRuntimeConfig& runtime_config) {
     return desired;
 }
 
-struct AdaptiveKValues {
-    int k_ivf = 0;
-    int k1 = 0;
-    int k2 = 0;
-    int k3 = 0;
-    int k4 = 0;
-};
-
-AdaptiveKValues calculate_adaptive_k_values(int seq_len, int target_cluster_size, int subspace_parts) {
-    AdaptiveKValues out;
-
-    if (seq_len <= 0) {
-        // Boundary: at least 1 cluster per stage
-        if (subspace_parts == 0) {
-            out.k_ivf = 1;
-        } else if (subspace_parts == 4) {
-            out.k1 = 1;
-            out.k2 = 1;
-            out.k3 = 1;
-            out.k4 = 1;
-        } else {
-            out.k1 = 1;
-            out.k2 = 1;
-        }
-        return out;
-    }
-
-    if (target_cluster_size <= 0) {
-        target_cluster_size = 16;
-    }
-
-    if (subspace_parts == 0) {
-        // IVF: k = round(seq_len / target_cluster_size)
-        double total_clusters = static_cast<double>(seq_len) / target_cluster_size;
-        int k = static_cast<int>(std::round(total_clusters));
-        out.k_ivf = std::max(k, 1);
-        return out;
-    }
-
-    if (subspace_parts == 4) {
-        // 4-way IMI: k1=k2=k3=k4=round((seq_len/target_cluster_size)^(1/4)), min 2
-        double total_clusters = static_cast<double>(seq_len) / target_cluster_size;
-        double k_double = std::pow(total_clusters, 0.25);
-        int k = static_cast<int>(std::round(k_double));
-        k = std::max(k, 2);
-        out.k1 = k;
-        out.k2 = k;
-        out.k3 = k;
-        out.k4 = k;
-        return out;
-    }
-
-    // 2-way IMI: k1=k2=floor(sqrt(seq_len/target_cluster_size)), min 32
-    double total_clusters = static_cast<double>(seq_len) / target_cluster_size;
-    int k = static_cast<int>(std::sqrt(total_clusters));
-    k = std::max(k, 32);
-    out.k1 = k;
-    out.k2 = k;
-    return out;
-}
-
 std::vector<int32_t> calculate_learned_k_values(int seq_len, int target_cluster_size, int subspace_parts) {
     const int M = std::max(subspace_parts, 1);
     const int token_count = std::max(seq_len, 1);
@@ -323,6 +252,7 @@ void LayerPipeline::reset_pipeline_stats() {
 
 bool LayerPipeline::allocate_chunk_buffers(int capacity_tokens) {
     int required_tokens = std::max(1, capacity_tokens);
+    int row_count = row_count_ > 0 ? row_count_ : kv_heads_;
     try {
         std::lock_guard<std::mutex> lock(chunk_pool_mutex_);
         if (chunk_buffer_capacity_ >= required_tokens && !chunk_keys_pool_.empty()) {
@@ -344,20 +274,20 @@ bool LayerPipeline::allocate_chunk_buffers(int capacity_tokens) {
         for (int i = 0; i < pool_size; ++i) {
             if (runtime_config_.learned_partition_enabled) {
                 chunk_keys_pool_.push_back(torch::empty(
-                    {required_tokens, kv_heads_, dim_},
+                    {batch_size_, required_tokens, kv_heads_, dim_},
                     torch::dtype(kv_dtype_).device(torch::kCPU).pinned_memory(true)
                 ));
                 chunk_values_pool_.push_back(torch::empty(
-                    {required_tokens, kv_heads_, dim_},
+                    {batch_size_, required_tokens, kv_heads_, dim_},
                     torch::dtype(kv_dtype_).device(torch::kCPU).pinned_memory(true)
                 ));
             } else {
                 chunk_keys_pool_.push_back(torch::empty(
-                    {kv_heads_, required_tokens, dim_},
+                    {row_count, required_tokens, dim_},
                     torch::dtype(kv_dtype_).device(torch::kCPU).pinned_memory(true)
                 ));
                 chunk_values_pool_.push_back(torch::empty(
-                    {kv_heads_, required_tokens, dim_},
+                    {row_count, required_tokens, dim_},
                     torch::dtype(kv_dtype_).device(torch::kCPU).pinned_memory(true)
                 ));
             }
@@ -393,28 +323,29 @@ bool LayerPipeline::prepare_direct_write_buffers(int32_t total_tokens) {
 
     static thread_local std::vector<std::pair<int32_t, int32_t>> heads_info;
     heads_info.clear();
-    heads_info.reserve(kv_heads_);
-    for (int32_t head = 0; head < kv_heads_; ++head) {
-        heads_info.emplace_back(head, total_tokens);
+    int row_count = row_count_ > 0 ? row_count_ : kv_heads_;
+    heads_info.reserve(row_count);
+    for (int32_t row = 0; row < row_count; ++row) {
+        heads_info.emplace_back(row, total_tokens);
     }
 
     auto buffers = batch_allocate_cpu_buffer_cb_(layer_idx_, heads_info);
-    if (buffers.size() != static_cast<size_t>(kv_heads_)) {
+    if (buffers.size() != static_cast<size_t>(row_count)) {
         std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
                   << ": Batch allocate returned wrong size ("
-                  << buffers.size() << " != " << kv_heads_ << ")\n";
+                  << buffers.size() << " != " << row_count << ")\n";
         return false;
     }
 
-    for (int32_t head = 0; head < kv_heads_; ++head) {
-        const auto& desc = buffers[head];
+    for (int32_t row = 0; row < row_count; ++row) {
+        const auto& desc = buffers[row];
         if (desc.key_buffer_ptr == nullptr || desc.value_buffer_ptr == nullptr) {
-            std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_ << " Head " << head
+            std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_ << " Row " << row
                       << ": buffer pointer is null\n";
             return false;
         }
         if (desc.buffer_capacity < static_cast<size_t>(total_tokens)) {
-            std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_ << " Head " << head
+            std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_ << " Row " << row
                       << ": buffer capacity insufficient ("
                       << desc.buffer_capacity << " < " << total_tokens << ")\n";
             return false;
@@ -439,14 +370,15 @@ bool LayerPipeline::write_cpu_buffers() {
             }
 
             std::vector<HeadMetadata> all_heads_data;
-            all_heads_data.reserve(kv_heads_);
+            int row_count = row_count_ > 0 ? row_count_ : kv_heads_;
+            all_heads_data.reserve(row_count);
 
-            for (int32_t head = 0; head < kv_heads_; ++head) {
-                const auto& reorg_result = reorganize_results_[head];
+            for (int32_t row = 0; row < row_count; ++row) {
+                const auto& reorg_result = reorganize_results_[row];
 
                 if (reorg_result.cluster_sizes.empty()) {
                     std::string error_msg =
-                        "❌ Layer " + std::to_string(layer_idx_) + " Head " + std::to_string(head) +
+                        "❌ Layer " + std::to_string(layer_idx_) + " Row " + std::to_string(row) +
                         ": cluster_sizes is EMPTY! This indicates reorganize failed or was not executed.";
                     std::cerr << error_msg << "\n";
                     mark_failure(error_msg);
@@ -454,15 +386,15 @@ bool LayerPipeline::write_cpu_buffers() {
                 }
 
                 bool centroids_missing =
-                    (head >= static_cast<int32_t>(merged_centroids_.size())) ||
-                    !merged_centroids_[head].defined() ||
-                    merged_centroids_[head].numel() == 0;
+                    (row >= static_cast<int32_t>(merged_centroids_.size())) ||
+                    !merged_centroids_[row].defined() ||
+                    merged_centroids_[row].numel() == 0;
                 if (centroids_missing) {
-                    int actual_size = (head < static_cast<int32_t>(merged_centroids_.size()) &&
-                                       merged_centroids_[head].defined())
-                                      ? merged_centroids_[head].numel() : -1;
+                    int actual_size = (row < static_cast<int32_t>(merged_centroids_.size()) &&
+                                       merged_centroids_[row].defined())
+                                      ? merged_centroids_[row].numel() : -1;
                     std::string error_msg =
-                        "❌ Layer " + std::to_string(layer_idx_) + " Head " + std::to_string(head) +
+                        "❌ Layer " + std::to_string(layer_idx_) + " Row " + std::to_string(row) +
                         ": merged_centroids is MISSING or EMPTY! " +
                         "(size=" + std::to_string(actual_size) + "). " +
                         "This indicates global K-means failed.";
@@ -472,18 +404,18 @@ bool LayerPipeline::write_cpu_buffers() {
                 }
 
                 HeadMetadata head_data;
-                head_data.head_idx = head;
+                head_data.head_idx = row;
                 head_data.cluster_sizes = reorg_result.cluster_sizes;
                 head_data.cluster_offsets = reorg_result.cluster_offsets;
-                head_data.centroids = merged_centroids_[head];
+                head_data.centroids = merged_centroids_[row];
                 all_heads_data.push_back(std::move(head_data));
             }
 
-            if (static_cast<int32_t>(all_heads_data.size()) != kv_heads_) {
+            if (static_cast<int32_t>(all_heads_data.size()) != row_count) {
                 std::string error_msg =
                     "❌ Layer " + std::to_string(layer_idx_) +
-                    ": Expected " + std::to_string(kv_heads_) + " heads, but only collected " +
-                    std::to_string(all_heads_data.size()) + " heads!";
+                    ": Expected " + std::to_string(row_count) + " rows, but only collected " +
+                    std::to_string(all_heads_data.size()) + " rows!";
                 std::cerr << error_msg << "\n";
                 mark_failure(error_msg);
                 throw std::runtime_error(error_msg);
@@ -515,14 +447,42 @@ bool LayerPipeline::write_cpu_buffers() {
 // ════════════════════════════════════════════════════════════════════════
 
 bool LayerPipeline::start_chunk_pipeline(int total_middle_tokens, int chunk_size) {
+    return start_chunk_pipeline_batch(std::vector<int32_t>{static_cast<int32_t>(total_middle_tokens)}, chunk_size);
+}
+
+bool LayerPipeline::start_chunk_pipeline_batch(const std::vector<int32_t>& token_counts, int chunk_size) {
     if (chunk_mode_) {
         std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
                   << ": Chunk pipeline already started!\n";
         return false;
     }
 
-    // ✅ 不再接受 k1, k2 参数，由 process_chunk_kmeans() 根据实际 chunk_len 自动计算
-    total_middle_tokens_ = total_middle_tokens;
+    if (token_counts.empty()) {
+        std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
+                  << ": token_counts must be non-empty\n";
+        return false;
+    }
+    int max_tokens = 0;
+    for (int32_t count : token_counts) {
+        if (count <= 0) {
+            std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
+                      << ": token_counts entries must be positive\n";
+            return false;
+        }
+        max_tokens = std::max(max_tokens, static_cast<int>(count));
+    }
+    for (int32_t count : token_counts) {
+        if (count != max_tokens) {
+            std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
+                      << ": CPU batch pipeline currently requires lockstep token_counts\n";
+            return false;
+        }
+    }
+
+    batch_token_counts_ = token_counts;
+    batch_size_ = static_cast<int>(token_counts.size());
+    row_count_ = batch_size_ * kv_heads_;
+    total_middle_tokens_ = max_tokens;
 
     // ════════════════════════════════════════════════════════════════════
     //配置 OpenMP（reorganize/write 阶段使用）
@@ -545,7 +505,7 @@ bool LayerPipeline::start_chunk_pipeline(int total_middle_tokens, int chunk_size
     );
     int expected_kmeans_outer = std::max(
         1,
-        std::min(worker_threads_ / min_threads_per_phase, kv_heads_ * subspace_parts_)
+        std::min(worker_threads_ / min_threads_per_phase, row_count_ * subspace_parts_)
     );
     int expected_kmeans_inner = std::max(1, worker_threads_ / expected_kmeans_outer);
     int expected_kmeans_cores = runtime_config_.enable_omp_nested
@@ -563,7 +523,7 @@ bool LayerPipeline::start_chunk_pipeline(int total_middle_tokens, int chunk_size
                   << ", dynamic=" << omp_get_dynamic()
                   << ", worker_threads=" << worker_threads_
                   << ", min_threads_per_phase=" << min_threads_per_phase
-                  << ", kmeans_tasks=" << (kv_heads_ * subspace_parts_)
+                  << ", kmeans_tasks=" << (row_count_ * subspace_parts_)
                   << ", expected_kmeans_cores=" << expected_kmeans_cores
                   << ", kmeans_outer=" << expected_kmeans_outer
                   << ", kmeans_inner=" << expected_kmeans_inner
@@ -573,15 +533,25 @@ bool LayerPipeline::start_chunk_pipeline(int total_middle_tokens, int chunk_size
 
 
     // ════════════════════════════════════════════════════════════════════
-    // 步骤1：预分配完整 CPU buffer（⚡ 优化：使用 pinned memory）
+    // 步骤1：预分配完整 CPU raw buffer。
+    // learned/hybrid path keeps raw KV in sequence-major layout so D2H can
+    // land directly in the merge source without a CPU-side transpose pass.
     // ════════════════════════════════════════════════════════════════════
     try {
-        auto build_opts = torch::dtype(kv_dtype_).device(torch::kCPU);
-        if (!runtime_config_.learned_partition_enabled) {
-            build_opts = build_opts.pinned_memory(true);
+        auto build_opts = torch::dtype(kv_dtype_).device(torch::kCPU).pinned_memory(true);
+        if (runtime_config_.learned_partition_enabled) {
+            keys_sequence_cpu_ = torch::empty({total_middle_tokens_, row_count_, dim_}, build_opts);
+            values_sequence_cpu_ = torch::empty({total_middle_tokens_, row_count_, dim_}, build_opts);
+            keys_buffer_ = torch::Tensor();
+            values_buffer_ = torch::Tensor();
+            sequence_major_cpu_ready_ = true;
+        } else {
+            keys_buffer_ = torch::empty({row_count_, total_middle_tokens_, dim_}, build_opts);
+            values_buffer_ = torch::empty({row_count_, total_middle_tokens_, dim_}, build_opts);
+            keys_sequence_cpu_ = torch::Tensor();
+            values_sequence_cpu_ = torch::Tensor();
+            sequence_major_cpu_ready_ = false;
         }
-        keys_buffer_ = torch::empty({kv_heads_, total_middle_tokens_, dim_}, build_opts);
-        values_buffer_ = torch::empty({kv_heads_, total_middle_tokens_, dim_}, build_opts);
     } catch (const std::exception& e) {
         std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
                   << ": Failed to allocate CPU buffer: " << e.what() << "\n";
@@ -606,9 +576,6 @@ bool LayerPipeline::start_chunk_pipeline(int total_middle_tokens, int chunk_size
     n_tokens_ = 0;
     keys_cpu_ = torch::Tensor();
     values_cpu_ = torch::Tensor();
-    keys_sequence_cpu_ = torch::Tensor();
-    values_sequence_cpu_ = torch::Tensor();
-    sequence_major_cpu_ready_ = false;
     merged_centroids_.clear();
     reorganize_results_.clear();
     direct_write_buffers_.clear();
@@ -697,7 +664,53 @@ void LayerPipeline::chunk_worker_loop() {
 
         try {
             auto copy_start = std::chrono::steady_clock::now();
-            if (task.sequence_major_staging) {
+            if (task.batch_sequence_major_staging) {
+                const size_t element_size = chunk_keys_pool_[task.buffer_index].element_size();
+                const size_t token_bytes = static_cast<size_t>(dim_) * element_size;
+                const size_t keys_src_batch_stride =
+                    static_cast<size_t>(chunk_keys_pool_[task.buffer_index].stride(0)) * element_size;
+                const size_t values_src_batch_stride =
+                    static_cast<size_t>(chunk_values_pool_[task.buffer_index].stride(0)) * element_size;
+                const size_t keys_src_token_stride =
+                    static_cast<size_t>(chunk_keys_pool_[task.buffer_index].stride(1)) * element_size;
+                const size_t values_src_token_stride =
+                    static_cast<size_t>(chunk_values_pool_[task.buffer_index].stride(1)) * element_size;
+                const size_t keys_src_head_stride =
+                    static_cast<size_t>(chunk_keys_pool_[task.buffer_index].stride(2)) * element_size;
+                const size_t values_src_head_stride =
+                    static_cast<size_t>(chunk_values_pool_[task.buffer_index].stride(2)) * element_size;
+                const size_t dst_head_stride = static_cast<size_t>(total_middle_tokens_) * token_bytes;
+                const size_t dst_offset = static_cast<size_t>(task.start_token) * token_bytes;
+
+                const char* src_keys_base = static_cast<const char*>(chunk_keys_pool_[task.buffer_index].data_ptr());
+                const char* src_values_base = static_cast<const char*>(chunk_values_pool_[task.buffer_index].data_ptr());
+                char* dst_keys_base = static_cast<char*>(keys_buffer_.data_ptr());
+                char* dst_values_base = static_cast<char*>(values_buffer_.data_ptr());
+
+                int batch_rows = std::max(1, task.batch_size * kv_heads_);
+                int copy_threads = std::max(1, std::min(worker_threads_, batch_rows));
+                #pragma omp parallel for num_threads(copy_threads) schedule(static)
+                for (int local_row = 0; local_row < batch_rows; ++local_row) {
+                    const int local_batch = local_row / kv_heads_;
+                    const int head = local_row % kv_heads_;
+                    const int global_row = (task.start_bdx + local_batch) * kv_heads_ + head;
+                    const char* src_head_keys = src_keys_base
+                        + static_cast<size_t>(local_batch) * keys_src_batch_stride
+                        + static_cast<size_t>(head) * keys_src_head_stride;
+                    const char* src_head_values = src_values_base
+                        + static_cast<size_t>(local_batch) * values_src_batch_stride
+                        + static_cast<size_t>(head) * values_src_head_stride;
+                    char* dst_head_keys = dst_keys_base + static_cast<size_t>(global_row) * dst_head_stride + dst_offset;
+                    char* dst_head_values = dst_values_base + static_cast<size_t>(global_row) * dst_head_stride + dst_offset;
+                    for (int token = 0; token < task.chunk_len; ++token) {
+                        const size_t keys_src_offset = static_cast<size_t>(token) * keys_src_token_stride;
+                        const size_t values_src_offset = static_cast<size_t>(token) * values_src_token_stride;
+                        const size_t dst_token_offset = static_cast<size_t>(token) * token_bytes;
+                        std::memcpy(dst_head_keys + dst_token_offset, src_head_keys + keys_src_offset, token_bytes);
+                        std::memcpy(dst_head_values + dst_token_offset, src_head_values + values_src_offset, token_bytes);
+                    }
+                }
+            } else if (task.sequence_major_staging) {
                 const size_t element_size = chunk_keys_pool_[task.buffer_index].element_size();
                 const size_t token_bytes = static_cast<size_t>(dim_) * element_size;
                 const size_t src_token_stride = static_cast<size_t>(kv_heads_) * token_bytes;
@@ -752,7 +765,7 @@ void LayerPipeline::chunk_worker_loop() {
                 std::lock_guard<std::mutex> lock(pipeline_stats_mutex_);
                 pipeline_stats_.cpu_copy_ms += copy_ms;
                 pipeline_stats_.total_chunks += 1;
-                pipeline_stats_.total_tokens += task.chunk_len;
+                pipeline_stats_.total_tokens += static_cast<int64_t>(task.chunk_len) * std::max(1, task.batch_size);
             }
         } catch (const std::exception& exc) {
             std::string msg = "Chunk CPU copy failed: ";
@@ -808,259 +821,32 @@ void LayerPipeline::chunk_worker_loop() {
     }
 }
 
-bool LayerPipeline::submit_chunk(
-    torch::Tensor keys_gpu,       // [1, kv_heads, chunk_len, dim]
-    torch::Tensor values_gpu,
-    int chunk_id,
-    int start_token,
-    bool is_last
-) {
-    auto fail_with_message = [&](const std::string& msg) {
-        std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_ << ": " << msg << "\n";
-        mark_failure(msg);
-        merge_cv_.notify_one();
-        return false;
-    };
-
-    if (!chunk_mode_) {
-        return fail_with_message("Chunk pipeline not started! Call start_chunk_pipeline() first.");
-    }
-
-    if (has_error_) {
-        return fail_with_message("Previous chunk failed, cannot submit more chunks.");
-    }
-    int chunk_len = keys_gpu.size(2);  // [1, kv_heads, chunk_len, dim]
-    if (start_token < 0 || start_token + chunk_len > total_middle_tokens_) {
-        return fail_with_message(
-            "Chunk " + std::to_string(chunk_id) + ": invalid token range (" +
-            std::to_string(start_token) + "+" + std::to_string(chunk_len) +
-            " > " + std::to_string(total_middle_tokens_) + ")"
-        );
-    }
-    auto keys_squeezed = keys_gpu[0];      // [1,8,8192,128] → [8,8192,128]
-    auto values_squeezed = values_gpu[0];  // 等价于 squeeze(0) 但更直接
-
-    if (keys_squeezed.stride(2) != 1 || keys_squeezed.stride(1) != dim_) {
-        keys_squeezed = keys_squeezed.contiguous();
-    }
-    if (values_squeezed.stride(2) != 1 || values_squeezed.stride(1) != dim_) {
-        values_squeezed = values_squeezed.contiguous();
-    }
-
-    // ✅ 【诊断】验证 dtype（首次调试时打印）
-    if (keys_squeezed.dtype() != kv_dtype_ || values_squeezed.dtype() != kv_dtype_) {
-        std::string msg = "Dtype mismatch! Expected " + std::string(c10::toString(kv_dtype_)) +
-                          ", got keys=" + std::string(c10::toString(keys_squeezed.scalar_type())) +
-                          ", values=" + std::string(c10::toString(values_squeezed.scalar_type()));
-        return fail_with_message(msg);
-    }
-
-    cudaSetDevice(device_id_);
-
-    if (chunk_len > chunk_buffer_capacity_ || chunk_keys_pool_.empty()) {
-        bool has_inflight = false;
-        {
-            std::lock_guard<std::mutex> lock(chunk_pool_mutex_);
-            has_inflight = std::any_of(
-                chunk_buffer_in_use_.begin(),
-                chunk_buffer_in_use_.end(),
-                [](bool in_use) { return in_use; }
-            );
-        }
-        if (has_inflight) {
-            return fail_with_message(
-                "Chunk " + std::to_string(chunk_id) + ": staging buffer too small while in-flight"
-            );
-        }
-        int new_capacity = std::max(chunk_len, std::max(chunk_buffer_capacity_ * 2, 1));
-        if (!allocate_chunk_buffers(new_capacity)) {
-            return fail_with_message(
-                "Chunk " + std::to_string(chunk_id) + ": staging buffer allocation failed"
-            );
-        }
-    }
-
-    size_t buffer_index = 0;
-    bool buffer_acquired = false;
-    auto release_buffer = [&]() {
-        if (!buffer_acquired) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(chunk_pool_mutex_);
-        if (buffer_index < chunk_buffer_in_use_.size()) {
-            chunk_buffer_in_use_[buffer_index] = false;
-        }
-        buffer_acquired = false;
-        chunk_pool_cv_.notify_one();
-    };
-    {
-        std::unique_lock<std::mutex> lock(chunk_pool_mutex_);
-        chunk_pool_cv_.wait(lock, [this] {
-            if (chunk_worker_stop_.load(std::memory_order_acquire)) {
-                return true;
-            }
-            return std::any_of(
-                chunk_buffer_in_use_.begin(),
-                chunk_buffer_in_use_.end(),
-                [](bool in_use) { return !in_use; }
-            );
-        });
-        if (chunk_worker_stop_.load(std::memory_order_acquire)) {
-            return fail_with_message("Chunk worker stopped while waiting for buffer");
-        }
-        auto it = std::find(chunk_buffer_in_use_.begin(), chunk_buffer_in_use_.end(), false);
-        if (it == chunk_buffer_in_use_.end()) {
-            return fail_with_message("No available staging buffer");
-        }
-        buffer_index = static_cast<size_t>(std::distance(chunk_buffer_in_use_.begin(), it));
-        chunk_buffer_in_use_[buffer_index] = true;
-        buffer_acquired = true;
-    }
-
-    if (transfer_stream_ == nullptr) {
-        cudaError_t stream_err = cudaStreamCreate(&transfer_stream_);
-        if (stream_err != cudaSuccess) {
-            return fail_with_message(
-                "Chunk " + std::to_string(chunk_id) + ": failed to create transfer stream (" +
-                std::string(cudaGetErrorString(stream_err)) + ")"
-            );
-        }
-    } else {
-        cudaError_t stream_status = cudaStreamQuery(transfer_stream_);
-        if (stream_status == cudaErrorInvalidResourceHandle) {
-            cudaGetLastError();  // clear the error state
-            cudaError_t stream_err = cudaStreamCreate(&transfer_stream_);
-            if (stream_err != cudaSuccess) {
-                return fail_with_message(
-                    "Chunk " + std::to_string(chunk_id) + ": failed to recreate transfer stream (" +
-                    std::string(cudaGetErrorString(stream_err)) + ")"
-                );
-            }
-        }
-    }
-
-    cudaEvent_t input_ready_event = nullptr;
-    cudaError_t cuda_err = cudaEventCreateWithFlags(&input_ready_event, cudaEventDisableTiming);
-    if (cuda_err != cudaSuccess) {
-        release_buffer();
-        return fail_with_message(
-            "Chunk " + std::to_string(chunk_id) + ": cudaEventCreate failed (" +
-            cudaGetErrorString(cuda_err) + ")"
-        );
-    }
-
-    auto current_stream = c10::cuda::getCurrentCUDAStream(device_id_);
-    cuda_err = cudaEventRecord(input_ready_event, current_stream.stream());
-    if (cuda_err != cudaSuccess) {
-        cudaEventDestroy(input_ready_event);
-        release_buffer();
-        return fail_with_message(
-            "Chunk " + std::to_string(chunk_id) + ": cudaEventRecord failed (" +
-            cudaGetErrorString(cuda_err) + ")"
-        );
-    }
-    cuda_err = cudaStreamWaitEvent(transfer_stream_, input_ready_event, 0);
-    cudaEventDestroy(input_ready_event);
-    if (cuda_err != cudaSuccess) {
-        release_buffer();
-        return fail_with_message(
-            "Chunk " + std::to_string(chunk_id) + ": cudaStreamWaitEvent failed (" +
-            cudaGetErrorString(cuda_err) + ")"
-        );
-    }
-
-    // ✅ 直接获取目标位置（keys_buffer_ 已是 pinned memory，支持高速 DMA）
-    // ✅ 计算按 head 的行跨度，使用 cudaMemcpy2DAsync 实现单次批量拷贝
-    size_t element_size = keys_squeezed.element_size();  // 2 for FP16/BF16, 4 for FP32
-    size_t row_bytes = static_cast<size_t>(chunk_len) * dim_ * element_size;
-    size_t dst_pitch = static_cast<size_t>(chunk_buffer_capacity_) * dim_ * element_size;
-    size_t keys_src_pitch = static_cast<size_t>(keys_squeezed.stride(0)) * element_size;
-    size_t values_src_pitch = static_cast<size_t>(values_squeezed.stride(0)) * element_size;
-
-    char* keys_dst_base = static_cast<char*>(chunk_keys_pool_[buffer_index].data_ptr());
-    char* values_dst_base = static_cast<char*>(chunk_values_pool_[buffer_index].data_ptr());
-    const char* keys_src_base = static_cast<const char*>(keys_squeezed.data_ptr());
-    const char* values_src_base = static_cast<const char*>(values_squeezed.data_ptr());
-
-    // 🚀 单次拷贝：使用2D拷贝同时复制所有 heads
-    cudaMemcpy2DAsync(
-        keys_dst_base,
-        dst_pitch,
-        keys_src_base,
-        keys_src_pitch,
-        row_bytes,
-        kv_heads_,
-        cudaMemcpyDeviceToHost,
-        transfer_stream_
-    );
-    cudaMemcpy2DAsync(
-        values_dst_base,
-        dst_pitch,
-        values_src_base,
-        values_src_pitch,
-        row_bytes,
-        kv_heads_,
-        cudaMemcpyDeviceToHost,
-        transfer_stream_
-    );
-
-    // ✅ 检查 CUDA 错误
-    cuda_err = cudaGetLastError();
-    if (cuda_err != cudaSuccess) {
-        release_buffer();
-        return fail_with_message(
-            "Chunk " + std::to_string(chunk_id) + ": cudaMemcpyAsync failed (" +
-            cudaGetErrorString(cuda_err) + ")"
-        );
-    }
-
-    if (is_last) {
-        total_chunks_.store(chunk_id + 1, std::memory_order_release);
-        last_chunk_seen_ = true;
-    }
-
-    cudaEvent_t ready_event = nullptr;
-    cuda_err = cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming);
-    if (cuda_err != cudaSuccess) {
-        release_buffer();
-        return fail_with_message(
-            "Chunk " + std::to_string(chunk_id) + ": cudaEventCreate failed (" +
-            cudaGetErrorString(cuda_err) + ")"
-        );
-    }
-    cuda_err = cudaEventRecord(ready_event, transfer_stream_);
-    if (cuda_err != cudaSuccess) {
-        cudaEventDestroy(ready_event);
-        release_buffer();
-        return fail_with_message(
-            "Chunk " + std::to_string(chunk_id) + ": cudaEventRecord failed (" +
-            cudaGetErrorString(cuda_err) + ")"
-        );
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(chunk_queue_mutex_);
-        pending_chunks_.push_back(ChunkTransfer{
-            .chunk_id = chunk_id,
-            .start_token = start_token,
-            .chunk_len = chunk_len,
-            .is_last = is_last,
-            .buffer_index = buffer_index,
-            .ready_event = ready_event,
-            .keys_src = keys_squeezed,
-            .values_src = values_squeezed,
-        });
-    }
-    buffer_acquired = false;
-    chunk_queue_cv_.notify_one();
-
-    return true;
-}
-
 bool LayerPipeline::submit_raw_sequence_chunk(
     torch::Tensor keys_gpu,
     torch::Tensor values_gpu,
     int chunk_id,
+    int source_token,
+    int start_token,
+    int chunk_len,
+    bool is_last
+) {
+    return submit_raw_sequence_batch_chunk(
+        keys_gpu,
+        values_gpu,
+        chunk_id,
+        0,
+        source_token,
+        start_token,
+        chunk_len,
+        is_last
+    );
+}
+
+bool LayerPipeline::submit_raw_sequence_batch_chunk(
+    torch::Tensor keys_gpu,
+    torch::Tensor values_gpu,
+    int chunk_id,
+    int start_bdx,
     int source_token,
     int start_token,
     int chunk_len,
@@ -1083,20 +869,25 @@ bool LayerPipeline::submit_raw_sequence_chunk(
         return fail_with_message("Raw sequence chunk requires CUDA tensors.");
     }
     if (keys_gpu.dim() != 4 || values_gpu.dim() != 4) {
-        return fail_with_message("Raw sequence chunk tensors must be [1, seq_len, kv_heads, dim].");
+        return fail_with_message("Raw sequence chunk tensors must be [bsz, seq_len, kv_heads, dim].");
     }
     for (int dim_idx = 0; dim_idx < keys_gpu.dim(); ++dim_idx) {
         if (keys_gpu.size(dim_idx) != values_gpu.size(dim_idx)) {
             return fail_with_message("Raw sequence keys/values shape mismatch.");
         }
     }
-    if (keys_gpu.size(0) != 1 || keys_gpu.size(2) != kv_heads_ || keys_gpu.size(3) != dim_) {
+    int submit_bsz = static_cast<int>(keys_gpu.size(0));
+    int seq_len = static_cast<int>(keys_gpu.size(1));
+    if (submit_bsz <= 0 || start_bdx < 0 || start_bdx + submit_bsz > batch_size_) {
+        return fail_with_message("Raw sequence batch range is invalid.");
+    }
+    if (keys_gpu.size(2) != kv_heads_ || keys_gpu.size(3) != dim_) {
         return fail_with_message("Raw sequence chunk shape mismatch.");
     }
     if (keys_gpu.dtype() != kv_dtype_ || values_gpu.dtype() != kv_dtype_) {
         return fail_with_message("Raw sequence dtype mismatch.");
     }
-    if (chunk_len <= 0 || source_token < 0 || source_token + chunk_len > keys_gpu.size(1)) {
+    if (chunk_len <= 0 || source_token < 0 || source_token + chunk_len > seq_len) {
         return fail_with_message("Raw sequence source token range is invalid.");
     }
     if (start_token < 0 || start_token + chunk_len > total_middle_tokens_) {
@@ -1160,18 +951,130 @@ bool LayerPipeline::submit_raw_sequence_chunk(
     const size_t element_size = keys_gpu.element_size();
     const size_t keys_src_seq_pitch = static_cast<size_t>(keys_gpu.stride(1)) * element_size;
     const size_t values_src_seq_pitch = static_cast<size_t>(values_gpu.stride(1)) * element_size;
+    const size_t src_batch_pitch = static_cast<size_t>(keys_gpu.stride(0)) * element_size;
+    const char* keys_src_tensor = static_cast<const char*>(keys_gpu.data_ptr());
+    const char* values_src_tensor = static_cast<const char*>(values_gpu.data_ptr());
     const bool sequence_major_contiguous =
         keys_gpu.stride(3) == 1 &&
         values_gpu.stride(3) == 1 &&
         keys_gpu.stride(2) == dim_ &&
         values_gpu.stride(2) == dim_ &&
         keys_gpu.stride(1) == kv_heads_ * dim_ &&
-        values_gpu.stride(1) == kv_heads_ * dim_;
+        values_gpu.stride(1) == kv_heads_ * dim_ &&
+        keys_gpu.stride(0) == seq_len * kv_heads_ * dim_ &&
+        values_gpu.stride(0) == seq_len * kv_heads_ * dim_;
     if (!sequence_major_contiguous) {
         return fail_with_message(
-            "Raw sequence bulk D2H requires contiguous [1, seq_len, kv_heads, dim] layout; "
+            "Raw sequence bulk D2H requires contiguous [bsz, seq_len, kv_heads, dim] layout; "
             "strided 2D D2H fallback is disabled."
         );
+    }
+
+    if (runtime_config_.learned_partition_enabled && sequence_major_cpu_ready_) {
+        if (!keys_sequence_cpu_.defined() || !values_sequence_cpu_.defined()) {
+            return fail_with_message("Sequence-major CPU raw buffers are not allocated");
+        }
+        if (keys_sequence_cpu_.size(0) < start_token + chunk_len ||
+            values_sequence_cpu_.size(0) < start_token + chunk_len ||
+            keys_sequence_cpu_.size(1) != row_count_ ||
+            values_sequence_cpu_.size(1) != row_count_) {
+            return fail_with_message("Sequence-major CPU raw buffer shape mismatch");
+        }
+
+        const size_t dst_row_pitch =
+            static_cast<size_t>(row_count_) * static_cast<size_t>(dim_) * element_size;
+        const size_t row_width =
+            static_cast<size_t>(kv_heads_) * static_cast<size_t>(dim_) * element_size;
+        char* keys_seq_base = static_cast<char*>(keys_sequence_cpu_.data_ptr());
+        char* values_seq_base = static_cast<char*>(values_sequence_cpu_.data_ptr());
+
+        for (int local_bdx = 0; local_bdx < submit_bsz; ++local_bdx) {
+            const int global_bdx = start_bdx + local_bdx;
+            const size_t dst_offset =
+                (static_cast<size_t>(start_token) * static_cast<size_t>(row_count_) +
+                 static_cast<size_t>(global_bdx) * static_cast<size_t>(kv_heads_)) *
+                static_cast<size_t>(dim_) * element_size;
+            const char* keys_src_base = keys_src_tensor
+                + static_cast<size_t>(local_bdx) * src_batch_pitch
+                + static_cast<size_t>(source_token) * keys_src_seq_pitch;
+            const char* values_src_base = values_src_tensor
+                + static_cast<size_t>(local_bdx) * src_batch_pitch
+                + static_cast<size_t>(source_token) * values_src_seq_pitch;
+
+            cudaMemcpy2DAsync(
+                keys_seq_base + dst_offset,
+                dst_row_pitch,
+                keys_src_base,
+                keys_src_seq_pitch,
+                row_width,
+                static_cast<size_t>(chunk_len),
+                cudaMemcpyDeviceToHost,
+                transfer_stream_
+            );
+            cudaMemcpy2DAsync(
+                values_seq_base + dst_offset,
+                dst_row_pitch,
+                values_src_base,
+                values_src_seq_pitch,
+                row_width,
+                static_cast<size_t>(chunk_len),
+                cudaMemcpyDeviceToHost,
+                transfer_stream_
+            );
+        }
+
+        cuda_err = cudaGetLastError();
+        if (cuda_err != cudaSuccess) {
+            return fail_with_message(
+                "Chunk " + std::to_string(chunk_id) + ": sequence-major raw cudaMemcpy2DAsync failed (" +
+                cudaGetErrorString(cuda_err) + ")"
+            );
+        }
+
+        if (is_last) {
+            total_chunks_.store(chunk_id + 1, std::memory_order_release);
+            last_chunk_seen_ = true;
+        }
+
+        cudaEvent_t ready_event = nullptr;
+        cuda_err = cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming);
+        if (cuda_err != cudaSuccess) {
+            return fail_with_message(
+                "Chunk " + std::to_string(chunk_id) + ": cudaEventCreate failed (" +
+                cudaGetErrorString(cuda_err) + ")"
+            );
+        }
+        cuda_err = cudaEventRecord(ready_event, transfer_stream_);
+        if (cuda_err != cudaSuccess) {
+            cudaEventDestroy(ready_event);
+            return fail_with_message(
+                "Chunk " + std::to_string(chunk_id) + ": cudaEventRecord failed (" +
+                cudaGetErrorString(cuda_err) + ")"
+            );
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(chunk_queue_mutex_);
+            pending_chunks_.push_back(ChunkTransfer{
+                .chunk_id = chunk_id,
+                .start_token = start_token,
+                .chunk_len = chunk_len,
+                .start_bdx = start_bdx,
+                .batch_size = submit_bsz,
+                .is_last = is_last,
+                .buffer_index = 0,
+                .direct_to_final = true,
+                .sequence_major_staging = false,
+                .batch_sequence_major_staging = false,
+                .ready_event = ready_event,
+                .keys_src = keys_gpu,
+                .values_src = values_gpu,
+                .keys_seq_cpu = keys_sequence_cpu_,
+                .values_seq_cpu = values_sequence_cpu_,
+            });
+        }
+        chunk_queue_cv_.notify_one();
+        return true;
     }
 
     if (chunk_len > chunk_buffer_capacity_) {
@@ -1235,24 +1138,36 @@ bool LayerPipeline::submit_raw_sequence_chunk(
     }
 
     const size_t copy_bytes = static_cast<size_t>(chunk_len) * kv_heads_ * dim_ * element_size;
-    const char* keys_src_base = static_cast<const char*>(keys_gpu.data_ptr())
-        + static_cast<size_t>(source_token) * keys_src_seq_pitch;
-    const char* values_src_base = static_cast<const char*>(values_gpu.data_ptr())
-        + static_cast<size_t>(source_token) * values_src_seq_pitch;
-    cudaMemcpyAsync(
-        chunk_keys_pool_[buffer_index].data_ptr(),
-        keys_src_base,
-        copy_bytes,
-        cudaMemcpyDeviceToHost,
-        transfer_stream_
-    );
-    cudaMemcpyAsync(
-        chunk_values_pool_[buffer_index].data_ptr(),
-        values_src_base,
-        copy_bytes,
-        cudaMemcpyDeviceToHost,
-        transfer_stream_
-    );
+    const size_t keys_dst_batch_pitch =
+        static_cast<size_t>(chunk_keys_pool_[buffer_index].stride(0)) * element_size;
+    const size_t values_dst_batch_pitch =
+        static_cast<size_t>(chunk_values_pool_[buffer_index].stride(0)) * element_size;
+    char* keys_dst_tensor = static_cast<char*>(chunk_keys_pool_[buffer_index].data_ptr());
+    char* values_dst_tensor = static_cast<char*>(chunk_values_pool_[buffer_index].data_ptr());
+    for (int local_bdx = 0; local_bdx < submit_bsz; ++local_bdx) {
+        const char* keys_src_base = keys_src_tensor
+            + static_cast<size_t>(local_bdx) * src_batch_pitch
+            + static_cast<size_t>(source_token) * keys_src_seq_pitch;
+        const char* values_src_base = values_src_tensor
+            + static_cast<size_t>(local_bdx) * src_batch_pitch
+            + static_cast<size_t>(source_token) * values_src_seq_pitch;
+        char* keys_dst_base = keys_dst_tensor + static_cast<size_t>(local_bdx) * keys_dst_batch_pitch;
+        char* values_dst_base = values_dst_tensor + static_cast<size_t>(local_bdx) * values_dst_batch_pitch;
+        cudaMemcpyAsync(
+            keys_dst_base,
+            keys_src_base,
+            copy_bytes,
+            cudaMemcpyDeviceToHost,
+            transfer_stream_
+        );
+        cudaMemcpyAsync(
+            values_dst_base,
+            values_src_base,
+            copy_bytes,
+            cudaMemcpyDeviceToHost,
+            transfer_stream_
+        );
+    }
 
     cuda_err = cudaGetLastError();
     if (cuda_err != cudaSuccess) {
@@ -1293,10 +1208,13 @@ bool LayerPipeline::submit_raw_sequence_chunk(
             .chunk_id = chunk_id,
             .start_token = start_token,
             .chunk_len = chunk_len,
+            .start_bdx = start_bdx,
+            .batch_size = submit_bsz,
             .is_last = is_last,
             .buffer_index = buffer_index,
             .direct_to_final = false,
-            .sequence_major_staging = true,
+            .sequence_major_staging = submit_bsz == 1 && batch_size_ == 1 && start_bdx == 0,
+            .batch_sequence_major_staging = !(submit_bsz == 1 && batch_size_ == 1 && start_bdx == 0),
             .ready_event = ready_event,
             .keys_src = keys_gpu,
             .values_src = values_gpu,
@@ -1484,12 +1402,35 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
 
 
     // ════════════════════════════════════════════════════════════════════
-    // 步骤2：获取完整KV数据（已在keys_buffer_/values_buffer_中）
+    // 步骤2：获取完整KV数据。learned/hybrid CPU path uses the
+    // sequence-major raw buffer written directly by D2H.
     // ════════════════════════════════════════════════════════════════════
     torch::Tensor keys_full;
     torch::Tensor values_full;
-    const bool use_sequence_major_source = false;
-    if (total_tokens == total_middle_tokens_) {
+    const bool use_sequence_major_source =
+        runtime_config_.learned_partition_enabled && sequence_major_cpu_ready_;
+    if (use_sequence_major_source) {
+        if (!keys_sequence_cpu_.defined() || !values_sequence_cpu_.defined()) {
+            mark_failure("Sequence-major raw CPU buffers are missing");
+            return false;
+        }
+        if (total_tokens == total_middle_tokens_) {
+            keys_full = keys_sequence_cpu_;
+            values_full = values_sequence_cpu_;
+        } else {
+            keys_full = keys_sequence_cpu_.index({
+                torch::indexing::Slice(0, total_tokens),
+                torch::indexing::Slice(),
+                torch::indexing::Slice()
+            });  // [total_tokens, rows, dim]
+
+            values_full = values_sequence_cpu_.index({
+                torch::indexing::Slice(0, total_tokens),
+                torch::indexing::Slice(),
+                torch::indexing::Slice()
+            });  // [total_tokens, rows, dim]
+        }
+    } else if (total_tokens == total_middle_tokens_) {
         keys_full = keys_buffer_;
         values_full = values_buffer_;
     } else {
@@ -1497,13 +1438,13 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
             torch::indexing::Slice(),
             torch::indexing::Slice(0, total_tokens),
             torch::indexing::Slice()
-        });  // [kv_heads, total_tokens, dim]
+        });  // [rows, total_tokens, dim]
 
         values_full = values_buffer_.index({
             torch::indexing::Slice(),
             torch::indexing::Slice(0, total_tokens),
             torch::indexing::Slice()
-        });  // [kv_heads, total_tokens, dim]
+        });  // [rows, total_tokens, dim]
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -1511,52 +1452,26 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
     // ════════════════════════════════════════════════════════════════════
     stage_.store(PipelineStage::Clustering);
 
-    // ✅ 自动计算k1/k2（基于完整数据）
-    int k1 = 0;
-    int k2 = 0;
-    int k3 = 0;
-    int k4 = 0;
-    int k_ivf = 0;
     std::vector<int32_t> learned_k_values;
-    const bool has_k12 = runtime_config_.kmeans_k1 > 0 && runtime_config_.kmeans_k2 > 0;
-    const bool has_k34 = runtime_config_.kmeans_k3 > 0 && runtime_config_.kmeans_k4 > 0;
     const int target_cluster_size = runtime_config_.kmeans_target_cluster_size > 0
         ? runtime_config_.kmeans_target_cluster_size
         : 16;
-    if (runtime_config_.learned_partition_enabled) {
-        const int M = runtime_config_.learned_subspace_parts > 0
-            ? runtime_config_.learned_subspace_parts
-            : subspace_parts_;
-        if (!runtime_config_.learned_k_values.empty()) {
-            learned_k_values = runtime_config_.learned_k_values;
-        } else {
-            learned_k_values = calculate_learned_k_values(total_tokens, target_cluster_size, M);
-        }
-        if (static_cast<int>(learned_k_values.size()) != M) {
-            mark_failure("learned partition k_values length does not match M");
-            return false;
-        }
-    } else if (subspace_parts_ == 0) {
-        if (runtime_config_.kmeans_k1 > 0) {
-            k_ivf = runtime_config_.kmeans_k1;
-        } else {
-            auto ks = calculate_adaptive_k_values(total_tokens, target_cluster_size, subspace_parts_);
-            k_ivf = ks.k_ivf;
-        }
-    } else if (subspace_parts_ == 4 && has_k12 && has_k34) {
-        k1 = runtime_config_.kmeans_k1;
-        k2 = runtime_config_.kmeans_k2;
-        k3 = runtime_config_.kmeans_k3;
-        k4 = runtime_config_.kmeans_k4;
-    } else if (subspace_parts_ == 2 && has_k12) {
-        k1 = runtime_config_.kmeans_k1;
-        k2 = runtime_config_.kmeans_k2;
+
+    const int M = runtime_config_.learned_subspace_parts > 0
+        ? runtime_config_.learned_subspace_parts
+        : subspace_parts_;
+    if (M != 8) {
+        mark_failure("hybrid_8way_v2 CPU K-means requires M=8");
+        return false;
+    }
+    if (!runtime_config_.learned_k_values.empty()) {
+        learned_k_values = runtime_config_.learned_k_values;
     } else {
-        auto ks = calculate_adaptive_k_values(total_tokens, target_cluster_size, subspace_parts_);
-        k1 = ks.k1;
-        k2 = ks.k2;
-        k3 = ks.k3;
-        k4 = ks.k4;
+        learned_k_values = calculate_learned_k_values(total_tokens, target_cluster_size, M);
+    }
+    if (static_cast<int>(learned_k_values.size()) != M) {
+        mark_failure("learned partition k_values length does not match M");
+        return false;
     }
     // 确保keys_full连续性
     if (!keys_full.is_contiguous()) {
@@ -1568,65 +1483,30 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
 
     // 获取16-bit数据指针
     const void* keys_16bit = keys_full.data_ptr();
-    int dim_half = dim_ / 2;
-    int dim_quarter = dim_ / 4;
-
-
-
     auto kmeans_start = std::chrono::steady_clock::now();
     const double kmeans_cpu_start_ms = get_process_cpu_time_ms();
-    std::unique_ptr<KmeansResult> kmeans_result;
-    if (runtime_config_.learned_partition_enabled) {
-        kmeans_result = kmeans_execute_m(
-            keys_16bit,
-            kv_heads_,
-            total_tokens,
-            dim_,
-            learned_k_values,
-            runtime_config_.learned_head_pair_groups,
-            kv_dtype_,
-            worker_threads_,
-            runtime_config_,
-            false
-        );
-    } else if (subspace_parts_ == 0) {
-        kmeans_result = kmeans_execute_ivf(
-            keys_16bit,
-            kv_heads_,
-            total_tokens,
-            dim_,
-            k_ivf,
-            kv_dtype_,
-            worker_threads_,
-            runtime_config_
-        );
-    } else if (subspace_parts_ == 4) {
-        kmeans_result = kmeans_execute_4(
-            keys_16bit,
-            kv_heads_,
-            total_tokens,
-            dim_,
-            k1,
-            k2,
-            k3,
-            k4,
-            kv_dtype_,
-            worker_threads_,
-            runtime_config_
-        );
+    std::vector<std::vector<std::vector<int32_t>>> row_pair_groups;
+    const int row_count = row_count_ > 0 ? row_count_ : kv_heads_;
+    if (row_count <= kv_heads_) {
+        row_pair_groups = runtime_config_.learned_head_pair_groups;
     } else {
-        kmeans_result = kmeans_execute(
-            keys_16bit,
-            kv_heads_,
-            total_tokens,
-            dim_,
-            k1,
-            k2,
-            kv_dtype_,
-            worker_threads_,
-            runtime_config_
-        );
+        row_pair_groups.reserve(static_cast<size_t>(row_count));
+        for (int row = 0; row < row_count; ++row) {
+            row_pair_groups.push_back(runtime_config_.learned_head_pair_groups[row % kv_heads_]);
+        }
     }
+    std::unique_ptr<KmeansResult> kmeans_result = kmeans_execute_m(
+        keys_16bit,
+        row_count,
+        total_tokens,
+        dim_,
+        learned_k_values,
+        row_pair_groups,
+        kv_dtype_,
+        worker_threads_,
+        runtime_config_,
+        use_sequence_major_source
+    );
     auto kmeans_end = std::chrono::steady_clock::now();
     const double kmeans_cpu_end_ms = get_process_cpu_time_ms();
     {
@@ -1645,16 +1525,7 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
     if (!kmeans_result) {
         std::cerr << "❌ [MergeWorker] Layer " << layer_idx_
                   << ": kmeans_execute returned null (tokens=" << total_tokens;
-        if (subspace_parts_ == 0) {
-            std::cerr << ", k=" << k_ivf;
-        } else if (runtime_config_.learned_partition_enabled) {
-            std::cerr << ", learned_M=" << subspace_parts_;
-        } else {
-            std::cerr << ", k1=" << k1 << ", k2=" << k2;
-            if (subspace_parts_ == 4) {
-                std::cerr << ", k3=" << k3 << ", k4=" << k4;
-            }
-        }
+        std::cerr << ", learned_M=" << subspace_parts_;
         std::cerr
                   << ", worker_threads=" << worker_threads_ << ")!\n";
         mark_failure("Global K-means failed");
@@ -1677,63 +1548,29 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
     stage_.store(PipelineStage::Reorganizing);
 
     auto reorganize_start = std::chrono::steady_clock::now();
-    if (runtime_config_.learned_partition_enabled) {
-        reorganize_from_kmeans_m(
-            keys_full,
-            values_full,
-            *kmeans_result,
-            runtime_config_.learned_head_pair_groups,
-            total_tokens,
-            reorganize_results_,
-            merged_centroids_,
-            output_buffers,
-            false
-        );
-    } else if (subspace_parts_ == 0) {
-        reorganize_from_kmeans_ivf(
-            keys_full,
-            values_full,
-            *kmeans_result,
-            total_tokens,
-            reorganize_results_,
-            merged_centroids_,
-            output_buffers
-        );
-    } else if (subspace_parts_ == 4) {
-        reorganize_from_kmeans_4(
-            keys_full,
-            values_full,
-            *kmeans_result,
-            total_tokens,
-            dim_quarter,
-            reorganize_results_,
-            merged_centroids_,
-            output_buffers
-        );
-    } else {
-        reorganize_from_kmeans(
-            keys_full,
-            values_full,
-            *kmeans_result,
-            total_tokens,
-            dim_half,
-            reorganize_results_,
-            merged_centroids_,
-            output_buffers
-        );
-    }
+    reorganize_from_kmeans_m(
+        keys_full,
+        values_full,
+        *kmeans_result,
+        row_pair_groups,
+        total_tokens,
+        reorganize_results_,
+        merged_centroids_,
+        output_buffers,
+        use_sequence_major_source
+    );
 
     kmeans_result_ = std::move(kmeans_result);
     if (kmeans_result_) {
         // Unified outputs for Python API
         kmeans_result_->per_head_centroids.clear();
-        kmeans_result_->per_head_centroids.resize(kv_heads_);
+        kmeans_result_->per_head_centroids.resize(row_count);
 
         // NOTE: per_head_labels is not currently populated here.
         // If needed, it should come from the kmeans stage outputs (before reorg),
         // not reconstructed from the reorganized layout.
 
-        for (int32_t head = 0; head < kv_heads_; ++head) {
+        for (int32_t head = 0; head < row_count; ++head) {
             if (head >= static_cast<int32_t>(merged_centroids_.size())) {
                 continue;
             }
@@ -1768,7 +1605,10 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
     // ════════════════════════════════════════════════════════════════════
     // 步骤5：设置 keys_cpu_ 和 values_cpu_
     // ════════════════════════════════════════════════════════════════════
-    if (total_tokens == total_middle_tokens_) {
+    if (use_sequence_major_source) {
+        keys_cpu_ = torch::Tensor();
+        values_cpu_ = torch::Tensor();
+    } else if (total_tokens == total_middle_tokens_) {
         keys_cpu_ = keys_buffer_;
         values_cpu_ = values_buffer_;
     } else {

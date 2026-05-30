@@ -209,10 +209,6 @@ LayerPipelineRuntimeConfig runtime_config_from_python(const py::object& runtime_
         "cluster_size",
         cfg.kmeans_target_cluster_size
     );
-    cfg.kmeans_k1 = py_dict_get_i32(kmeans, "k1", cfg.kmeans_k1);
-    cfg.kmeans_k2 = py_dict_get_i32(kmeans, "k2", cfg.kmeans_k2);
-    cfg.kmeans_k3 = py_dict_get_i32(kmeans, "k3", cfg.kmeans_k3);
-    cfg.kmeans_k4 = py_dict_get_i32(kmeans, "k4", cfg.kmeans_k4);
     cfg.defer_merge_until_wait = py_obj_to_bool(
         py_dict_get_value(pipeline, "defer_merge_until_wait"),
         cfg.defer_merge_until_wait
@@ -256,9 +252,6 @@ py::dict kmeans_result_to_dict(const KmeansResult* result) {
     d["kv_heads"] = result->kv_heads;
     d["n_tokens"] = result->n_tokens;
     d["dim"] = result->dim;
-    d["k1"] = result->k1;  // Deprecated (set to 0)
-    d["k2"] = result->k2;  // Deprecated (set to 0)
-
     // ✅ 【架构统一】转换合并后的labels
     py::list per_head_labels_list;
     for (const auto& labels : result->per_head_labels) {
@@ -483,10 +476,14 @@ py::dict metadata_result_to_dict(LayerPipeline& pipeline) {
                     }
                 }
 
-                if (head < static_cast<int64_t>(pair_groups.size()) &&
-                    m < static_cast<int64_t>(pair_groups[head].size())) {
+                int64_t partition_head = head;
+                if (!pair_groups.empty()) {
+                    partition_head = head % static_cast<int64_t>(pair_groups.size());
+                }
+                if (partition_head < static_cast<int64_t>(pair_groups.size()) &&
+                    m < static_cast<int64_t>(pair_groups[partition_head].size())) {
                     int64_t offset = 0;
-                    for (int32_t pair : pair_groups[head][m]) {
+                    for (int32_t pair : pair_groups[partition_head][m]) {
                         dim_ids_ptr[(head * M + m) * max_sub_dim + offset] = pair;
                         dim_masks_ptr[(head * M + m) * max_sub_dim + offset] = false;
                         ++offset;
@@ -581,7 +578,7 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
              py::arg("kv_dtype") = py::none(),
              py::arg("cache_manager_ptr") = nullptr,
              py::arg("enable_direct_write") = true,
-             py::arg("subspace_parts") = 2,
+             py::arg("subspace_parts") = 8,
              py::arg("runtime_config") = py::none(),
              R"pbdoc(
                 Create a LayerPipeline instance.
@@ -595,7 +592,7 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                     kv_dtype: torch dtype for KV tensors (torch.float16 or torch.bfloat16)
                     cache_manager_ptr: Optional pointer to cache manager (not used yet)
                     enable_direct_write: Enable C++ direct CPU buffer write (default: True)
-                    subspace_parts: Number of subspaces for K-means (2 or 4)
+                    subspace_parts: Learned partition subspace count. hybrid_8way_v2 requires 8.
 
                 Returns:
                     LayerPipeline instance with allocated pinned memory and CUDA resources
@@ -619,47 +616,28 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                     chunk_size: Python-side chunk_size (for capacity validation)
 
                 Note:
-                    k1, k2 are auto-calculated by C++ based on actual chunk_len
+                    k_values are read from learned_partition or derived for learned 8-way.
 
                 Returns:
                     True if successful
              )pbdoc")
 
-
-        .def("submit_chunk",
-            [](LayerPipeline& self,
-               torch::Tensor keys,
-               torch::Tensor values,
-               int chunk_id,
-               int start_token,
-               bool is_last) {
-                // ✅ Release GIL for true parallelism
+        .def("start_chunk_pipeline_batch",
+            [](LayerPipeline& self, const std::vector<int32_t>& token_counts, int chunk_size) {
                 py::gil_scoped_release release;
-                return self.submit_chunk(keys, values, chunk_id, start_token, is_last);
+                return self.start_chunk_pipeline_batch(token_counts, chunk_size);
             },
-            py::arg("keys"),
-            py::arg("values"),
-            py::arg("chunk_id"),
-            py::arg("start_token"),
-            py::arg("is_last"),
+            py::arg("token_counts"),
+            py::arg("chunk_size"),
             R"pbdoc(
-                Submit a single chunk (returns after GPU→CPU transfer is queued).
+                Initialize batch chunk pipeline.
 
                 Args:
-                    keys: [1, kv_heads, chunk_len, dim] GPU tensor (torch.float16 or torch.bfloat16)
-                    values: [1, kv_heads, chunk_len, dim] GPU tensor (same dtype as keys)
-                    chunk_id: Chunk ID (0-based, must be consecutive)
-                    start_token: Chunk start position in middle region (global offset)
-                    is_last: Whether this is the last chunk
+                    token_counts: middle-token count for each batch row.
+                    chunk_size: Python-side chunk size for bounded staging buffers.
 
                 Returns:
-                    True if successful, False if failed (e.g., chunk too large)
-
-                Note:
-                    - GPU→CPU transfer runs on independent transfer_stream_
-                    - Transfer may still be in-flight when this call returns
-                     - Python side does NOT need to keep references to GPU tensors
-                     - C++ chunk worker will wait for transfer to complete
+                    True if successful.
              )pbdoc")
 
         .def("submit_raw_sequence_chunk",
@@ -695,7 +673,41 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                 The pipeline copies directly from the original sequence layout
                 to pinned CPU staging on its transfer stream. It does not
                 require Python to transpose or materialize a GPU-contiguous
-                [kv_heads, chunk_len, dim] buffer.
+                [kv_heads, chunk_len, dim] buffer for single-batch compatibility.
+             )pbdoc")
+
+        .def("submit_raw_sequence_batch_chunk",
+            [](LayerPipeline& self,
+               torch::Tensor keys,
+               torch::Tensor values,
+               int chunk_id,
+               int start_bdx,
+               int source_token,
+               int start_token,
+               int chunk_len,
+               bool is_last) {
+                py::gil_scoped_release release;
+                return self.submit_raw_sequence_batch_chunk(
+                    keys,
+                    values,
+                    chunk_id,
+                    start_bdx,
+                    source_token,
+                    start_token,
+                    chunk_len,
+                    is_last
+                );
+            },
+            py::arg("keys"),
+            py::arg("values"),
+            py::arg("chunk_id"),
+            py::arg("start_bdx"),
+            py::arg("source_token"),
+            py::arg("start_token"),
+            py::arg("chunk_len"),
+            py::arg("is_last"),
+            R"pbdoc(
+                Submit one raw-layout chunk from [bsz, seq_len, kv_heads, dim].
              )pbdoc")
 
         .def("set_worker_threads",
@@ -803,17 +815,17 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
 
                 Returns:
                     Dictionary with CPU tensors:
-                      - 'head_indices': int64 [kv_heads]
-                      - 'cluster_counts': int32 [kv_heads]
-                      - 'cluster_sizes': int32 [kv_heads, max_clusters]
-                      - 'cluster_offsets': int32 [kv_heads, max_clusters + 1]
-                      - 'centroids': float32 [kv_heads, max_clusters, dim]
-                      - 'token_ids_by_cluster': int32 [kv_heads, n_tokens]
-                      - 'compact_codes': int32 [kv_heads, max_clusters, subspace_parts]
-                      - 'subspace_centroids': float32 [kv_heads, subspace_parts, max_k, max_sub_dim] when learned partition is enabled
-                      - 'subspace_centroid_masks': bool [kv_heads, subspace_parts, max_k] when learned partition is enabled
-                      - 'subspace_dim_ids': int64 [kv_heads, subspace_parts, max_sub_dim] when learned partition is enabled
-                      - 'subspace_dim_masks': bool [kv_heads, subspace_parts, max_sub_dim] when learned partition is enabled
+                      - 'head_indices': int64 [rows]
+                      - 'cluster_counts': int32 [rows]
+                      - 'cluster_sizes': int32 [rows, max_clusters]
+                      - 'cluster_offsets': int32 [rows, max_clusters + 1]
+                      - 'centroids': float32 [rows, max_clusters, dim]
+                      - 'token_ids_by_cluster': int32 [rows, n_tokens]
+                      - 'compact_codes': int32 [rows, max_clusters, subspace_parts]
+                      - 'subspace_centroids': float32 [rows, subspace_parts, max_k, max_sub_dim]
+                      - 'subspace_centroid_masks': bool [rows, subspace_parts, max_k]
+                      - 'subspace_dim_ids': int64 [rows, subspace_parts, max_sub_dim]
+                      - 'subspace_dim_masks': bool [rows, subspace_parts, max_sub_dim]
             )pbdoc")
 
         .def("get_pipeline_stats",
@@ -860,7 +872,7 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                 Get original CPU keys (after transfer complete).
 
                 Returns:
-                    torch.Tensor [kv_heads, n_tokens, dim] CPU tensor (torch.float16/bfloat16)
+                    torch.Tensor [rows, n_tokens, dim] CPU tensor (torch.float16/bfloat16)
              )pbdoc")
 
         .def("get_values_cpu", &LayerPipeline::get_values_cpu,
@@ -868,11 +880,11 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                 Get original CPU values (after transfer complete).
 
                 Returns:
-                    torch.Tensor [kv_heads, n_tokens, dim] CPU tensor (torch.float16/bfloat16)
+                    torch.Tensor [rows, n_tokens, dim] CPU tensor (torch.float16/bfloat16)
              )pbdoc")
 
         // ════════════════════════════════════════════════════════════════════
-        // ✅ 【GIL优化】Set batch callbacks (8 heads in one call)
+        // Set batch callbacks for all row/head entries in one call.
         // ════════════════════════════════════════════════════════════════════
         .def("set_batch_allocate_cpu_buffer_callback",
             [](LayerPipeline& self, py::object callback) {
@@ -883,10 +895,10 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                         py::gil_scoped_acquire acquire;
 
                         try {
-                            // 转换heads_info为Python list
+                            // Convert row/head requests to a Python list.
                             py::list py_heads_info;
-                            for (const auto& [head_idx, required_tokens] : heads_info) {
-                                py_heads_info.append(py::make_tuple(head_idx, required_tokens));
+                            for (const auto& [row_idx, required_tokens] : heads_info) {
+                                py_heads_info.append(py::make_tuple(row_idx, required_tokens));
                             }
 
                             // Call Python: callback(layer_idx, heads_info)
@@ -901,7 +913,7 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
 
                                 CPUBufferDescriptor desc;
                                 desc.layer_idx = layer_idx;
-                                desc.head_idx = i;
+                                desc.head_idx = i < heads_info.size() ? heads_info[i].first : static_cast<int32_t>(i);
 
                                 torch::Tensor key_buffer = dict_item["key_buffer"].cast<torch::Tensor>();
                                 torch::Tensor value_buffer = dict_item["value_buffer"].cast<torch::Tensor>();
@@ -925,13 +937,13 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
             },
             py::arg("callback"),
             R"pbdoc(
-                Set batch callback for allocating CPU buffers (8 heads in one call).
+                Set batch callback for allocating CPU buffers (all row/head entries in one call).
 
                 Args:
                     callback: Python function with signature:
                               (layer_idx: int, heads_info: List[Tuple[int, int]]) -> List[dict]
 
-                              heads_info: [(head_idx, required_tokens), ...]
+                              heads_info: [(row_idx, required_tokens), ...]
                               Return: List of dicts, each containing:
                                 - 'key_buffer': torch.Tensor
                                 - 'value_buffer': torch.Tensor
@@ -987,7 +999,7 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
             },
             py::arg("callback"),
             R"pbdoc(
-                Set batch callback for metadata + centroids registration (8 heads in one call).
+                Set batch callback for metadata + centroids registration (all row/head entries in one call).
 
                 Args:
                     callback: Python function with signature:

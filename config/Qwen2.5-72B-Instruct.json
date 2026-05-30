@@ -8,7 +8,8 @@
       "cache_ratio": 0.05,
       "buffer_cluster_num": 32,
       "gpu_only": false,
-      "subspace_parts": 4,
+      "engine": "hybrid_8way_v2",
+      "subspace_parts": 8,
       "kmeans": {
         "max_iters": 5,
         "tol": 0.0005,
@@ -17,12 +18,7 @@
         "fp32_convert_chunk_elems": 1048576
       },
       "prefill": {
-        "prefill_chunk_size": 16384,
-        "enable_prefill_attn_chunk": true,
-        "streaming": {
-          "prefill_queue_depth": 8,
-          "prefill_stage_slots": 8
-        }
+        "prefill_chunk_size": 16384
       }
     }
 }

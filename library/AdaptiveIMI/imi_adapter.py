@@ -115,7 +115,7 @@ class IMIPipeline:
     dtype: torch.dtype
     device_id: int
     max_tokens: int
-    subspace_parts: int = 2
+    subspace_parts: int = 8
     runtime_config: IMIRuntimeConfig = field(default_factory=IMIRuntimeConfig)
     enable_direct_write: bool = True
     learned_partition: Optional[Dict[str, object]] = None
@@ -196,45 +196,6 @@ class IMIPipeline:
                 raise TimeoutError("IMI pipeline transfer did not finish in time")
             time.sleep(0.001)
 
-    def build_index(
-        self,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        list_keys: torch.Tensor,
-        list_values: torch.Tensor,
-    ) -> List[Dict[str, object]]:
-        self.start_index(keys, values)
-        return self.finish_index(list_keys, list_values)
-
-    def start_index(self, keys: torch.Tensor, values: torch.Tensor) -> None:
-        if keys.dim() != 4 or values.dim() != 4:
-            raise ValueError("keys/values must be [1, kv_heads, tokens, head_dim]")
-        if keys.size(0) != 1 or values.size(0) != 1:
-            raise ValueError("IMI pipeline supports batch_size=1")
-        if keys.size() != values.size():
-            raise ValueError("keys and values must share the same shape")
-        if keys.size(1) != self.kv_heads:
-            raise ValueError("kv_heads mismatch in IMI pipeline")
-
-        token_count = int(keys.size(2))
-        if token_count <= 0:
-            raise ValueError("IMI pipeline requires non-empty middle tokens")
-        if token_count > self.max_tokens:
-            raise ValueError(
-                f"token_count({token_count}) exceeds max_tokens({self.max_tokens})"
-            )
-
-        self.begin_index_stream(token_count, token_count)
-        self.submit_index_stream_chunk(
-            keys,
-            values,
-            chunk_id=0,
-            token_offset=0,
-            is_last=True,
-        )
-
-        self._token_count = token_count
-
     def begin_index_stream(self, token_count: int, submit_chunk_size: int) -> None:
         if token_count <= 0:
             raise ValueError("IMI pipeline requires non-empty middle tokens")
@@ -250,36 +211,23 @@ class IMIPipeline:
             raise RuntimeError("IMI pipeline failed to start")
         self._token_count = token_count
 
-    def submit_index_stream_chunk(
-        self,
-        chunk_keys: torch.Tensor,
-        chunk_values: torch.Tensor,
-        chunk_id: int,
-        token_offset: int,
-        is_last: bool,
-    ) -> None:
-        if chunk_keys.dim() != 4 or chunk_values.dim() != 4:
-            raise ValueError("chunk keys/values must be [1, kv_heads, tokens, head_dim]")
-        if chunk_keys.size(0) != 1 or chunk_values.size(0) != 1:
-            raise ValueError("IMI pipeline supports batch_size=1")
-        if chunk_keys.size() != chunk_values.size():
-            raise ValueError("chunk keys and values must share the same shape")
-        if chunk_keys.size(1) != self.kv_heads:
-            raise ValueError("kv_heads mismatch in IMI pipeline")
-        if chunk_id < 0:
-            raise ValueError("chunk_id must be non-negative")
-        if token_offset < 0:
-            raise ValueError("token_offset must be non-negative")
+    def begin_index_stream_batch(self, token_counts: torch.Tensor | list[int], submit_chunk_size: int) -> None:
+        counts = torch.as_tensor(token_counts, dtype=torch.int32, device="cpu").view(-1).contiguous()
+        if int(counts.numel()) <= 0:
+            raise ValueError("IMI batch pipeline requires non-empty token_counts")
+        if int(counts.min().item()) <= 0:
+            raise ValueError("IMI batch pipeline requires positive token_counts")
+        max_tokens = int(counts.max().item())
+        if max_tokens > self.max_tokens:
+            raise ValueError(f"token_count({max_tokens}) exceeds max_tokens({self.max_tokens})")
+        if submit_chunk_size <= 0:
+            raise ValueError("submit_chunk_size must be positive")
 
         pipeline = self._get_pipeline()
-        if not pipeline.submit_chunk(
-            chunk_keys,
-            chunk_values,
-            chunk_id,
-            token_offset,
-            is_last,
-        ):
-            raise RuntimeError("IMI pipeline failed to submit chunk")
+        if not pipeline.start_chunk_pipeline_batch(counts.tolist(), int(submit_chunk_size)):
+            raise RuntimeError("IMI batch pipeline failed to start")
+        self._token_count = max_tokens
+        self._batch_size = int(counts.numel())
 
     def submit_index_stream_raw_sequence_chunk(
         self,
@@ -316,6 +264,40 @@ class IMIPipeline:
         ):
             raise RuntimeError("IMI pipeline failed to submit raw sequence chunk")
 
+    def submit_index_stream_raw_sequence_batch_chunk(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        chunk_id: int,
+        start_bdx: int,
+        source_token: int,
+        token_offset: int,
+        chunk_len: int,
+        is_last: bool,
+    ) -> None:
+        if key_states.dim() != 4 or value_states.dim() != 4:
+            raise ValueError("raw key_states/value_states must be [bsz, seq_len, kv_heads, head_dim]")
+        if key_states.size() != value_states.size():
+            raise ValueError("raw key_states and value_states must share the same shape")
+        if key_states.size(2) != self.kv_heads:
+            raise ValueError("kv_heads mismatch in raw IMI batch pipeline chunk")
+        if source_token < 0 or chunk_len <= 0 or source_token + chunk_len > int(key_states.size(1)):
+            raise ValueError("invalid raw source token range")
+        if token_offset < 0:
+            raise ValueError("token_offset must be non-negative")
+
+        pipeline = self._get_pipeline()
+        if not pipeline.submit_raw_sequence_batch_chunk(
+            key_states,
+            value_states,
+            int(chunk_id),
+            int(start_bdx),
+            int(source_token),
+            int(token_offset),
+            int(chunk_len),
+            bool(is_last),
+        ):
+            raise RuntimeError("IMI batch pipeline failed to submit raw sequence chunk")
 
     def finish_index(
         self,
@@ -390,78 +372,6 @@ class IMIPipeline:
         if self._last_search_metadata_cpu is None:
             return None
         return dict(self._last_search_metadata_cpu)
-
-    def get_kmeans_result(self) -> Dict[str, object]:
-        pipeline = self._get_pipeline()
-        return dict(pipeline.get_kmeans_result())
-
-    def build_index_chunked(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        middle_start: int,
-        middle_end: int,
-        list_keys: torch.Tensor,
-        list_values: torch.Tensor,
-        chunk_size: int,
-    ) -> List[Dict[str, object]]:
-        self.start_index_chunked(
-            key_states,
-            value_states,
-            middle_start,
-            middle_end,
-            chunk_size,
-        )
-        return self.finish_index(list_keys, list_values)
-
-    def start_index_chunked(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        middle_start: int,
-        middle_end: int,
-        chunk_size: int,
-    ) -> None:
-        if key_states.dim() != 4 or value_states.dim() != 4:
-            raise ValueError("key_states/value_states must be [1, seq_len, kv_heads, head_dim]")
-        if key_states.size(0) != 1 or value_states.size(0) != 1:
-            raise ValueError("IMI pipeline supports batch_size=1")
-        if key_states.size() != value_states.size():
-            raise ValueError("key_states and value_states must share the same shape")
-        if key_states.size(2) != self.kv_heads:
-            raise ValueError("kv_heads mismatch in IMI pipeline")
-
-        seq_len = int(key_states.size(1))
-        if middle_start < 0 or middle_end > seq_len or middle_start >= middle_end:
-            raise ValueError("Invalid middle token range for IMI chunked build")
-
-        token_count = middle_end - middle_start
-        if token_count > self.max_tokens:
-            raise ValueError(
-                f"token_count({token_count}) exceeds max_tokens({self.max_tokens})"
-            )
-
-        submit_chunk_size = token_count if chunk_size <= 0 else int(chunk_size)
-        self.begin_index_stream(token_count, submit_chunk_size)
-
-        chunk_id = 0
-        token_offset = 0
-        for chunk_start in range(middle_start, middle_end, submit_chunk_size):
-            chunk_end = min(middle_end, chunk_start + submit_chunk_size)
-            chunk_len = chunk_end - chunk_start
-            self.submit_index_stream_raw_sequence_chunk(
-                key_states,
-                value_states,
-                chunk_id=chunk_id,
-                source_token=chunk_start,
-                token_offset=token_offset,
-                chunk_len=chunk_len,
-                is_last=chunk_end == middle_end,
-            )
-            chunk_id += 1
-            token_offset += chunk_len
-
-        self._token_count = token_count
 
     def _build_metadata_from_tensors(
         self,

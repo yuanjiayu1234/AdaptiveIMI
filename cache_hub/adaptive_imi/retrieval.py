@@ -293,13 +293,31 @@ class AdaptiveIMIRetrievalMixin:
             "h2d_ms": (h2d_end - h2d_start) * 1000.0,
         }
     def _select_clusters(self, layer_idx, similarities):
-        topk = torch.topk(similarities, self.nprobe, dim=-1, largest=True, sorted=True)
+        active_clusters = int(similarities.size(-1))
+        if active_clusters <= 0:
+            return torch.full(
+                (similarities.size(0), self.nprobe),
+                self.padding_cluster_id,
+                dtype=torch.int64,
+                device=similarities.device,
+            )
+        effective_nprobe = min(int(self.nprobe), active_clusters)
+        topk = torch.topk(similarities, effective_nprobe, dim=-1, largest=True, sorted=True)
         cluster_sizes = self.cluster_sizes_gpu[layer_idx]
         sizes = torch.gather(cluster_sizes, 1, topk.indices)
         valid = sizes > 0
         cumsum = torch.cumsum(sizes, dim=-1, dtype=torch.int32)
         keep = valid & ((cumsum - sizes) < self.max_retrieval_tokens)
         selected = topk.indices.masked_fill(~keep, self.padding_cluster_id)
+        if effective_nprobe < int(self.nprobe):
+            padded = torch.full(
+                (selected.size(0), int(self.nprobe)),
+                self.padding_cluster_id,
+                dtype=selected.dtype,
+                device=selected.device,
+            )
+            padded[:, :effective_nprobe].copy_(selected)
+            selected = padded
         return selected
     def ensure_layer_ready(self, layer_idx):
         if self.layer_ready[layer_idx] or not self.build_index_when_prefilling:

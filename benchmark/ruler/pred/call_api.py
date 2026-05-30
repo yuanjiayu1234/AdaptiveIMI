@@ -139,7 +139,7 @@ class HuggingFaceModel:
         device,
         budget_ratio,
         synthetic_len,
-        subspace_parts=2,
+        subspace_parts=None,
         imi_engine=None,
         partition_path=None,
         decode_search_mode=None,
@@ -245,7 +245,7 @@ def get_llm(
     budget_ratio,
     synthetic_len,
     model_path=None,
-    subspace_parts=2,
+    subspace_parts=None,
     imi_engine=None,
     partition_path=None,
     decode_search_mode=None,
@@ -295,20 +295,7 @@ def should_stop_at_period(task_name: str, task_config: dict) -> bool:
     if override is not None:
         return override
 
-    # Auto mode: only use '.' as a stop token for NIAH tasks with one requested
-    # value. Multi-value/multi-query and extraction tasks often answer as
-    # numbered lists, so stopping at '.' truncates them to "1".
-    if task_config.get("task") != "niah":
-        return False
-
-    args_cfg = task_config.get("args", {})
-    try:
-        num_needle_v = int(args_cfg.get("num_needle_v", 1))
-        num_needle_q = int(args_cfg.get("num_needle_q", 1))
-    except (TypeError, ValueError):
-        return False
-
-    return num_needle_v == 1 and num_needle_q == 1
+    return False
 
 
 def postprocess_pred(pred: str, stop_at_period: bool = False) -> str:
@@ -350,7 +337,7 @@ def get_pred(
     budget_ratio: float,
     synthetic_len: int,
     answer_prefix: str = "",
-    subspace_parts: int = 2,
+    subspace_parts: int | None = None,
     imi_engine: str | None = None,
     partition_path: str | None = None,
     decode_search_mode: str | None = None,
@@ -424,7 +411,7 @@ def get_pred_batch(
     budget_ratio: float,
     synthetic_len: int,
     answer_prefixes: List[str] | None = None,
-    subspace_parts: int = 2,
+    subspace_parts: int | None = None,
     imi_engine: str | None = None,
     partition_path: str | None = None,
     decode_search_mode: str | None = None,
@@ -700,9 +687,9 @@ if __name__ == '__main__':
     parser.add_argument("--threads", type=int, default=4)
 
     parser.add_argument("--synthetic_len", type=int, required=True)
-    parser.add_argument("--budget_ratio", type=float, default=0.018, help="Retrieval budget for AdaptiveIMI")
-    parser.add_argument("--subspace_parts", type=int, default=2, help="IMI subspace parts (0, 2 or 4)")
-    parser.add_argument("--imi_engine", type=str, default=None, choices=[None, "hybrid_8way_v2"])
+    parser.add_argument("--budget_ratio", type=float, default=None, help="Retrieval budget override for AdaptiveIMI")
+    parser.add_argument("--subspace_parts", type=int, default=None, help="AdaptiveIMI subspace override")
+    parser.add_argument("--imi_engine", type=str, default=None, choices=["hybrid_8way_v2"])
     parser.add_argument("--partition_path", type=str, default=None, help="Learned partition JSON for AdaptiveIMI hybrid v2")
     parser.add_argument(
         "--decode_search_mode",

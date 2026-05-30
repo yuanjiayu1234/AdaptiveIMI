@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
-import os
 import time
 from typing import Dict, List, Optional, Sequence
 
@@ -17,8 +16,8 @@ _HYBRID_8WAY_CUDA_EXT = None
 @dataclass
 class HybridBuildResult:
     metadata: List[Dict[str, object]]
-    search_metadata_cpu: Dict[str, torch.Tensor] = field(default_factory=dict)
     search_metadata_gpu: Optional[Dict[str, torch.Tensor]] = None
+    base_metadata_gpu: Optional[Dict[str, torch.Tensor]] = None
     stats: Dict[str, float] = field(default_factory=dict)
 
 
@@ -120,11 +119,16 @@ class HybridLayerBuildJob:
         self.build_end: Optional[torch.cuda.Event] = None
         self.build_stream: Optional[torch.cuda.Stream] = None
         self._metadata_device: Optional[Dict[str, torch.Tensor]] = None
+        self._metadata_cpu: Optional[Dict[str, torch.Tensor]] = None
+        self._metadata_cpu_event: Optional[torch.cuda.Event] = None
+        self._metadata_cpu_stream: Optional[torch.cuda.Stream] = None
+        self._metadata_cpu_started = False
         self._build_ready = False
         self._raw_d2h_started = False
         self._gpu_build_started = False
         self._gpu_build_ms = 0.0
         self._raw_d2h_wait_ms = 0.0
+        self._metadata_d2h_ms = 0.0
         self._gpu_sources_released = False
 
         self.keys_cpu = None
@@ -171,7 +175,12 @@ class HybridLayerBuildJob:
         device_index = int(keys.device.index or 0)
         self.build_start = torch.cuda.Event(enable_timing=True)
         self.build_end = torch.cuda.Event(enable_timing=True)
-        self.build_stream = torch.cuda.Stream(device=device_index)
+        priority = 0
+        get_priority_range = getattr(torch.cuda, "get_stream_priority_range", None)
+        if callable(get_priority_range):
+            low_priority, _high_priority = get_priority_range()
+            priority = int(low_priority)
+        self.build_stream = torch.cuda.Stream(device=device_index, priority=priority)
         with torch.cuda.stream(self.build_stream):
             if event is not None:
                 self.build_stream.wait_event(event)
@@ -190,19 +199,38 @@ class HybridLayerBuildJob:
             self.start_raw_d2h()
         if not self._gpu_build_started:
             self.start_gpu_metadata_build()
-        if self.build_end is not None:
-            self.build_end.synchronize()
-            self._gpu_build_ms = (
-                float(self.build_start.elapsed_time(self.build_end))
-                if self.build_start is not None and self.build_end is not None
-                else 0.0
-            )
+        self.wait_gpu_metadata_build()
         if self.copy_event is not None:
             copy_wait_start = time.perf_counter()
             self.copy_event.synchronize()
             self._raw_d2h_wait_ms = (time.perf_counter() - copy_wait_start) * 1000.0
         if self.keys_cpu is None or self.values_cpu is None:
             raise RuntimeError("hybrid raw KV D2H did not produce CPU buffers")
+        self._keys_ref = None
+        self._values_ref = None
+        self._gpu_sources_released = True
+
+    def wait_gpu_metadata_build(self) -> None:
+        if self.build_device != "gpu":
+            return
+        if not self._gpu_build_started:
+            self.start_gpu_metadata_build()
+        if self.build_end is None:
+            return
+        self.build_end.synchronize()
+        self._gpu_build_ms = (
+            float(self.build_start.elapsed_time(self.build_end))
+            if self.build_start is not None and self.build_end is not None
+            else 0.0
+        )
+
+    def release_gpu_source_refs(self) -> None:
+        if self._gpu_sources_released:
+            return
+        if self.build_end is not None:
+            self.build_end.synchronize()
+        if self.copy_event is not None:
+            self.copy_event.synchronize()
         self._keys_ref = None
         self._values_ref = None
         self._gpu_sources_released = True
@@ -319,38 +347,130 @@ class HybridLayerBuildJob:
         }
         return metadata
 
+    def prepare_cpu_metadata(self) -> None:
+        if self._metadata_cpu is not None and self._metadata_cpu_event is None:
+            return
+        self.start_cpu_metadata_d2h()
+        if self._metadata_cpu_event is not None:
+            meta_d2h_start = time.perf_counter()
+            self._metadata_cpu_event.synchronize()
+            self._metadata_d2h_ms = (time.perf_counter() - meta_d2h_start) * 1000.0
+            self._metadata_cpu_event = None
+
+    def start_cpu_metadata_d2h(self) -> None:
+        if self._metadata_cpu is not None or self._metadata_cpu_started:
+            return
+        self.wait_gpu_metadata_build()
+        if self._metadata_device is None:
+            raise RuntimeError("hybrid build metadata was not produced")
+        cpu_metadata_keys = [
+            "token_counts",
+            "cluster_counts",
+            "cluster_sizes",
+            "cluster_offsets",
+            "token_ids_by_cluster",
+        ]
+        first_tensor = next(
+            (self._metadata_device[key] for key in cpu_metadata_keys if key in self._metadata_device),
+            None,
+        )
+        if first_tensor is None:
+            raise RuntimeError("hybrid build metadata did not contain CPU metadata tensors")
+        device_index = int(first_tensor.device.index or 0)
+        self._metadata_cpu_stream = torch.cuda.Stream(device=device_index)
+        self._metadata_cpu_event = torch.cuda.Event()
+        self._metadata_cpu = {
+            key: torch.empty(
+                self._metadata_device[key].shape,
+                dtype=self._metadata_device[key].dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            for key in cpu_metadata_keys
+            if key in self._metadata_device
+        }
+        with torch.cuda.stream(self._metadata_cpu_stream):
+            if self.build_end is not None:
+                self._metadata_cpu_stream.wait_event(self.build_end)
+            for key, dst in self._metadata_cpu.items():
+                dst.copy_(self._metadata_device[key], non_blocking=True)
+            self._metadata_cpu_event.record()
+        self._metadata_cpu_started = True
+
+    def _validate_cpu_metadata(self, metadata_cpu: Dict[str, torch.Tensor]) -> None:
+        required = (
+            "token_counts",
+            "cluster_counts",
+            "cluster_sizes",
+            "cluster_offsets",
+            "token_ids_by_cluster",
+        )
+        missing = [key for key in required if key not in metadata_cpu]
+        if missing:
+            raise RuntimeError(f"hybrid build metadata missing CPU tensors: {missing}")
+
+        token_counts = metadata_cpu["token_counts"].view(-1)
+        cluster_counts = metadata_cpu["cluster_counts"].view(-1)
+        cluster_sizes = metadata_cpu["cluster_sizes"]
+        cluster_offsets = metadata_cpu["cluster_offsets"]
+        token_ids = metadata_cpu["token_ids_by_cluster"]
+        rows = self.batch_size * self.kv_heads
+        if int(token_counts.numel()) != rows or int(cluster_counts.numel()) != rows:
+            raise RuntimeError("hybrid build metadata row count mismatch")
+        if int(cluster_sizes.size(0)) != rows or int(cluster_offsets.size(0)) != rows or int(token_ids.size(0)) != rows:
+            raise RuntimeError("hybrid build metadata tensor row mismatch")
+        if int(token_ids.size(1)) < self.max_token_count:
+            raise RuntimeError("hybrid token_ids_by_cluster is shorter than source tokens")
+
+        max_clusters = int(cluster_sizes.size(1))
+        for row_idx in range(rows):
+            token_count = int(token_counts[row_idx].item())
+            cluster_count = int(cluster_counts[row_idx].item())
+            if token_count < 0 or token_count > self.max_token_count:
+                raise RuntimeError(f"hybrid metadata row {row_idx} has invalid token_count={token_count}")
+            if cluster_count < 0 or cluster_count > max_clusters:
+                raise RuntimeError(f"hybrid metadata row {row_idx} has invalid cluster_count={cluster_count}")
+            if cluster_count == 0:
+                if token_count != 0:
+                    raise RuntimeError(f"hybrid metadata row {row_idx} has tokens but no clusters")
+                continue
+            row_sizes = cluster_sizes[row_idx, :cluster_count]
+            row_offsets = cluster_offsets[row_idx, : cluster_count + 1]
+            if int(row_offsets[0].item()) != 0:
+                raise RuntimeError(f"hybrid metadata row {row_idx} first cluster offset is not zero")
+            if int(row_offsets[-1].item()) != token_count:
+                raise RuntimeError(
+                    f"hybrid metadata row {row_idx} offset tail {int(row_offsets[-1].item())} "
+                    f"!= token_count {token_count}"
+                )
+            if bool((row_sizes < 0).any().item()):
+                raise RuntimeError(f"hybrid metadata row {row_idx} has negative cluster size")
+            if int(row_sizes.sum().item()) != token_count:
+                raise RuntimeError(
+                    f"hybrid metadata row {row_idx} cluster size sum {int(row_sizes.sum().item())} "
+                    f"!= token_count {token_count}"
+                )
+
     def finish(
         self,
         list_keys: torch.Tensor,
         list_values: torch.Tensor,
         *,
         keep_search_metadata: bool = True,
+        on_sources_consumed=None,
     ) -> HybridBuildResult:
         self.wait_gpu_sources_consumed()
+        if on_sources_consumed is not None:
+            on_sources_consumed()
         gpu_build_ms = float(self._gpu_build_ms)
         raw_d2h_wait_ms = float(self._raw_d2h_wait_ms)
 
-        if self._metadata_device is None:
+        self.prepare_cpu_metadata()
+        if self._metadata_cpu is None or self._metadata_device is None:
             raise RuntimeError("hybrid build metadata was not produced")
-
-        meta_d2h_start = time.perf_counter()
-        # Only transfer what CPU needs for final list layout and base decode
-        # metadata. subspace_rerank search tensors already exist on GPU, so
-        # keeping a CPU debug copy is optional and disabled by default.
-        cpu_metadata_keys = (
-            "token_counts",
-            "cluster_counts",
-            "cluster_sizes",
-            "cluster_offsets",
-            "centroids",
-            "token_ids_by_cluster",
-        )
-        metadata_cpu = {
-            key: self._metadata_device[key].detach().cpu()
-            for key in cpu_metadata_keys
-            if key in self._metadata_device
-        }
-        metadata_d2h_ms = (time.perf_counter() - meta_d2h_start) * 1000.0
+        metadata_cpu = self._metadata_cpu
+        self._validate_cpu_metadata(metadata_cpu)
+        metadata_d2h_ms = float(self._metadata_d2h_ms)
 
         reorg_start = time.perf_counter()
         ext = _load_hybrid_8way_cuda_extension()
@@ -377,7 +497,6 @@ class HybridLayerBuildJob:
                 "token_count": int(metadata_cpu["token_counts"][row_idx].item()),
                 "cluster_sizes": metadata_cpu["cluster_sizes"][row_idx, :cluster_count],
                 "cluster_offsets": metadata_cpu["cluster_offsets"][row_idx, : cluster_count + 1],
-                "centroids": metadata_cpu["centroids"][row_idx, :cluster_count],
             })
 
         stats = {
@@ -393,53 +512,30 @@ class HybridLayerBuildJob:
             "batch_groups": float(self.batch_size * self.kv_heads),
         }
 
-        search_cpu = {}
         search_gpu = None
-        search_cpu_d2h_ms = 0.0
+        base_gpu = {
+            "centroids": self._metadata_device["centroids"],
+            "cluster_sizes": self._metadata_device["cluster_sizes"],
+            "cluster_counts": self._metadata_device["cluster_counts"],
+        }
         if keep_search_metadata:
-            keep_cpu_search_metadata = os.getenv("IMI_HYBRID_KEEP_SEARCH_METADATA_CPU", "0").lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
+            active_clusters = max(int(metadata_cpu["cluster_counts"].max().item()), 1)
+            search_keys = (
+                "subspace_centroids",
+                "subspace_centroid_masks",
+                "subspace_dim_ids",
+                "subspace_dim_masks",
             )
-            if keep_cpu_search_metadata:
-                search_cpu_keys = (
-                    "subspace_centroids",
-                    "subspace_centroid_masks",
-                    "subspace_dim_ids",
-                    "subspace_dim_masks",
-                    "compact_codes",
-                    "token_ids_by_cluster",
-                    "cluster_sizes",
-                    "cluster_offsets",
-                    "cluster_counts",
-                )
-                search_cpu_d2h_start = time.perf_counter()
-                search_cpu = {
-                    key: self._metadata_device[key].detach().cpu()
-                    for key in search_cpu_keys
-                    if key in self._metadata_device
-                }
-                search_cpu_d2h_ms = (time.perf_counter() - search_cpu_d2h_start) * 1000.0
-            if self.build_device == "gpu":
-                active_clusters = max(int(metadata_cpu["cluster_counts"].max().item()), 1)
-                search_keys = (
-                    "subspace_centroids",
-                    "subspace_centroid_masks",
-                    "subspace_dim_ids",
-                    "subspace_dim_masks",
-                )
-                search_gpu = {key: self._metadata_device[key] for key in search_keys}
-                search_gpu["compact_codes"] = self._metadata_device["compact_codes"][:, :active_clusters, :]
-        stats["search_cpu_d2h_ms"] = search_cpu_d2h_ms
+            search_gpu = {key: self._metadata_device[key] for key in search_keys}
+            search_gpu["compact_codes"] = self._metadata_device["compact_codes"][:, :active_clusters, :]
         self._metadata_device = None
+        self._metadata_cpu = None
         self._keys_ref = None
         self._values_ref = None
         return HybridBuildResult(
             metadata=structured,
-            search_metadata_cpu=search_cpu,
             search_metadata_gpu=search_gpu,
+            base_metadata_gpu=base_gpu,
             stats=stats,
         )
 

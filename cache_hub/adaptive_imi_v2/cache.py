@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Dict, Optional
 import json
 import math
 import os
+import queue as thread_queue
 import threading
 import time
 
@@ -22,27 +24,31 @@ imi_gpu_kernels = get_imi_kernels()
 
 
 @dataclass
-class _PendingGpuBuild:
+class _PendingCpuSubmit:
+    kind: str
     layer_idx: int
-    keys: Optional[torch.Tensor]
-    values: Optional[torch.Tensor]
-    token_counts: torch.Tensor
-    source_ready_event: torch.cuda.Event
-    forced: bool = False
-    running: bool = False
-    job: Optional[HybridGpuLayerBuildJob] = None
-    raw_ready: threading.Event = field(default_factory=threading.Event)
-    done: threading.Event = field(default_factory=threading.Event)
-    error: Optional[BaseException] = None
-
+    keys: Optional[torch.Tensor] = None
+    values: Optional[torch.Tensor] = None
+    token_counts: Optional[torch.Tensor] = None
+    max_middle_len: int = 0
+    chunk_id: int = 0
+    start_bdx: int = 0
+    source_token: int = 0
+    token_offset: int = 0
+    chunk_len: int = 0
+    is_last: bool = False
+    middle_start: int = 0
+    middle_end: int = 0
+    submit_chunk_size: int = 0
+    producer_event: Optional[torch.cuda.Event] = None
 
 class Hybrid8WayIMICache(adpimi_cache):
     """Hybrid layer-level 8-way learned IMI cache.
 
-    CPU and GPU layers share the same batch-aware metadata schema. CPU layers
-    build while prefill runs; GPU layers enqueue raw KV offload and metadata
-    kernels on independent CUDA streams as soon as layer KV is ready. Both
-    paths then reuse the existing CPU-list layout and hot/cold retrieval path.
+    CPU and GPU layers share the same batch-aware metadata schema. GPU-only
+    prefill follows RetroInfer's bounded ordering: current-layer GPU metadata
+    build is synchronous, raw KV D2H is asynchronous until sync(), and CPU list
+    organization is allowed to overlap only with the next layer.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -63,15 +69,35 @@ class Hybrid8WayIMICache(adpimi_cache):
         runtime_config["partition_path"] = str(partition_path)
         runtime_config["allow_batch_size_gt_one"] = True
         pipeline_cfg = dict(runtime_config.get("pipeline") or {})
+        early_hybrid_cfg = dict(runtime_config.get("hybrid_index") or {})
+        ordered_cpu_finish = bool(early_hybrid_cfg.get("ordered_cpu_finish", True))
         configured_core = int(kwargs.get("core") or 0)
-        total_cpu_threads = configured_core or int(runtime_config.get("cpu_threads") or 0) or int(os.cpu_count() or 1)
-        pipeline_cfg["worker_threads"] = max(int(pipeline_cfg.get("worker_threads", 0) or 0), total_cpu_threads)
+        configured_cpu_threads = int(runtime_config.get("cpu_threads") or 0)
+        total_cpu_threads = configured_cpu_threads or configured_core or int(os.cpu_count() or 1)
+        default_worker_threads = max(1, total_cpu_threads)
+        if ordered_cpu_finish:
+            configured_per_job = int(
+                pipeline_cfg.get(
+                    "cpu_worker_threads_per_job",
+                    early_hybrid_cfg.get("cpu_worker_threads_per_job", 0),
+                )
+                or 0
+            )
+            default_worker_threads = configured_per_job if configured_per_job > 0 else max(1, total_cpu_threads // 2)
+            default_worker_threads = min(default_worker_threads, total_cpu_threads)
+            pipeline_cfg.setdefault("cpu_worker_threads_per_job", default_worker_threads)
+
+        pipeline_cfg["worker_threads"] = int(pipeline_cfg.get("worker_threads", 0) or default_worker_threads)
         pipeline_cfg["total_cpu_threads"] = max(int(pipeline_cfg.get("total_cpu_threads", 0) or 0), total_cpu_threads)
-        pipeline_cfg["enable_omp_nested"] = bool(pipeline_cfg.get("enable_omp_nested", True))
-        pipeline_cfg["omp_max_active_levels"] = max(int(pipeline_cfg.get("omp_max_active_levels", 2) or 2), 2)
+        pipeline_cfg["enable_omp_nested"] = bool(pipeline_cfg.get("enable_omp_nested", not ordered_cpu_finish))
+        default_active_levels = 2 if pipeline_cfg["enable_omp_nested"] else 1
+        pipeline_cfg["omp_max_active_levels"] = max(
+            int(pipeline_cfg.get("omp_max_active_levels", default_active_levels) or default_active_levels),
+            default_active_levels,
+        )
         pipeline_cfg["defer_merge_until_wait"] = True
         runtime_config["pipeline"] = pipeline_cfg
-        runtime_config["cpu_threads"] = max(int(runtime_config.get("cpu_threads") or 0), total_cpu_threads)
+        runtime_config["cpu_threads"] = total_cpu_threads
         kwargs["runtime_config"] = runtime_config
         kwargs["subspace_parts"] = 8
         super().__init__(*args, **kwargs)
@@ -80,68 +106,26 @@ class Hybrid8WayIMICache(adpimi_cache):
         # produced by background layer builders, and decode buffers are prepared
         # by move()/prepare_cache() after prefill.
         self.allocated = False
+        if self.build_index_when_prefilling:
+            n_centroids, nprobe, cache_pages, buffer_pages = self._estimate_cache_parameters()
+            self.n_centroids = int(n_centroids)
+            self.padding_cluster_id = self.n_centroids - 1
+            self.nprobe = int(nprobe)
+            self.max_retrieval_tokens = max(int(self.retrieval_budget * self.list_capacity), 1)
+            self.budget_tokens = self.max_retrieval_tokens
+            self.max_retrieval_pages = self._tokens_to_pages(self.max_retrieval_tokens)
+            self.cache_size = int(cache_pages)
+            self.cache_budget_pages = self.cache_size
+            self.buffer_size = int(buffer_pages)
+            self.buffer_budget_pages = self.buffer_size
+            self.execution_stride = self.buffer_size * self.page_size + self.static_capacity
+            self.retrieval_execution_stride = self.buffer_size * self.page_size
 
         hybrid_cfg = dict(runtime_config.get("hybrid_index") or {})
         self.hybrid_scheduler = LayerBuildScheduler.from_config(self.layer_num, hybrid_cfg)
-        gpu_build_during_prefill_env = os.getenv("IMI_HYBRID_GPU_BUILD_DURING_PREFILL")
-        if gpu_build_during_prefill_env is not None:
-            self.hybrid_gpu_build_during_prefill = gpu_build_during_prefill_env.lower() in ("1", "true", "yes", "on")
-        else:
-            self.hybrid_gpu_build_during_prefill = bool(hybrid_cfg.get("gpu_build_during_prefill", True))
-        gap_value = os.getenv("IMI_HYBRID_GPU_PREFILL_LAYER_GAP", hybrid_cfg.get("gpu_prefill_layer_gap", 8))
-        interval_value = os.getenv(
-            "IMI_HYBRID_GPU_PREFILL_LAYER_INTERVAL",
-            hybrid_cfg.get("gpu_prefill_layer_interval", 8),
-        )
-        self.hybrid_gpu_prefill_layer_gap = max(0, int(gap_value))
-        self.hybrid_gpu_prefill_layer_interval = max(1, int(interval_value))
-        self.hybrid_gpu_prefill_slow_ms = float(hybrid_cfg.get("gpu_prefill_slow_ms", 1000.0))
-        self.hybrid_prefill_current_layer = -1
         self.hybrid_prefill_finished = False
-        self.hybrid_gpu_next_prefill_layer = 0
-        self.hybrid_gpu_prefill_disabled = False
         self.layer_build_modes = self.hybrid_scheduler.all_modes()
-        if self.batch_size > 1 and any(mode != "gpu" for mode in self.layer_build_modes):
-            self.layer_build_modes = ["gpu"] * self.layer_num
-            print(
-                "[IMI hybrid v2] batch_size>1 uses GPU index build for all layers; "
-                "CPU batch build is not enabled yet",
-                flush=True,
-            )
-        self.hybrid_gpu_only_build = all(mode == "gpu" for mode in self.layer_build_modes)
-        if (
-            self.hybrid_gpu_only_build
-            and "gpu_prefill_layer_interval" not in hybrid_cfg
-            and "IMI_HYBRID_GPU_PREFILL_LAYER_INTERVAL" not in os.environ
-        ):
-            self.hybrid_gpu_prefill_layer_interval = 1
-        self.hybrid_gpu_jobs: list[Optional[HybridGpuLayerBuildJob]] = [None] * self.layer_num
-        self.hybrid_cpu_source_refs: list[Optional[object]] = [None] * self.layer_num
-        self.hybrid_cpu_source_release_started = [False] * self.layer_num
-        self.hybrid_gpu_stream_chunk_ids = [0] * self.layer_num
-        self.hybrid_gpu_stream_token_offsets: list[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.hybrid_gpu_stream_token_counts: list[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.hybrid_staging_keys: list[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.hybrid_staging_values: list[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.hybrid_staging_seen: list[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.hybrid_staging_token_counts: list[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.hybrid_search_metadata_cpu: list[Optional[Dict[str, torch.Tensor]]] = [None] * self.layer_num
-        self.hybrid_search_metadata_gpu: list[Optional[Dict[str, torch.Tensor]]] = [None] * self.layer_num
-        self.hybrid_gpu_profile_rows = []
-        self.hybrid_gpu_pending: list[Optional[_PendingGpuBuild]] = [None] * self.layer_num
-        self.hybrid_gpu_pending_order: list[int] = []
-        self.hybrid_gpu_cv = threading.Condition()
-        self.hybrid_gpu_stop = False
-        self.hybrid_max_pending_gpu_builds = max(
-            int(os.getenv("IMI_HYBRID_MAX_PENDING_GPU_BUILDS", "4")),
-            1,
-        )
-        self.hybrid_gpu_worker = threading.Thread(
-            target=self._hybrid_gpu_build_loop,
-            daemon=True,
-            name="imi-hybrid-gpu-build",
-        )
-        self.hybrid_gpu_worker.start()
+        self._init_hybrid_gpu_build_state(hybrid_cfg)
         self.decode_search_config = dict(runtime_config.get("decode_search") or {})
         decode_search_mode = str(self.decode_search_config.get("mode", "flat")).lower()
         if decode_search_mode not in ("flat", "subspace_rerank"):
@@ -149,48 +133,10 @@ class Hybrid8WayIMICache(adpimi_cache):
                 "hybrid_8way_v2 decode_search.mode must be 'flat' or 'subspace_rerank'; "
                 f"got {decode_search_mode!r}"
             )
-        pipeline_cfg = dict(runtime_config.get("pipeline") or {})
-        env_max_concurrent = os.getenv("IMI_HYBRID_MAX_CONCURRENT")
-        if env_max_concurrent:
-            default_concurrency = int(env_max_concurrent)
-        else:
-            default_concurrency = int(pipeline_cfg.get("max_concurrent_prefill", pipeline_cfg.get("kmeans_concurrency", 3)))
-        max_concurrent = max(1, min(default_concurrency, self.layer_num))
-        env_cpu_threads = os.getenv("IMI_CPU_BUILD_THREADS")
-        if env_cpu_threads:
-            total_build_threads = int(env_cpu_threads)
-        else:
-            total_build_threads = int(
-                pipeline_cfg.get(
-                    "total_cpu_threads",
-                    runtime_config.get("cpu_threads") or getattr(self, "core", self._available_cpu_cores),
-                )
-            )
-            total_build_threads = max(
-                total_build_threads,
-                int(getattr(self, "core", total_build_threads) or total_build_threads),
-            )
-        total_build_threads = max(1, total_build_threads)
-        min_threads_per_job = max(1, total_build_threads // max_concurrent)
-        configured_worker_threads = int(pipeline_cfg.get("cpu_worker_threads_per_job", 0) or 0)
-        if configured_worker_threads <= 0:
-            configured_worker_threads = max(
-                min_threads_per_job,
-                int(math.ceil(float(total_build_threads) * 0.75)),
-            )
-        self.hybrid_finish_worker_threads = max(
-            min_threads_per_job,
-            min(total_build_threads, configured_worker_threads),
-        )
-        self.hybrid_finish_scheduler = _KmeansScheduler(
-            total_build_threads,
-            min_threads_per_job,
-            max_concurrent=max_concurrent,
-            worker_threads_per_job=self.hybrid_finish_worker_threads,
-        )
+        max_concurrent, total_build_threads = self._init_hybrid_cpu_finish_scheduler(runtime_config)
 
         print(
-            "[IMI hybrid v2] layer_build_modes={} cpu_build_concurrency={} cpu_total_threads={} cpu_worker_threads_per_job={}".format(
+            "[IMI hybrid v2] layer_build_modes={} cpu_build_concurrency={} cpu_total_threads={} cpu_worker_threads_per_job={} gpu_build_order=layer_sync".format(
                 ",".join(self.layer_build_modes),
                 max_concurrent,
                 total_build_threads,
@@ -198,31 +144,279 @@ class Hybrid8WayIMICache(adpimi_cache):
             ),
             flush=True,
         )
-        self.index_submit_chunk_size = max(
-            int(self.runtime_config["streaming"].get("index_submit_chunk_size", self.prefill_chunk_size)),
-            1,
+        self.prefill_index_chunk_size = max(int(self.prefill_chunk_size), 1)
+
+    def _init_hybrid_gpu_build_state(self, hybrid_cfg: dict) -> None:
+        self.hybrid_gpu_jobs: list[Optional[HybridGpuLayerBuildJob]] = [None] * self.layer_num
+        self.hybrid_cpu_source_refs: list[list[tuple[torch.Tensor, torch.Tensor]]] = [
+            [] for _ in range(self.layer_num)
+        ]
+        self.hybrid_cpu_source_release_started = [False] * self.layer_num
+        self.hybrid_cpu_stream_chunk_ids = [0] * self.layer_num
+        self.hybrid_cpu_stream_token_offsets: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_cpu_stream_token_counts: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_cpu_stream_seen: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_gpu_stream_chunk_ids = [0] * self.layer_num
+        self.hybrid_gpu_stream_token_offsets: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_gpu_stream_token_counts: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_gpu_stream_middle_starts: list[int] = [0] * self.layer_num
+        self.hybrid_staging_keys: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_staging_values: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_staging_seen: list[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.hybrid_search_metadata_cpu: list[Optional[Dict[str, torch.Tensor]]] = [None] * self.layer_num
+        self.hybrid_search_metadata_gpu: list[Optional[Dict[str, torch.Tensor]]] = [None] * self.layer_num
+        self.hybrid_gpu_profile_rows = []
+        self.hybrid_gpu_finish_scheduled = [False] * self.layer_num
+        self.hybrid_cpu_submit_queue: thread_queue.Queue[Optional[_PendingCpuSubmit]] = thread_queue.Queue()
+        self.hybrid_cpu_submit_stop = False
+        self.hybrid_cpu_submit_worker = threading.Thread(
+            target=self._hybrid_cpu_submit_loop,
+            daemon=True,
+            name="imi-hybrid-cpu-submit",
         )
+        self.hybrid_cpu_submit_worker.start()
+
+    def _init_hybrid_cpu_finish_scheduler(self, runtime_config: dict) -> tuple[int, int]:
+        pipeline_cfg = dict(runtime_config.get("pipeline") or {})
+        hybrid_cfg = dict(runtime_config.get("hybrid_index") or {})
+        default_concurrency = int(
+            hybrid_cfg.get(
+                "cpu_build_concurrency",
+                pipeline_cfg.get("max_concurrent_prefill", pipeline_cfg.get("kmeans_concurrency", 3)),
+            )
+        )
+        if bool(hybrid_cfg.get("ordered_cpu_finish", True)):
+            default_concurrency = 1
+        ordered_cpu_finish = bool(hybrid_cfg.get("ordered_cpu_finish", True))
+        max_concurrent = max(1, min(default_concurrency, self.layer_num))
+
+        total_build_threads = int(
+            pipeline_cfg.get(
+                "total_cpu_threads",
+                runtime_config.get("cpu_threads") or getattr(self, "core", self._available_cpu_cores),
+            )
+        )
+        total_build_threads = max(1, total_build_threads)
+
+        min_threads_per_job = max(1, total_build_threads // max_concurrent)
+        configured_worker_threads = int(pipeline_cfg.get("cpu_worker_threads_per_job", 0) or 0)
+        if configured_worker_threads <= 0:
+            configured_worker_threads = min_threads_per_job
+        if ordered_cpu_finish:
+            self.hybrid_finish_worker_threads = max(1, min(total_build_threads, configured_worker_threads))
+            min_threads_per_job = self.hybrid_finish_worker_threads
+        else:
+            self.hybrid_finish_worker_threads = max(
+                min_threads_per_job,
+                min(total_build_threads, configured_worker_threads),
+            )
+        self.hybrid_finish_scheduler = _KmeansScheduler(
+            total_build_threads,
+            min_threads_per_job,
+            max_concurrent=max_concurrent,
+            worker_threads_per_job=self.hybrid_finish_worker_threads,
+        )
+        return max_concurrent, total_build_threads
 
     @staticmethod
     def _storage_ptr(tensor: torch.Tensor) -> int:
         return int(tensor.untyped_storage().data_ptr())
 
+    @staticmethod
+    def _emit_pipeline_debug(payload: dict) -> None:
+        if os.getenv("IMI_DEBUG_PIPELINE_STATS", "0") == "1":
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+    def _enqueue_cpu_submit_task(self, task: _PendingCpuSubmit) -> None:
+        if not hasattr(self, "hybrid_cpu_submit_queue"):
+            raise RuntimeError("hybrid CPU submit worker is not initialized")
+        self.hybrid_cpu_submit_queue.put(task)
+
+    @staticmethod
+    def _record_cuda_producer_event(tensor: torch.Tensor) -> Optional[torch.cuda.Event]:
+        if tensor is None or not tensor.is_cuda:
+            return None
+        device_index = int(tensor.device.index or 0)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device_index))
+        return event
+
+    def _hybrid_cpu_submit_loop(self) -> None:
+        while True:
+            task = self.hybrid_cpu_submit_queue.get()
+            try:
+                if task is None:
+                    return
+                self._run_cpu_submit_task(task)
+            finally:
+                self.hybrid_cpu_submit_queue.task_done()
+
+    def _run_cpu_submit_task(self, task: _PendingCpuSubmit) -> None:
+        layer_idx = int(task.layer_idx)
+        if self.prefill_stream_errors[layer_idx] is not None:
+            return
+        start_ts = time.perf_counter()
+        phase = str(task.kind)
+        try:
+            if task.keys is not None and task.keys.is_cuda:
+                torch.cuda.set_device(task.keys.device)
+            pipeline = self.imi_pipelines[layer_idx]
+            if pipeline is None:
+                raise RuntimeError(f"missing IMI pipeline for layer {layer_idx}")
+
+            stream_context = nullcontext()
+            if task.producer_event is not None and task.keys is not None and task.keys.is_cuda:
+                producer_stream = torch.cuda.Stream(device=task.keys.device)
+                producer_stream.wait_event(task.producer_event)
+                stream_context = torch.cuda.stream(producer_stream)
+
+            with stream_context:
+                if task.kind == "begin_batch":
+                    if task.token_counts is None:
+                        raise RuntimeError(f"missing token_counts for CPU begin task on layer {layer_idx}")
+                    pipeline.begin_index_stream_batch(task.token_counts, task.submit_chunk_size)
+                elif task.kind == "batch_chunk":
+                    if task.keys is None or task.values is None:
+                        raise RuntimeError(f"missing raw tensors for CPU chunk task on layer {layer_idx}")
+                    pipeline.submit_index_stream_raw_sequence_batch_chunk(
+                        task.keys,
+                        task.values,
+                        chunk_id=int(task.chunk_id),
+                        start_bdx=int(task.start_bdx),
+                        source_token=int(task.source_token),
+                        token_offset=int(task.token_offset),
+                        chunk_len=int(task.chunk_len),
+                        is_last=bool(task.is_last),
+                    )
+                elif task.kind == "finish":
+                    self._release_hybrid_cpu_source_after_transfer(layer_idx)
+                    self._schedule_hybrid_layer_finish(
+                        layer_idx,
+                        lambda worker_threads, layer_idx=layer_idx: self._finish_pipeline_layer_index(
+                            layer_idx,
+                            worker_threads,
+                        ),
+                    )
+                elif task.kind == "full_layer":
+                    self._run_cpu_full_layer_submit(task)
+                else:
+                    raise RuntimeError(f"unknown CPU submit task kind: {task.kind!r}")
+        except BaseException as exc:
+            if self.prefill_stream_errors[layer_idx] is None:
+                self.prefill_stream_errors[layer_idx] = exc
+            self.hybrid_cpu_source_refs[layer_idx].clear()
+            self.prefill_stream_done_events[layer_idx].set()
+            print(
+                f"[IMI ERROR] hybrid layer={layer_idx} CPU submit failed during {phase}: {exc}",
+                flush=True,
+            )
+        finally:
+            elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+            self._emit_pipeline_debug({
+                "tag": "IMI_CPU_SUBMIT_WORKER_TIMING",
+                "layer_idx": int(layer_idx),
+                "phase": phase,
+                "elapsed_ms": round(elapsed_ms, 3),
+            })
+
+    def _run_cpu_full_layer_submit(self, task: _PendingCpuSubmit) -> None:
+        layer_idx = int(task.layer_idx)
+        if task.keys is None or task.values is None:
+            raise RuntimeError(f"missing raw tensors for full CPU submit task on layer {layer_idx}")
+        pipeline = self.imi_pipelines[layer_idx]
+        if pipeline is None:
+            raise RuntimeError(f"missing IMI pipeline for layer {layer_idx}")
+
+        middle_start = int(task.middle_start)
+        middle_end = int(task.middle_end)
+        middle_len = middle_end - middle_start
+        if middle_len <= 0:
+            raise ValueError("Hybrid 8-way IMI requires a non-empty middle segment")
+
+        begin_start = time.perf_counter()
+        pipeline.begin_index_stream(middle_len, int(task.submit_chunk_size))
+        begin_ms = (time.perf_counter() - begin_start) * 1000.0
+        chunk_id = 0
+        token_offset = 0
+        chunk_start = middle_start
+        submit_ms = 0.0
+        while chunk_start < middle_end:
+            chunk_end = min(middle_end, chunk_start + int(task.submit_chunk_size))
+            chunk_len = chunk_end - chunk_start
+            submit_start = time.perf_counter()
+            pipeline.submit_index_stream_raw_sequence_chunk(
+                task.keys,
+                task.values,
+                chunk_id=chunk_id,
+                source_token=chunk_start,
+                token_offset=token_offset,
+                chunk_len=chunk_len,
+                is_last=chunk_end == middle_end,
+            )
+            submit_ms += (time.perf_counter() - submit_start) * 1000.0
+            chunk_id += 1
+            token_offset += chunk_len
+            chunk_start = chunk_end
+
+        self._emit_pipeline_debug({
+            "tag": "IMI_CPU_FULL_LAYER_SUBMIT_TIMING",
+            "layer_idx": int(layer_idx),
+            "middle_len": int(middle_len),
+            "submit_chunk_size": int(task.submit_chunk_size),
+            "begin_ms": round(begin_ms, 3),
+            "submit_ms": round(submit_ms, 3),
+            "chunks": int(chunk_id),
+        })
+        self._release_hybrid_cpu_source_after_transfer(layer_idx)
+        self._schedule_hybrid_layer_finish(
+            layer_idx,
+            lambda worker_threads, layer_idx=layer_idx: self._finish_pipeline_layer_index(
+                layer_idx,
+                worker_threads,
+            ),
+        )
+
     def prefill_kv_workspace_available(self, keys: torch.Tensor, values: torch.Tensor) -> bool:
         key_ptr = self._storage_ptr(keys)
         value_ptr = self._storage_ptr(values)
-        for refs in self.hybrid_cpu_source_refs:
-            if not isinstance(refs, tuple) or len(refs) != 2:
-                continue
-            ref_keys, ref_values = refs
+        for ref_keys, ref_values in zip(
+            getattr(self, "hybrid_staging_keys", []),
+            getattr(self, "hybrid_staging_values", []),
+        ):
             if ref_keys is None or ref_values is None:
                 continue
             if self._storage_ptr(ref_keys) == key_ptr or self._storage_ptr(ref_values) == value_ptr:
                 return False
+        for refs in self.hybrid_cpu_source_refs:
+            if isinstance(refs, tuple) and len(refs) == 2:
+                refs = [refs]
+            if not isinstance(refs, list):
+                continue
+            for ref_keys, ref_values in refs:
+                if ref_keys is None or ref_values is None:
+                    continue
+                if self._storage_ptr(ref_keys) == key_ptr or self._storage_ptr(ref_values) == value_ptr:
+                    return False
+        for job in getattr(self, "hybrid_gpu_jobs", []):
+            if job is None:
+                continue
+            ref_keys = getattr(job, "_keys_ref", None)
+            ref_values = getattr(job, "_values_ref", None)
+            if ref_keys is not None and self._storage_ptr(ref_keys) == key_ptr:
+                return False
+            if ref_values is not None and self._storage_ptr(ref_values) == value_ptr:
+                return False
         return True
 
     def _hold_hybrid_cpu_source(self, layer_idx: int, keys: torch.Tensor, values: torch.Tensor) -> None:
-        self.hybrid_cpu_source_refs[int(layer_idx)] = (keys, values)
-        self.hybrid_cpu_source_release_started[int(layer_idx)] = False
+        layer_idx = int(layer_idx)
+        refs = self.hybrid_cpu_source_refs[layer_idx]
+        key_ptr = self._storage_ptr(keys)
+        value_ptr = self._storage_ptr(values)
+        for ref_keys, ref_values in refs:
+            if self._storage_ptr(ref_keys) == key_ptr and self._storage_ptr(ref_values) == value_ptr:
+                return
+        refs.append((keys, values))
 
     def _release_hybrid_cpu_source_after_transfer(self, layer_idx: int) -> None:
         layer_idx = int(layer_idx)
@@ -239,7 +433,7 @@ class Hybrid8WayIMICache(adpimi_cache):
                 if self.prefill_stream_errors[layer_idx] is None:
                     self.prefill_stream_errors[layer_idx] = exc
             finally:
-                self.hybrid_cpu_source_refs[layer_idx] = None
+                self.hybrid_cpu_source_refs[layer_idx].clear()
 
         threading.Thread(
             target=_release,
@@ -253,184 +447,42 @@ class Hybrid8WayIMICache(adpimi_cache):
         target_cluster_size = int(cfg.get("target_cluster_size", cfg.get("cluster_size", 16)))
         return max_iters, target_cluster_size
 
-    def _gpu_prefill_build_allowed_locked(self, pending: _PendingGpuBuild) -> bool:
-        if not self.hybrid_gpu_build_during_prefill or self.hybrid_gpu_prefill_disabled:
-            return False
-        if not pending.raw_ready.is_set():
-            return False
-        layer_idx = int(pending.layer_idx)
-        if self.hybrid_prefill_current_layer < layer_idx + self.hybrid_gpu_prefill_layer_gap:
-            return False
-        if layer_idx < self.hybrid_gpu_next_prefill_layer:
-            return False
-        if self.hybrid_gpu_only_build:
-            return True
-        active_cpu = self.hybrid_finish_scheduler.active_jobs()
-        queued_cpu = self.hybrid_finish_scheduler.queued_jobs()
-        return active_cpu >= self.hybrid_finish_scheduler.max_concurrent() or queued_cpu > 0
-
-    def _pending_gpu_build_ready_locked(self, pending: _PendingGpuBuild) -> bool:
-        return (
-            pending.error is not None
-            or pending.forced
-            or self._gpu_prefill_build_allowed_locked(pending)
-        )
-
-    def _select_pending_gpu_build_locked(self) -> Optional[_PendingGpuBuild]:
-        for layer_idx in list(self.hybrid_gpu_pending_order):
-            pending = self.hybrid_gpu_pending[layer_idx]
-            if pending is None or pending.running or pending.done.is_set():
-                continue
-            if self._pending_gpu_build_ready_locked(pending):
-                pending.running = True
-                return pending
-        return None
-
-    def _pending_gpu_build_count_locked(self) -> int:
-        return sum(
-            1
-            for pending in self.hybrid_gpu_pending
-            if pending is not None and not pending.done.is_set()
-        )
-
-    def _force_oldest_pending_gpu_build_locked(self) -> None:
-        for layer_idx in list(self.hybrid_gpu_pending_order):
-            pending = self.hybrid_gpu_pending[layer_idx]
-            if pending is None or pending.done.is_set():
-                continue
-            pending.forced = True
-            self.hybrid_gpu_cv.notify_all()
+    def _wait_previous_layer_finish(self, layer_idx: int) -> None:
+        prev_layer = int(layer_idx) - 1
+        if prev_layer < 0:
             return
-
-    def _wait_for_pending_gpu_build_capacity_locked(self) -> None:
-        while self._pending_gpu_build_count_locked() >= self.hybrid_max_pending_gpu_builds:
-            self._force_oldest_pending_gpu_build_locked()
-            self.hybrid_gpu_cv.wait(timeout=0.05)
-
-    def _enqueue_pending_gpu_build(self, pending: _PendingGpuBuild) -> None:
-        with self.hybrid_gpu_cv:
-            self._wait_for_pending_gpu_build_capacity_locked()
-            if self.hybrid_gpu_pending[pending.layer_idx] is not None:
-                raise RuntimeError(f"duplicate pending GPU build for layer {pending.layer_idx}")
-            self.hybrid_gpu_pending[pending.layer_idx] = pending
-            self.hybrid_gpu_pending_order.append(pending.layer_idx)
-            self.hybrid_gpu_pending_order.sort()
-            self.hybrid_gpu_cv.notify_all()
-        threading.Thread(
-            target=self._prepare_pending_gpu_raw_d2h,
-            args=(pending,),
-            daemon=True,
-            name=f"imi-hybrid-gpu-raw-{pending.layer_idx}",
-        ).start()
-
-    def _prepare_pending_gpu_raw_d2h(self, pending: _PendingGpuBuild) -> None:
-        layer_idx = int(pending.layer_idx)
-        try:
-            partition_spec = self.learned_partition_specs[layer_idx]
-            if partition_spec is None:
-                raise RuntimeError(f"missing learned 8-way partition for layer {layer_idx}")
-
-            max_iters, target_cluster_size = self._gpu_kmeans_config()
-            job = HybridGpuLayerBuildJob(
-                layer_idx=layer_idx,
-                keys=pending.keys,
-                values=pending.values,
-                partition_spec=partition_spec,
-                build_device="gpu",
-                token_counts=pending.token_counts,
-                target_cluster_size=target_cluster_size,
-                max_iters=max_iters,
-                source_ready_event=pending.source_ready_event,
-                auto_start_raw_d2h=False,
-                auto_start_gpu_build=False,
-            )
-            job.start_raw_d2h(pending.source_ready_event)
-            pending.job = job
-            self.hybrid_gpu_jobs[layer_idx] = job
-        except BaseException as exc:
-            pending.error = exc
-            if self.prefill_stream_errors[layer_idx] is None:
-                self.prefill_stream_errors[layer_idx] = exc
-            print(
-                f"[IMI ERROR] hybrid layer={layer_idx} raw D2H setup failed: {exc}",
-                flush=True,
-            )
-        finally:
-            pending.raw_ready.set()
-            with self.hybrid_gpu_cv:
-                self.hybrid_gpu_cv.notify_all()
-
-    def _force_pending_gpu_build(self, layer_idx: int) -> Optional[_PendingGpuBuild]:
-        with self.hybrid_gpu_cv:
-            pending = self.hybrid_gpu_pending[int(layer_idx)]
-            if pending is not None and not pending.done.is_set():
-                pending.forced = True
-                self.hybrid_gpu_cv.notify_all()
-            return pending
-
-    def _finish_pending_gpu_build(self, pending: _PendingGpuBuild) -> None:
-        layer_idx = int(pending.layer_idx)
-        was_forced = bool(pending.forced)
-        start_ts = time.perf_counter()
-        try:
-            pending.raw_ready.wait()
-            if pending.error is not None:
-                raise pending.error
-            job = pending.job
-            if job is None:
-                raise RuntimeError(f"hybrid GPU build job for layer {layer_idx} was not prepared")
-            job.start_gpu_metadata_build(pending.source_ready_event)
-            self._finish_layer_index(layer_idx)
-        except BaseException as exc:
-            pending.error = exc
-            if self.prefill_stream_errors[layer_idx] is None:
-                self.prefill_stream_errors[layer_idx] = exc
-            print(
-                f"[IMI ERROR] hybrid layer={layer_idx} GPU build failed: {exc}",
-                flush=True,
-            )
-        finally:
-            pending.keys = None
-            pending.values = None
-            with self.hybrid_gpu_cv:
-                if self.hybrid_gpu_pending[layer_idx] is pending:
-                    self.hybrid_gpu_pending[layer_idx] = None
-                self.hybrid_gpu_pending_order = [
-                    idx for idx in self.hybrid_gpu_pending_order if idx != layer_idx
-                ]
-                if not was_forced:
-                    elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
-                    if elapsed_ms > self.hybrid_gpu_prefill_slow_ms:
-                        self.hybrid_gpu_prefill_disabled = True
-                    else:
-                        self.hybrid_gpu_next_prefill_layer = layer_idx + self.hybrid_gpu_prefill_layer_interval
-                pending.done.set()
-                self.prefill_stream_done_events[layer_idx].set()
-                self.hybrid_gpu_cv.notify_all()
-
-    def _hybrid_gpu_build_loop(self) -> None:
-        while True:
-            with self.hybrid_gpu_cv:
-                while not self.hybrid_gpu_stop:
-                    pending = self._select_pending_gpu_build_locked()
-                    if pending is not None:
-                        break
-                    self.hybrid_gpu_cv.wait()
-                if self.hybrid_gpu_stop:
-                    return
-            self._finish_pending_gpu_build(pending)
-
-    def _wait_for_pending_gpu_build(self, layer_idx: int) -> None:
-        pending = self._force_pending_gpu_build(layer_idx)
-        if pending is None:
+        if not self.prefill_stream_started[prev_layer] or self.layer_ready[prev_layer]:
             return
-        pending.done.wait()
-        if pending.error is not None:
-            raise RuntimeError(f"hybrid GPU build failed on layer {layer_idx}") from pending.error
+        self.prefill_stream_done_events[prev_layer].wait()
+        self._raise_prefill_stream_error(prev_layer)
+
+    def _materialize_decode_search_metadata_gpu(self) -> None:
+        if not self._decode_search_enabled():
+            return
+        search_keys = (
+            "subspace_centroids",
+            "subspace_centroid_masks",
+            "subspace_dim_ids",
+            "subspace_dim_masks",
+            "compact_codes",
+        )
+        for layer_idx, metadata_cpu in enumerate(self.hybrid_search_metadata_cpu):
+            if self.hybrid_search_metadata_gpu[layer_idx] is not None:
+                continue
+            if metadata_cpu is None:
+                continue
+            device = self.layer_mapping[str(layer_idx)]
+            self.hybrid_search_metadata_gpu[layer_idx] = {
+                key: value.to(device=device, non_blocking=True)
+                for key, value in metadata_cpu.items()
+                if key in search_keys and torch.is_tensor(value)
+            }
 
     def prepare_cache(self, skip_prefetch: bool = False):
         self._wait_for_hybrid_background_finishes()
-        return super().prepare_cache(skip_prefetch=True)
+        result = super().prepare_cache(skip_prefetch=True)
+        self._materialize_decode_search_metadata_gpu()
+        return result
 
     def ensure_layer_ready(self, layer_idx):
         layer_idx = int(layer_idx)
@@ -439,13 +491,6 @@ class Hybrid8WayIMICache(adpimi_cache):
         self._raise_prefill_stream_error(layer_idx)
         if not self.layer_started[layer_idx]:
             raise RuntimeError(f"IMI layer {layer_idx} not started")
-
-        pending = self.hybrid_gpu_pending[layer_idx]
-        if pending is not None and not pending.done.is_set():
-            self._wait_for_pending_gpu_build(layer_idx)
-            self._raise_prefill_stream_error(layer_idx)
-            if self.layer_ready[layer_idx]:
-                return
 
         if self.prefill_stream_started[layer_idx]:
             done_event = self.prefill_stream_done_events[layer_idx]
@@ -471,10 +516,7 @@ class Hybrid8WayIMICache(adpimi_cache):
             return False
 
     def can_reuse_for_next_sequence(self, valid_start, max_new_length: int, input_length: int) -> bool:
-        allow_reuse = os.getenv("IMI_HYBRID_ALLOW_CACHE_REUSE", "0").lower() in ("1", "true", "yes", "on")
-        if not allow_reuse:
-            return False
-        return super().can_reuse_for_next_sequence(valid_start, max_new_length, input_length)
+        return False
 
     def _select_clusters_for_decode(self, layer_idx: int, query_grouped: torch.Tensor, device: str) -> torch.Tensor:
         if not self._decode_search_enabled():
@@ -586,41 +628,6 @@ class Hybrid8WayIMICache(adpimi_cache):
             or [0]
         )
 
-    def _prepare_prefill_chunk_ragged(
-        self,
-        states: torch.Tensor,
-        start_bdx: int,
-        token_counts: torch.Tensor,
-        max_middle_len: int,
-    ) -> torch.Tensor:
-        bsz = int(states.size(0))
-        out = torch.zeros(
-            (bsz, self.kv_head, int(max_middle_len), self.head_dim),
-            dtype=states.dtype,
-            device=states.device,
-        )
-        if bsz > 1:
-            valid_starts = self._valid_starts_for_range(start_bdx, bsz)
-            if all(valid_start == valid_starts[0] for valid_start in valid_starts):
-                valid_start = valid_starts[0]
-                middle_start = valid_start + self.static_pattern_start
-                middle_end = middle_start + int(token_counts[0].item())
-                out[:, :, : int(token_counts[0].item()), :].copy_(
-                    states[:, middle_start:middle_end, :, :].transpose(1, 2)
-                )
-                return out.contiguous()
-
-        for local_idx, valid_start in enumerate(self._valid_starts_for_range(start_bdx, bsz)):
-            token_count = int(token_counts[local_idx].item())
-            if token_count <= 0:
-                continue
-            middle_start = valid_start + self.static_pattern_start
-            middle_end = middle_start + token_count
-            out[local_idx, :, :token_count, :].copy_(
-                states[local_idx, middle_start:middle_end, :, :].transpose(0, 1)
-            )
-        return out.contiguous()
-
     def _copy_steady_zone(
         self,
         layer_idx: int,
@@ -665,45 +672,6 @@ class Hybrid8WayIMICache(adpimi_cache):
                     value_states[local_idx, seq_len - self.static_pattern_end : seq_len, :, :].transpose(0, 1)
                 )
 
-    def _submit_hybrid_layer_build(
-        self,
-        layer_idx: int,
-        middle_keys: torch.Tensor,
-        middle_values: torch.Tensor,
-        token_counts: torch.Tensor,
-    ) -> None:
-        if self.layer_started[layer_idx]:
-            return
-        partition_spec = self.learned_partition_specs[layer_idx]
-        if partition_spec is None:
-            raise RuntimeError(f"missing learned 8-way partition for layer {layer_idx}")
-
-        build_device = self.layer_build_modes[layer_idx]
-        self.layer_started[layer_idx] = True
-        self.prefill_stream_started[layer_idx] = True
-        self.prefill_stream_done_events[layer_idx].clear()
-        self.prefill_stream_errors[layer_idx] = None
-
-        if build_device == "cpu":
-            raise RuntimeError(
-                "hybrid_8way_v2 CPU build must use raw sequence KV submission; "
-                "GPU-contiguous CPU staging is intentionally disabled"
-            )
-
-        device_index = int(middle_keys.device.index or 0)
-        source_ready_event = torch.cuda.Event()
-        source_ready_event.record(torch.cuda.current_stream(device_index))
-        self.prefill_stream_end_submitted[layer_idx] = True
-        self._enqueue_pending_gpu_build(
-            _PendingGpuBuild(
-                layer_idx=int(layer_idx),
-                keys=middle_keys,
-                values=middle_values,
-                token_counts=token_counts,
-                source_ready_event=source_ready_event,
-            )
-        )
-
     def _submit_hybrid_cpu_layer_build_chunked(
         self,
         layer_idx: int,
@@ -727,7 +695,9 @@ class Hybrid8WayIMICache(adpimi_cache):
 
         middle_start = int(middle_start)
         middle_end = int(middle_end)
-        pipeline.begin_index_stream(middle_end - middle_start, self.index_submit_chunk_size)
+        middle_len = middle_end - middle_start
+        if middle_len <= 0:
+            raise ValueError("Hybrid 8-way IMI requires a non-empty middle segment")
         self._hold_hybrid_cpu_source(layer_idx, key_states, value_states)
 
         self.layer_started[layer_idx] = True
@@ -735,34 +705,94 @@ class Hybrid8WayIMICache(adpimi_cache):
         self.prefill_stream_end_submitted[layer_idx] = True
         self.prefill_stream_done_events[layer_idx].clear()
         self.prefill_stream_errors[layer_idx] = None
-
-        submit_chunk_size = max(int(self.index_submit_chunk_size), 1)
-        chunk_id = 0
-        token_offset = 0
-        chunk_start = middle_start
-        while chunk_start < middle_end:
-            chunk_end = min(middle_end, chunk_start + submit_chunk_size)
-            chunk_len = chunk_end - chunk_start
-            pipeline.submit_index_stream_raw_sequence_chunk(
-                key_states,
-                value_states,
-                chunk_id=chunk_id,
-                source_token=chunk_start,
-                token_offset=token_offset,
-                chunk_len=chunk_len,
-                is_last=chunk_end == middle_end,
+        self._enqueue_cpu_submit_task(
+            _PendingCpuSubmit(
+                kind="full_layer",
+                layer_idx=int(layer_idx),
+                keys=key_states,
+                values=value_states,
+                middle_start=middle_start,
+                middle_end=middle_end,
+                submit_chunk_size=max(int(self.prefill_index_chunk_size), 1),
+                producer_event=self._record_cuda_producer_event(key_states),
             )
-            chunk_id += 1
-            token_offset += chunk_len
-            chunk_start = chunk_end
+        )
 
-        self._release_hybrid_cpu_source_after_transfer(layer_idx)
-        self._schedule_hybrid_layer_finish(
-            layer_idx,
-            lambda worker_threads, layer_idx=layer_idx: self._finish_pipeline_layer_index(
-                layer_idx,
-                worker_threads,
-            ),
+    def _begin_hybrid_cpu_chunk_stream(
+        self,
+        layer_idx: int,
+        max_middle_len: int,
+        token_counts: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> None:
+        total_start = time.perf_counter()
+        if self.layer_started[layer_idx]:
+            return
+        if self.layer_build_modes[layer_idx] != "cpu":
+            raise RuntimeError(
+                f"layer {layer_idx} is configured for {self.layer_build_modes[layer_idx]} build, not cpu"
+            )
+        if self.learned_partition_specs[layer_idx] is None:
+            raise RuntimeError(f"missing learned 8-way partition for layer {layer_idx}")
+
+        token_counts = token_counts.to(dtype=torch.int32, device="cpu").view(-1).contiguous()
+        if int(token_counts.numel()) != self.batch_size:
+            raise ValueError("CPU chunk stream token_counts must have one entry per batch item")
+        if int(token_counts.min().item()) <= 0 or int(token_counts.max().item()) > int(max_middle_len):
+            raise ValueError("invalid CPU chunk stream token_counts")
+        if bool((token_counts != int(token_counts[0].item())).any().item()):
+            raise ValueError("CPU batch build currently requires lockstep token_counts")
+
+        pipeline = self.imi_pipelines[layer_idx]
+        if pipeline is None:
+            raise RuntimeError(f"missing IMI pipeline for layer {layer_idx}")
+        if not key_states.is_contiguous() or not value_states.is_contiguous():
+            raise RuntimeError("CPU raw batch stream requires contiguous [bsz, seq, kv_heads, dim] tensors")
+
+        self._hold_hybrid_cpu_source(layer_idx, key_states, value_states)
+        enqueue_start = time.perf_counter()
+        self._enqueue_cpu_submit_task(
+            _PendingCpuSubmit(
+                kind="begin_batch",
+                layer_idx=int(layer_idx),
+                token_counts=token_counts,
+                max_middle_len=int(max_middle_len),
+                submit_chunk_size=max(int(self.prefill_index_chunk_size), 1),
+            )
+        )
+        begin_enqueue_ms = (time.perf_counter() - enqueue_start) * 1000.0
+
+        self.layer_started[layer_idx] = True
+        self.prefill_stream_started[layer_idx] = True
+        self.prefill_stream_end_submitted[layer_idx] = False
+        self.prefill_stream_done_events[layer_idx].clear()
+        self.prefill_stream_errors[layer_idx] = None
+        self.hybrid_cpu_stream_chunk_ids[layer_idx] = 0
+        self.hybrid_cpu_stream_token_offsets[layer_idx] = torch.zeros((self.batch_size,), dtype=torch.int32)
+        self.hybrid_cpu_stream_token_counts[layer_idx] = token_counts
+        self.hybrid_cpu_stream_seen[layer_idx] = torch.zeros((self.batch_size,), dtype=torch.bool)
+        self._emit_pipeline_debug({
+            "tag": "IMI_CPU_BEGIN_TIMING",
+            "layer_idx": int(layer_idx),
+            "max_middle_len": int(max_middle_len),
+            "prefill_chunk_size": int(self.prefill_index_chunk_size),
+            "begin_enqueue_ms": round(begin_enqueue_ms, 3),
+            "total_ms": round((time.perf_counter() - total_start) * 1000.0, 3),
+        })
+
+    def _finish_hybrid_cpu_chunk_stream(self, layer_idx: int) -> None:
+        if self.prefill_stream_end_submitted[layer_idx]:
+            return
+        self.prefill_stream_end_submitted[layer_idx] = True
+        self.hybrid_cpu_stream_token_offsets[layer_idx] = None
+        self.hybrid_cpu_stream_token_counts[layer_idx] = None
+        self.hybrid_cpu_stream_seen[layer_idx] = None
+        self._enqueue_cpu_submit_task(
+            _PendingCpuSubmit(
+                kind="finish",
+                layer_idx=int(layer_idx),
+            )
         )
 
     def _begin_hybrid_gpu_chunk_stream(
@@ -770,12 +800,16 @@ class Hybrid8WayIMICache(adpimi_cache):
         layer_idx: int,
         max_middle_len: int,
         token_counts: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        middle_start: int,
         *,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> None:
+    ) -> bool:
+        total_start = time.perf_counter()
         if self.hybrid_staging_keys[layer_idx] is not None:
-            return
+            return True
         if self.layer_build_modes[layer_idx] != "gpu":
             raise RuntimeError(
                 f"layer {layer_idx} is configured for {self.layer_build_modes[layer_idx]} build, not gpu"
@@ -790,9 +824,9 @@ class Hybrid8WayIMICache(adpimi_cache):
         if int(token_counts.numel()) != self.batch_size:
             raise ValueError("GPU chunk stream token_counts must have one entry per batch item")
 
-        shape = (self.batch_size, self.kv_head, max_middle_len, self.head_dim)
-        self.hybrid_staging_keys[layer_idx] = torch.empty(shape, dtype=dtype, device=device).contiguous()
-        self.hybrid_staging_values[layer_idx] = torch.empty(shape, dtype=dtype, device=device).contiguous()
+        self.hybrid_staging_keys[layer_idx] = key_states
+        self.hybrid_staging_values[layer_idx] = value_states
+        self.hybrid_gpu_stream_middle_starts[layer_idx] = int(middle_start)
         self.hybrid_gpu_stream_token_counts[layer_idx] = token_counts
         self.hybrid_gpu_stream_chunk_ids[layer_idx] = 0
         self.hybrid_gpu_stream_token_offsets[layer_idx] = torch.zeros((self.batch_size,), dtype=torch.int32)
@@ -802,34 +836,80 @@ class Hybrid8WayIMICache(adpimi_cache):
         self.prefill_stream_end_submitted[layer_idx] = False
         self.prefill_stream_done_events[layer_idx].clear()
         self.prefill_stream_errors[layer_idx] = None
+        self._emit_pipeline_debug({
+            "tag": "IMI_GPU_BEGIN_TIMING",
+            "layer_idx": int(layer_idx),
+            "staging_mode": "direct",
+            "max_middle_len": int(max_middle_len),
+            "prefill_chunk_size": int(self.prefill_index_chunk_size),
+            "total_ms": round((time.perf_counter() - total_start) * 1000.0, 3),
+        })
+        return True
 
     def _finish_hybrid_gpu_chunk_stream(self, layer_idx: int) -> None:
-        middle_keys = self.hybrid_staging_keys[layer_idx]
-        middle_values = self.hybrid_staging_values[layer_idx]
+        source_keys = self.hybrid_staging_keys[layer_idx]
+        source_values = self.hybrid_staging_values[layer_idx]
         token_counts = self.hybrid_gpu_stream_token_counts[layer_idx]
-        if middle_keys is None or middle_values is None or token_counts is None:
+        if source_keys is None or source_values is None or token_counts is None:
             raise RuntimeError(f"hybrid GPU chunk stream for layer {layer_idx} was not initialized")
         if self.hybrid_gpu_jobs[layer_idx] is not None:
             return
+        middle_start = int(self.hybrid_gpu_stream_middle_starts[layer_idx])
+        max_tokens = int(token_counts.max().item())
+        middle_end = middle_start + max_tokens
+        middle_keys = source_keys[:, middle_start:middle_end, :, :].transpose(1, 2)
+        middle_values = source_values[:, middle_start:middle_end, :, :].transpose(1, 2)
 
-        device_index = int(middle_keys.device.index or 0)
+        device_index = int(source_keys.device.index or 0)
         source_ready_event = torch.cuda.Event()
         source_ready_event.record(torch.cuda.current_stream(device_index))
+        max_iters, target_cluster_size = self._gpu_kmeans_config()
+        partition_spec = self.learned_partition_specs[layer_idx]
+        if partition_spec is None:
+            raise RuntimeError(f"missing learned 8-way partition for layer {layer_idx}")
+
+        progress = os.getenv("IMI_STREAMING_PROGRESS", "0") == "1"
+        start_ts = time.perf_counter() if progress else None
+        if progress:
+            print(f"[IMI HYBRID INDEX] layer={layer_idx} mode=gpu phase=build_start", flush=True)
+        self._emit_pipeline_debug({
+            "tag": "IMI_GPU_BUILD_INPUT",
+            "layer_idx": int(layer_idx),
+            "staging_mode": "direct",
+            "middle_start": int(middle_start),
+            "middle_end": int(middle_end),
+            "max_tokens": int(max_tokens),
+            "source_shape": list(source_keys.shape),
+            "build_shape": list(middle_keys.shape),
+            "source_contiguous": bool(source_keys.is_contiguous()),
+            "build_contiguous": bool(middle_keys.is_contiguous()),
+            "source_storage_offset": int(source_keys.storage_offset()),
+            "build_storage_offset": int(middle_keys.storage_offset()),
+        })
+        job = HybridGpuLayerBuildJob(
+            layer_idx=int(layer_idx),
+            keys=middle_keys,
+            values=middle_values,
+            partition_spec=partition_spec,
+            build_device="gpu",
+            token_counts=token_counts,
+            target_cluster_size=target_cluster_size,
+            max_iters=max_iters,
+            source_ready_event=source_ready_event,
+            auto_start_raw_d2h=True,
+            auto_start_gpu_build=True,
+        )
+        job.wait_gpu_metadata_build()
+        if progress and start_ts is not None:
+            elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+            print(f"[IMI HYBRID INDEX] layer={layer_idx} mode=gpu phase=build_done elapsed_ms={elapsed_ms:.2f}", flush=True)
+        self.hybrid_gpu_jobs[layer_idx] = job
         self.prefill_stream_end_submitted[layer_idx] = True
         self.hybrid_staging_keys[layer_idx] = None
         self.hybrid_staging_values[layer_idx] = None
         self.hybrid_gpu_stream_token_counts[layer_idx] = None
         self.hybrid_gpu_stream_token_offsets[layer_idx] = None
         self.hybrid_staging_seen[layer_idx] = None
-        self._enqueue_pending_gpu_build(
-            _PendingGpuBuild(
-                layer_idx=int(layer_idx),
-                keys=middle_keys,
-                values=middle_values,
-                token_counts=token_counts,
-                source_ready_event=source_ready_event,
-            )
-        )
 
     def prefill_submit_kv_chunk(
         self,
@@ -842,12 +922,10 @@ class Hybrid8WayIMICache(adpimi_cache):
     ) -> bool:
         if not self.build_index_when_prefilling:
             return False
+        total_start = time.perf_counter()
         layer_idx = int(layer_idx)
-        self.hybrid_prefill_current_layer = max(self.hybrid_prefill_current_layer, layer_idx)
         build_device = self.layer_build_modes[layer_idx]
         if build_device not in ("cpu", "gpu"):
-            return False
-        if build_device != "gpu":
             return False
 
         start_bdx = int(start_bdx)
@@ -873,34 +951,192 @@ class Hybrid8WayIMICache(adpimi_cache):
         if not has_overlap:
             return False
 
+        split_size = int(self.prefill_index_chunk_size)
+        lockstep_middle = all(valid_start == valid_starts[0] for valid_start in valid_starts)
+        if build_device == "cpu" and not lockstep_middle:
+            raise ValueError("CPU batch build currently requires lockstep valid_start within a submitted group")
+
+        if build_device == "cpu":
+            current_offsets = self.hybrid_cpu_stream_token_offsets[layer_idx]
+        else:
+            current_offsets = self.hybrid_gpu_stream_token_offsets[layer_idx]
+
+        ready_to_submit = False
+        if lockstep_middle:
+            middle_start = int(valid_starts[0]) + self.static_pattern_start
+            middle_len = max(middle_end - middle_start, 0)
+            if middle_len <= 0:
+                raise ValueError("Hybrid 8-way IMI requires a non-empty middle segment")
+            if current_offsets is None:
+                token_offset = 0
+            else:
+                expected_offsets = current_offsets[start_bdx:end_bdx]
+                token_offset = int(expected_offsets[0].item())
+                if bool((expected_offsets != token_offset).any().item()):
+                    raise RuntimeError(
+                        f"hybrid {build_device.upper()} chunk stream offset mismatch on layer {layer_idx}: "
+                        f"batch_range=[{start_bdx},{end_bdx}) expected lockstep offsets, got {expected_offsets.tolist()}"
+                    )
+            if token_offset < middle_len:
+                token_width = min(split_size, middle_len - token_offset)
+                part_end = middle_start + token_offset + token_width
+                ready_to_submit = part_end <= int(chunk_end)
+        else:
+            for local_idx, valid_start in enumerate(valid_starts):
+                global_idx = start_bdx + local_idx
+                middle_start = int(valid_start) + self.static_pattern_start
+                middle_len = max(middle_end - middle_start, 0)
+                if middle_len <= 0:
+                    continue
+                token_offset = 0 if current_offsets is None else int(current_offsets[global_idx].item())
+                if token_offset >= middle_len:
+                    continue
+                token_width = min(split_size, middle_len - token_offset)
+                part_end = middle_start + token_offset + token_width
+                if part_end <= int(chunk_end):
+                    ready_to_submit = True
+                    break
+
+        if not ready_to_submit:
+            return False
+
         self._expected_middle_len[layer_idx] = int(max_middle_len)
-        self._begin_hybrid_gpu_chunk_stream(
-            layer_idx,
-            max_middle_len,
-            token_counts,
-            dtype=key_states.dtype,
-            device=key_states.device,
-        )
+        if build_device == "cpu":
+            begin_start = time.perf_counter()
+            self._begin_hybrid_cpu_chunk_stream(
+                layer_idx,
+                max_middle_len,
+                token_counts,
+                key_states,
+                value_states,
+            )
+            begin_ms = (time.perf_counter() - begin_start) * 1000.0
+            token_offsets = self.hybrid_cpu_stream_token_offsets[layer_idx]
+            seen = self.hybrid_cpu_stream_seen[layer_idx]
+            if token_offsets is None or seen is None:
+                raise RuntimeError(f"hybrid CPU chunk stream for layer {layer_idx} was not initialized")
+            self._hold_hybrid_cpu_source(layer_idx, key_states, value_states)
 
-        staging_keys = self.hybrid_staging_keys[layer_idx]
-        staging_values = self.hybrid_staging_values[layer_idx]
-        token_offsets = self.hybrid_gpu_stream_token_offsets[layer_idx]
-        seen = self.hybrid_staging_seen[layer_idx]
-        if staging_keys is None or staging_values is None or token_offsets is None or seen is None:
-            raise RuntimeError(f"hybrid GPU chunk stream for layer {layer_idx} was not initialized")
-
-        split_size = int(self.index_submit_chunk_size)
-        if all(valid_start == valid_starts[0] for valid_start in valid_starts):
+            submit_ms = 0.0
+            submitted_parts = 0
+            submitted_tokens = 0
+            finish_ms = 0.0
             middle_start = int(valid_starts[0]) + self.static_pattern_start
             middle_len = max(middle_end - middle_start, 0)
             if middle_len <= 0:
                 raise ValueError("Hybrid 8-way IMI requires a non-empty middle segment")
 
-            submit_start = max(int(chunk_start), middle_start)
-            submit_end = min(int(chunk_end), middle_end)
-            for part_start in range(submit_start, submit_end, split_size):
-                part_end = min(submit_end, part_start + split_size)
-                token_offset = part_start - middle_start
+            expected_offsets = token_offsets[start_bdx:end_bdx]
+            token_offset = int(expected_offsets[0].item())
+            if bool((expected_offsets != token_offset).any().item()):
+                raise RuntimeError(
+                    f"hybrid CPU chunk stream offset mismatch on layer {layer_idx}: "
+                    f"batch_range=[{start_bdx},{end_bdx}) expected lockstep offsets, got {expected_offsets.tolist()}"
+                )
+            while token_offset < middle_len:
+                token_width = min(split_size, middle_len - token_offset)
+                part_start = middle_start + token_offset
+                part_end = part_start + token_width
+                if part_end > int(chunk_end):
+                    break
+                expected_offsets = token_offsets[start_bdx:end_bdx]
+                if bool((expected_offsets != int(token_offset)).any().item()):
+                    raise RuntimeError(
+                        f"hybrid CPU chunk stream offset mismatch on layer {layer_idx}: "
+                        f"batch_range=[{start_bdx},{end_bdx}) expected {expected_offsets.tolist()}, got {token_offset}"
+                    )
+                chunk_id = int(self.hybrid_cpu_stream_chunk_ids[layer_idx])
+                self.hybrid_cpu_stream_chunk_ids[layer_idx] = chunk_id + 1
+                submit_start = time.perf_counter()
+                self._hold_hybrid_cpu_source(layer_idx, key_states, value_states)
+                self._enqueue_cpu_submit_task(
+                    _PendingCpuSubmit(
+                        kind="batch_chunk",
+                        layer_idx=int(layer_idx),
+                        keys=key_states,
+                        values=value_states,
+                        chunk_id=chunk_id,
+                        start_bdx=int(start_bdx),
+                        source_token=int(part_start),
+                        token_offset=int(token_offset),
+                        chunk_len=int(token_width),
+                        is_last=token_offset + token_width == middle_len and end_bdx == self.batch_size,
+                        producer_event=self._record_cuda_producer_event(key_states),
+                    )
+                )
+                submit_ms += (time.perf_counter() - submit_start) * 1000.0
+                submitted_parts += 1
+                submitted_tokens += int(token_width) * int(bsz)
+                token_offsets[start_bdx:end_bdx] = token_offset + token_width
+                token_offset += token_width
+                if token_offset == middle_len:
+                    seen[start_bdx:end_bdx] = True
+
+            if bool(seen.all().item()) and not self.prefill_stream_end_submitted[layer_idx]:
+                finish_start = time.perf_counter()
+                self._finish_hybrid_cpu_chunk_stream(layer_idx)
+                finish_ms = (time.perf_counter() - finish_start) * 1000.0
+            self._emit_pipeline_debug({
+                "tag": "IMI_PREFILL_SUBMIT_TIMING",
+                "layer_idx": int(layer_idx),
+                "build_device": "cpu",
+                "start_bdx": int(start_bdx),
+                "bsz": int(bsz),
+                "chunk_start": int(chunk_start),
+                "chunk_end": int(chunk_end),
+                "begin_ms": round(begin_ms, 3),
+                "cpu_submit_ms": round(submit_ms, 3),
+                "finish_enqueue_ms": round(finish_ms, 3),
+                "submitted_parts": int(submitted_parts),
+                "submitted_tokens": int(submitted_tokens),
+                "total_ms": round((time.perf_counter() - total_start) * 1000.0, 3),
+            })
+            return True
+
+        begin_start = time.perf_counter()
+        began_gpu_stream = self._begin_hybrid_gpu_chunk_stream(
+            layer_idx,
+            max_middle_len,
+            token_counts,
+            key_states,
+            value_states,
+            int(valid_starts[0]) + self.static_pattern_start,
+            dtype=key_states.dtype,
+            device=key_states.device,
+        )
+        begin_ms = (time.perf_counter() - begin_start) * 1000.0
+        if not began_gpu_stream:
+            raise RuntimeError(
+                f"hybrid GPU chunk stream for layer {layer_idx} could not acquire a raw slot"
+            )
+
+        token_offsets = self.hybrid_gpu_stream_token_offsets[layer_idx]
+        seen = self.hybrid_staging_seen[layer_idx]
+        if token_offsets is None or seen is None:
+            raise RuntimeError(f"hybrid GPU chunk stream for layer {layer_idx} was not initialized")
+        stage_enqueue_ms = 0.0
+        staged_parts = 0
+        staged_tokens = 0
+        finish_ms = 0.0
+        if lockstep_middle:
+            middle_start = int(valid_starts[0]) + self.static_pattern_start
+            middle_len = max(middle_end - middle_start, 0)
+            if middle_len <= 0:
+                raise ValueError("Hybrid 8-way IMI requires a non-empty middle segment")
+
+            expected_offsets = token_offsets[start_bdx:end_bdx]
+            token_offset = int(expected_offsets[0].item())
+            if bool((expected_offsets != token_offset).any().item()):
+                raise RuntimeError(
+                    f"hybrid GPU chunk stream offset mismatch on layer {layer_idx}: "
+                    f"batch_range=[{start_bdx},{end_bdx}) expected lockstep offsets, got {expected_offsets.tolist()}"
+                )
+            while token_offset < middle_len:
+                token_width = min(split_size, middle_len - token_offset)
+                part_start = middle_start + token_offset
+                part_end = part_start + token_width
+                if part_end > int(chunk_end):
+                    break
                 expected_offsets = token_offsets[start_bdx:end_bdx]
                 if bool((expected_offsets != int(token_offset)).any().item()):
                     raise RuntimeError(
@@ -908,22 +1144,35 @@ class Hybrid8WayIMICache(adpimi_cache):
                         f"batch_range=[{start_bdx},{end_bdx}) expected {expected_offsets.tolist()}, got {token_offset}"
                     )
 
-                token_width = int(part_end - part_start)
-                staging_keys[start_bdx:end_bdx, :, token_offset : token_offset + token_width, :].copy_(
-                    key_states[:, part_start:part_end, :, :].transpose(1, 2)
-                )
-                staging_values[start_bdx:end_bdx, :, token_offset : token_offset + token_width, :].copy_(
-                    value_states[:, part_start:part_end, :, :].transpose(1, 2)
-                )
+                staged_parts += 1
+                staged_tokens += int(token_width) * int(bsz)
 
                 chunk_id = int(self.hybrid_gpu_stream_chunk_ids[layer_idx])
                 self.hybrid_gpu_stream_chunk_ids[layer_idx] = chunk_id + 1
                 token_offsets[start_bdx:end_bdx] = token_offset + token_width
-                if part_end == middle_end:
+                token_offset += token_width
+                if token_offset == middle_len:
                     seen[start_bdx:end_bdx] = True
 
             if bool(seen.all().item()) and not self.prefill_stream_end_submitted[layer_idx]:
+                finish_start = time.perf_counter()
                 self._finish_hybrid_gpu_chunk_stream(layer_idx)
+                finish_ms = (time.perf_counter() - finish_start) * 1000.0
+            self._emit_pipeline_debug({
+                "tag": "IMI_PREFILL_SUBMIT_TIMING",
+                "layer_idx": int(layer_idx),
+                "build_device": "gpu",
+                "start_bdx": int(start_bdx),
+                "bsz": int(bsz),
+                "chunk_start": int(chunk_start),
+                "chunk_end": int(chunk_end),
+                "begin_ms": round(begin_ms, 3),
+                "gpu_stage_enqueue_ms": round(stage_enqueue_ms, 3),
+                "finish_enqueue_ms": round(finish_ms, 3),
+                "staged_parts": int(staged_parts),
+                "staged_tokens": int(staged_tokens),
+                "total_ms": round((time.perf_counter() - total_start) * 1000.0, 3),
+            })
             return True
 
         for local_idx, valid_start in enumerate(valid_starts):
@@ -933,14 +1182,13 @@ class Hybrid8WayIMICache(adpimi_cache):
             if middle_len <= 0:
                 raise ValueError("Hybrid 8-way IMI requires a non-empty middle segment")
 
-            submit_start = max(int(chunk_start), middle_start)
-            submit_end = min(int(chunk_end), middle_end)
-            if submit_start >= submit_end:
-                continue
-
-            for part_start in range(submit_start, submit_end, split_size):
-                part_end = min(submit_end, part_start + split_size)
-                token_offset = part_start - middle_start
+            token_offset = int(token_offsets[global_idx].item())
+            while token_offset < middle_len:
+                token_width = min(split_size, middle_len - token_offset)
+                part_start = middle_start + token_offset
+                part_end = part_start + token_width
+                if part_end > int(chunk_end):
+                    break
                 expected_offset = int(token_offsets[global_idx].item())
                 if token_offset != expected_offset:
                     raise RuntimeError(
@@ -948,72 +1196,36 @@ class Hybrid8WayIMICache(adpimi_cache):
                         f"batch={global_idx} expected {expected_offset}, got {token_offset}"
                     )
 
-                token_width = int(part_end - part_start)
-                staging_keys[global_idx : global_idx + 1, :, token_offset : token_offset + token_width, :].copy_(
-                    key_states[local_idx : local_idx + 1, part_start:part_end, :, :].transpose(1, 2)
-                )
-                staging_values[global_idx : global_idx + 1, :, token_offset : token_offset + token_width, :].copy_(
-                    value_states[local_idx : local_idx + 1, part_start:part_end, :, :].transpose(1, 2)
-                )
+                staged_parts += 1
+                staged_tokens += int(token_width)
 
                 chunk_id = int(self.hybrid_gpu_stream_chunk_ids[layer_idx])
                 self.hybrid_gpu_stream_chunk_ids[layer_idx] = chunk_id + 1
                 token_offsets[global_idx] = token_offset + token_width
-                if part_end == middle_end:
+                token_offset += token_width
+                if token_offset == middle_len:
                     seen[global_idx] = True
 
         if bool(seen.all().item()) and not self.prefill_stream_end_submitted[layer_idx]:
+            finish_start = time.perf_counter()
             self._finish_hybrid_gpu_chunk_stream(layer_idx)
+            finish_ms = (time.perf_counter() - finish_start) * 1000.0
+        self._emit_pipeline_debug({
+            "tag": "IMI_PREFILL_SUBMIT_TIMING",
+            "layer_idx": int(layer_idx),
+            "build_device": "gpu",
+            "start_bdx": int(start_bdx),
+            "bsz": int(bsz),
+            "chunk_start": int(chunk_start),
+            "chunk_end": int(chunk_end),
+            "begin_ms": round(begin_ms, 3),
+            "gpu_stage_enqueue_ms": round(stage_enqueue_ms, 3),
+            "finish_enqueue_ms": round(finish_ms, 3),
+            "staged_parts": int(staged_parts),
+            "staged_tokens": int(staged_tokens),
+            "total_ms": round((time.perf_counter() - total_start) * 1000.0, 3),
+        })
         return True
-
-    def _stage_hybrid_layer_batch(
-        self,
-        layer_idx: int,
-        start_bdx: int,
-        middle_keys: torch.Tensor,
-        middle_values: torch.Tensor,
-        token_counts: torch.Tensor,
-    ) -> None:
-        bsz = int(middle_keys.size(0))
-        end_bdx = int(start_bdx) + bsz
-        if start_bdx < 0 or end_bdx > self.batch_size:
-            raise ValueError(f"invalid prefill batch range [{start_bdx}, {end_bdx})")
-
-        if self.hybrid_staging_keys[layer_idx] is None:
-            shape = (self.batch_size, self.kv_head, int(middle_keys.size(2)), self.head_dim)
-            self.hybrid_staging_keys[layer_idx] = torch.empty(
-                shape,
-                dtype=middle_keys.dtype,
-                device=middle_keys.device,
-            ).contiguous()
-            self.hybrid_staging_values[layer_idx] = torch.empty(
-                shape,
-                dtype=middle_values.dtype,
-                device=middle_values.device,
-            ).contiguous()
-            self.hybrid_staging_seen[layer_idx] = torch.zeros((self.batch_size,), dtype=torch.bool)
-            self.hybrid_staging_token_counts[layer_idx] = torch.zeros((self.batch_size,), dtype=torch.int32)
-
-        seen = self.hybrid_staging_seen[layer_idx]
-        staging_keys = self.hybrid_staging_keys[layer_idx]
-        staging_values = self.hybrid_staging_values[layer_idx]
-        staging_token_counts = self.hybrid_staging_token_counts[layer_idx]
-        if seen is None or staging_keys is None or staging_values is None or staging_token_counts is None:
-            raise RuntimeError(f"hybrid staging buffers for layer {layer_idx} were not initialized")
-        if bool(seen[start_bdx:end_bdx].any().item()):
-            raise RuntimeError(f"duplicate prefill batch range for layer {layer_idx}: [{start_bdx}, {end_bdx})")
-
-        staging_keys[start_bdx:end_bdx].copy_(middle_keys)
-        staging_values[start_bdx:end_bdx].copy_(middle_values)
-        staging_token_counts[start_bdx:end_bdx].copy_(token_counts.to(dtype=torch.int32, device="cpu"))
-        seen[start_bdx:end_bdx] = True
-
-        if bool(seen.all().item()):
-            self._submit_hybrid_layer_build(layer_idx, staging_keys, staging_values, staging_token_counts)
-            self.hybrid_staging_keys[layer_idx] = None
-            self.hybrid_staging_values[layer_idx] = None
-            self.hybrid_staging_seen[layer_idx] = None
-            self.hybrid_staging_token_counts[layer_idx] = None
 
     def prefill_update_kv_cache(self, query_states, key_states, value_states, layer_idx, start_bdx):
         bsz, seq_len, _, _ = key_states.shape
@@ -1029,7 +1241,6 @@ class Hybrid8WayIMICache(adpimi_cache):
             )
 
         if self.build_index_when_prefilling:
-            token_counts = self._middle_lengths_for_range(seq_len, start_bdx, bsz)
             max_middle_len = self._middle_capacity_for_sequence(seq_len)
             if max_middle_len <= 0:
                 raise ValueError("Hybrid 8-way IMI requires a non-empty middle segment")
@@ -1037,7 +1248,11 @@ class Hybrid8WayIMICache(adpimi_cache):
             build_device = self.layer_build_modes[layer_idx]
 
             if not self.layer_started[layer_idx]:
-                self._ensure_list_storage(layer_idx)
+                if build_device == "gpu":
+                    raise RuntimeError(
+                        f"hybrid GPU chunk stream for layer {layer_idx} did not start; "
+                        "prefill_submit_kv_chunk() must acquire a GPU raw slot before final KV update"
+                    )
                 if build_device == "cpu" and bsz == 1 and self.batch_size == 1 and start_bdx == 0:
                     middle_start = int(valid_starts[0]) + self.static_pattern_start
                     middle_end = int(seq_len) - self.static_pattern_end
@@ -1049,21 +1264,17 @@ class Hybrid8WayIMICache(adpimi_cache):
                         middle_end,
                     )
                 else:
-                    middle_keys = self._prepare_prefill_chunk_ragged(key_states, start_bdx, token_counts, max_middle_len)
-                    middle_values = self._prepare_prefill_chunk_ragged(value_states, start_bdx, token_counts, max_middle_len)
-                    if bsz == self.batch_size and start_bdx == 0:
-                        self._submit_hybrid_layer_build(layer_idx, middle_keys, middle_values, token_counts)
-                    else:
-                        self._stage_hybrid_layer_batch(layer_idx, start_bdx, middle_keys, middle_values, token_counts)
+                    raise RuntimeError(
+                        f"hybrid chunk stream for layer {layer_idx} was not submitted; "
+                        "prefill must use prefill_submit_kv_chunk() before final KV update"
+                    )
             elif (
-                build_device == "cpu"
-                and bsz == 1
-                and self.batch_size == 1
-                and start_bdx == 0
+                build_device in ("cpu", "gpu")
                 and not self.prefill_stream_end_submitted[layer_idx]
             ):
                 raise RuntimeError(
-                    f"hybrid CPU chunk stream for layer {layer_idx} did not submit the final middle chunk"
+                    f"hybrid {build_device.upper()} chunk stream for layer {layer_idx} "
+                    "did not submit the final middle chunk"
                 )
 
             self._copy_steady_zone(layer_idx, key_states, value_states, start_bdx)
@@ -1078,14 +1289,188 @@ class Hybrid8WayIMICache(adpimi_cache):
         if (layer_idx == self.layer_num - 1) and (start_bdx + bsz == self.batch_size):
             self.context += seq_len
             self.hybrid_prefill_finished = True
-            with self.hybrid_gpu_cv:
-                self.hybrid_gpu_cv.notify_all()
             if self.build_index_when_prefilling:
                 self.attn_func = self.sparse_attention
             else:
                 self.static_pattern_total = seq_len
 
         return key_states[:, return_valid_start:, :, :], value_states[:, return_valid_start:, :, :]
+
+    def sync(self, layer_idx, start_bdx):
+        layer_idx = int(layer_idx)
+        if not self.build_index_when_prefilling:
+            return None
+        if self.layer_build_modes[layer_idx] != "gpu":
+            return super().sync(layer_idx, start_bdx)
+        if not self.prefill_stream_started[layer_idx]:
+            return None
+        self._raise_prefill_stream_error(layer_idx)
+        if self.layer_ready[layer_idx]:
+            return None
+        if not self.prefill_stream_end_submitted[layer_idx]:
+            raise RuntimeError(f"hybrid GPU layer {layer_idx} did not submit the final middle chunk")
+        job = self.hybrid_gpu_jobs[layer_idx]
+        if job is None:
+            raise RuntimeError(f"hybrid GPU build job for layer {layer_idx} was not submitted")
+
+        if not self.hybrid_gpu_finish_scheduled[layer_idx]:
+            try:
+                # Match RetroInfer's sync point: raw KV must be copied away
+                # before this layer workspace can be reused by the next layer.
+                job.wait_gpu_sources_consumed()
+                # CPU metadata is only needed by the background organizer.  Do
+                # not block the prefill path on D2H here; enqueue it and let
+                # the finish worker wait before touching CPU metadata.
+                job.start_cpu_metadata_d2h()
+            except BaseException as exc:
+                if self.prefill_stream_errors[layer_idx] is None:
+                    self.prefill_stream_errors[layer_idx] = exc
+                self.prefill_stream_done_events[layer_idx].set()
+                raise
+            # Queue CPU metadata/organize in layer order, but do not stall the
+            # next prefill layer here. Decode readiness is still gated by the
+            # per-layer done event and layer_ready flag.
+            self.hybrid_gpu_finish_scheduled[layer_idx] = True
+            self._schedule_hybrid_layer_finish(
+                layer_idx,
+                lambda _worker_threads, layer_idx=layer_idx: self._finish_layer_index(layer_idx),
+            )
+        return None
+
+    def _install_hybrid_decode_metadata(self, layer_idx: int, metadata_gpu: dict) -> None:
+        layer_idx = int(layer_idx)
+        if metadata_gpu is None:
+            raise RuntimeError(f"hybrid GPU metadata for layer {layer_idx} is not ready")
+
+        centroids_gpu = metadata_gpu.get("centroids")
+        cluster_sizes_gpu_src = metadata_gpu.get("cluster_sizes")
+        cluster_counts_gpu_src = metadata_gpu.get("cluster_counts")
+        if centroids_gpu is None or cluster_sizes_gpu_src is None or cluster_counts_gpu_src is None:
+            raise RuntimeError(f"missing GPU decode metadata for hybrid layer {layer_idx}")
+        required_centroids = int(centroids_gpu.size(1)) + 1
+        if required_centroids > self.n_centroids:
+            raise RuntimeError(
+                f"hybrid GPU layer {layer_idx} produced {required_centroids - 1} clusters, "
+                f"but metadata capacity is {self.n_centroids - 1}; "
+                "GPU-only build must not resize decode metadata after allocation"
+            )
+
+        if int(centroids_gpu.dim()) != 3:
+            raise RuntimeError(f"hybrid layer {layer_idx} centroids must be 3D")
+        if int(cluster_sizes_gpu_src.dim()) != 2:
+            raise RuntimeError(f"hybrid layer {layer_idx} cluster_sizes must be 2D")
+        if int(centroids_gpu.size(0)) != int(self.batch_groups):
+            raise RuntimeError(
+                f"hybrid layer {layer_idx} centroid rows {int(centroids_gpu.size(0))} "
+                f"!= batch_groups {int(self.batch_groups)}"
+            )
+        if int(cluster_sizes_gpu_src.size(0)) != int(self.batch_groups):
+            raise RuntimeError(
+                f"hybrid layer {layer_idx} cluster size rows {int(cluster_sizes_gpu_src.size(0))} "
+                f"!= batch_groups {int(self.batch_groups)}"
+            )
+        if int(centroids_gpu.size(2)) != int(self.head_dim):
+            raise RuntimeError(
+                f"hybrid layer {layer_idx} centroid dim {int(centroids_gpu.size(2))} "
+                f"!= head_dim {int(self.head_dim)}"
+            )
+        if int(cluster_sizes_gpu_src.size(1)) != int(centroids_gpu.size(1)):
+            raise RuntimeError(
+                f"hybrid layer {layer_idx} cluster_sizes columns {int(cluster_sizes_gpu_src.size(1))} "
+                f"!= centroid clusters {int(centroids_gpu.size(1))}"
+            )
+        if int(cluster_counts_gpu_src.dim()) != 1 or int(cluster_counts_gpu_src.size(0)) != int(self.batch_groups):
+            raise RuntimeError(
+                f"hybrid layer {layer_idx} cluster_counts shape {tuple(cluster_counts_gpu_src.shape)} "
+                f"does not match batch_groups {int(self.batch_groups)}"
+            )
+
+        self.centroids_cpu[layer_idx] = None
+        self.centroids_mask_cpu[layer_idx] = None
+        device = torch.device(self.layer_mapping[str(layer_idx)])
+        with torch.cuda.device(device):
+            self._materialize_hybrid_decode_metadata_gpu(
+                layer_idx,
+                centroids_gpu,
+                cluster_sizes_gpu_src,
+                cluster_counts_gpu_src,
+                device,
+            )
+
+    def _materialize_hybrid_decode_metadata_gpu(
+        self,
+        layer_idx: int,
+        centroids_compact: torch.Tensor,
+        cluster_sizes_compact: torch.Tensor,
+        cluster_counts: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        """Install compact GPU build metadata into the full decode layout.
+
+        Decode, prefetch, and async-update code use the global n_centroids
+        contract. The GPU builder emits a compact active-cluster layout, so we
+        expand only metadata needed by decode on device and keep centroids off
+        the CPU path.
+        """
+        if centroids_compact.device != device:
+            centroids_compact = centroids_compact.to(device=device, non_blocking=True).contiguous()
+        if cluster_sizes_compact.device != device:
+            cluster_sizes_compact = cluster_sizes_compact.to(device=device, non_blocking=True).contiguous()
+        if cluster_counts.device != device:
+            cluster_counts = cluster_counts.to(device=device, non_blocking=True).contiguous()
+        if not centroids_compact.is_contiguous():
+            centroids_compact = centroids_compact.contiguous()
+        if not cluster_sizes_compact.is_contiguous():
+            cluster_sizes_compact = cluster_sizes_compact.contiguous()
+        if not cluster_counts.is_contiguous():
+            cluster_counts = cluster_counts.contiguous()
+
+        cluster_sizes_compact = cluster_sizes_compact.to(dtype=torch.int32)
+        cluster_counts = cluster_counts.to(dtype=torch.int32)
+        compact_clusters = int(cluster_sizes_compact.size(1))
+        cluster_ids = torch.arange(
+            compact_clusters,
+            device=device,
+            dtype=torch.int32,
+        ).view(1, -1)
+        valid_by_count = cluster_ids < cluster_counts.view(-1, 1)
+        active_sizes = cluster_sizes_compact.masked_fill(~valid_by_count, 0)
+        active_mask = ~valid_by_count | (active_sizes == 0)
+
+        centroids_full = self.centroids[layer_idx]
+        cluster_sizes_full = self.cluster_sizes_gpu[layer_idx]
+        centroids_mask_full = self.centroids_mask[layer_idx]
+        centroid_shape = (self.batch_groups, self.n_centroids, self.head_dim)
+        metadata_shape = (self.batch_groups, self.n_centroids)
+
+        if centroids_full is None or tuple(centroids_full.shape) != centroid_shape:
+            centroids_full = torch.empty(
+                centroid_shape,
+                dtype=torch.float32,
+                device=device,
+            )
+        if cluster_sizes_full is None or tuple(cluster_sizes_full.shape) != metadata_shape:
+            cluster_sizes_full = torch.empty(
+                metadata_shape,
+                dtype=torch.int32,
+                device=device,
+            )
+        if centroids_mask_full is None or tuple(centroids_mask_full.shape) != metadata_shape:
+            centroids_mask_full = torch.empty(
+                metadata_shape,
+                dtype=torch.bool,
+                device=device,
+            )
+
+        cluster_sizes_full.zero_()
+        centroids_mask_full.fill_(True)
+        centroids_full[:, :compact_clusters, :].copy_(centroids_compact)
+        cluster_sizes_full[:, :compact_clusters].copy_(active_sizes)
+        centroids_mask_full[:, :compact_clusters].copy_(active_mask)
+
+        self.centroids[layer_idx] = centroids_full
+        self.cluster_sizes_gpu[layer_idx] = cluster_sizes_full
+        self.centroids_mask[layer_idx] = centroids_mask_full
 
     def _finish_layer_index(self, layer_idx: int):
         job = self.hybrid_gpu_jobs[layer_idx]
@@ -1100,19 +1485,16 @@ class Hybrid8WayIMICache(adpimi_cache):
 
         self._ensure_list_storage(layer_idx)
         keep_search_metadata = self._decode_search_enabled()
+
         result = job.finish(
             self.list_keys[layer_idx],
             self.list_values[layer_idx],
             keep_search_metadata=keep_search_metadata,
         )
         if keep_search_metadata:
-            self.hybrid_search_metadata_cpu[layer_idx] = result.search_metadata_cpu
+            self.hybrid_search_metadata_cpu[layer_idx] = None
             if result.search_metadata_gpu is None:
-                device = self.layer_mapping[str(layer_idx)]
-                self.hybrid_search_metadata_gpu[layer_idx] = {
-                    key: value.to(device=device, non_blocking=True)
-                    for key, value in result.search_metadata_cpu.items()
-                }
+                self.hybrid_search_metadata_gpu[layer_idx] = None
             else:
                 self.hybrid_search_metadata_gpu[layer_idx] = result.search_metadata_gpu
         else:
@@ -1130,8 +1512,7 @@ class Hybrid8WayIMICache(adpimi_cache):
             )
 
         with self._metadata_lock:
-            self._ensure_metadata_buffers()
-            self._load_layer_metadata(layer_idx, result.metadata)
+            self._load_hybrid_gpu_layer_metadata(layer_idx, result)
         self._log_index_summary_once(layer_idx)
 
         stats = dict(result.stats)
@@ -1180,6 +1561,53 @@ class Hybrid8WayIMICache(adpimi_cache):
                 f"[IMI HYBRID INDEX] layer={layer_idx} mode={build_mode} phase=done elapsed_ms={elapsed_ms:.2f}",
             flush=True,
         )
+
+    def _load_hybrid_gpu_layer_metadata(self, layer_idx: int, result) -> None:
+        metadata = result.metadata
+        base_metadata_gpu = result.base_metadata_gpu
+        if base_metadata_gpu is None:
+            raise RuntimeError(f"hybrid GPU layer {layer_idx} did not return decode metadata")
+        self.layer_metadata[layer_idx] = metadata
+
+        cluster_sizes = self.cluster_sizes_cpu[layer_idx]
+        cluster_offsets = self.cluster_offsets_cpu[layer_idx]
+        if cluster_sizes is None or cluster_offsets is None:
+            cluster_sizes = torch.zeros(
+                (self.batch_groups, self.n_centroids),
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            cluster_offsets = torch.zeros(
+                (self.batch_groups, self.n_centroids + 1),
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            self.cluster_sizes_cpu[layer_idx] = cluster_sizes
+            self.cluster_offsets_cpu[layer_idx] = cluster_offsets
+
+        cluster_sizes.zero_()
+        cluster_offsets.zero_()
+        for row_idx, row_meta in enumerate(metadata):
+            cluster_count = int(row_meta.get("cluster_sizes").numel())
+            if cluster_count <= 0:
+                continue
+            if cluster_count >= self.n_centroids:
+                raise RuntimeError(
+                    f"hybrid GPU layer {layer_idx} produced {cluster_count} clusters, "
+                    f"but metadata capacity is {self.n_centroids}"
+                )
+            sizes_tensor = row_meta["cluster_sizes"].to(dtype=torch.int32, device="cpu")
+            offsets_tensor = row_meta["cluster_offsets"].to(dtype=torch.int32, device="cpu")
+            cluster_sizes[row_idx, :cluster_count].copy_(sizes_tensor)
+            cluster_offsets[row_idx, : cluster_count + 1].copy_(offsets_tensor)
+            cluster_offsets[row_idx, cluster_count + 1 :] = int(offsets_tensor[-1].item())
+
+        self._install_hybrid_decode_metadata(layer_idx, base_metadata_gpu)
+        if self.cluster_sizes_gpu[layer_idx] is None or self.centroids_mask[layer_idx] is None:
+            raise RuntimeError(f"hybrid GPU decode metadata for layer {layer_idx} is missing after install")
+        if self.adpimi_index[layer_idx] is not None:
+            self.adpimi_index[layer_idx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
+        self.layer_ready[layer_idx] = True
 
     def _schedule_hybrid_layer_finish(self, layer_idx: int, finish_fn) -> None:
         with self._kmeans_job_lock:
@@ -1235,21 +1663,10 @@ class Hybrid8WayIMICache(adpimi_cache):
         stats["layer_idx"] = int(layer_idx)
         stats["build_device"] = "cpu_pipeline"
         self.hybrid_gpu_profile_rows.append(stats)
-        self.hybrid_cpu_source_refs[layer_idx] = None
+        self.hybrid_cpu_source_refs[layer_idx].clear()
         if self._decode_search_enabled() and search_metadata_cpu is not None:
-            device = self.layer_mapping[str(layer_idx)]
             self.hybrid_search_metadata_cpu[layer_idx] = search_metadata_cpu
-            self.hybrid_search_metadata_gpu[layer_idx] = {
-                key: value.to(device=device, non_blocking=True)
-                for key, value in search_metadata_cpu.items()
-                if key in (
-                    "subspace_centroids",
-                    "subspace_centroid_masks",
-                    "subspace_dim_ids",
-                    "subspace_dim_masks",
-                    "compact_codes",
-                )
-            }
+            self.hybrid_search_metadata_gpu[layer_idx] = None
         if self.profile_prefill:
             self.prefill_breakdown_rows.append({
                 "layer_idx": int(layer_idx),
@@ -1277,63 +1694,73 @@ class Hybrid8WayIMICache(adpimi_cache):
     def _wait_for_hybrid_background_finishes(self) -> None:
         if not getattr(self, "build_index_when_prefilling", False):
             return
-        for layer_idx in range(self.layer_num):
-            self._force_pending_gpu_build(layer_idx)
+        waited_layers = []
         for layer_idx in range(self.layer_num):
             if not self.prefill_stream_started[layer_idx] or self.layer_ready[layer_idx]:
                 continue
             done_event = self.prefill_stream_done_events[layer_idx]
             done_event.wait()
             self._raise_prefill_stream_error(layer_idx)
+            waited_layers.append(int(layer_idx))
+            if not self.layer_ready[layer_idx]:
+                raise RuntimeError(f"hybrid layer {layer_idx} finish event completed but layer_ready is false")
+        if waited_layers:
+            self._emit_pipeline_debug({
+                "tag": "IMI_WAIT_ALL_LAYERS_READY",
+                "layers": waited_layers,
+            })
 
     def reset_for_next_sequence(self, valid_start, max_new_length: int, input_length: int) -> None:
         self._wait_for_hybrid_background_finishes()
         super().reset_for_next_sequence(valid_start, max_new_length, input_length)
         self.hybrid_gpu_jobs = [None] * self.layer_num
-        self.hybrid_cpu_source_refs = [None] * self.layer_num
+        self.hybrid_cpu_source_refs = [[] for _ in range(self.layer_num)]
         self.hybrid_cpu_source_release_started = [False] * self.layer_num
+        self.hybrid_cpu_stream_chunk_ids = [0] * self.layer_num
+        self.hybrid_cpu_stream_token_offsets = [None] * self.layer_num
+        self.hybrid_cpu_stream_token_counts = [None] * self.layer_num
+        self.hybrid_cpu_stream_seen = [None] * self.layer_num
         self.hybrid_gpu_stream_chunk_ids = [0] * self.layer_num
         self.hybrid_gpu_stream_token_offsets = [None] * self.layer_num
         self.hybrid_gpu_stream_token_counts = [None] * self.layer_num
+        self.hybrid_gpu_stream_middle_starts = [0] * self.layer_num
         self.hybrid_staging_keys = [None] * self.layer_num
         self.hybrid_staging_values = [None] * self.layer_num
         self.hybrid_staging_seen = [None] * self.layer_num
-        self.hybrid_staging_token_counts = [None] * self.layer_num
+        self.hybrid_gpu_finish_scheduled = [False] * self.layer_num
         self.hybrid_search_metadata_cpu = [None] * self.layer_num
         self.hybrid_search_metadata_gpu = [None] * self.layer_num
         self.hybrid_gpu_profile_rows = []
-        with self.hybrid_gpu_cv:
-            self.hybrid_gpu_pending = [None] * self.layer_num
-            self.hybrid_gpu_pending_order = []
-            self.hybrid_gpu_cv.notify_all()
 
     def cleanup(self):
-        if hasattr(self, "hybrid_gpu_cv"):
-            try:
-                self._wait_for_hybrid_background_finishes()
-            except Exception:
-                pass
-            with self.hybrid_gpu_cv:
-                self.hybrid_gpu_stop = True
-                self.hybrid_gpu_cv.notify_all()
-            if hasattr(self, "hybrid_gpu_worker") and self.hybrid_gpu_worker is not None:
-                self.hybrid_gpu_worker.join(timeout=1.0)
+        try:
+            self._wait_for_hybrid_background_finishes()
+        except Exception:
+            pass
+        if hasattr(self, "hybrid_cpu_submit_queue"):
+            self.hybrid_cpu_submit_stop = True
+            self.hybrid_cpu_submit_queue.put(None)
+            if hasattr(self, "hybrid_cpu_submit_worker") and self.hybrid_cpu_submit_worker is not None:
+                self.hybrid_cpu_submit_worker.join(timeout=1.0)
         if hasattr(self, "hybrid_gpu_jobs"):
             for idx in range(len(self.hybrid_gpu_jobs)):
                 self.hybrid_gpu_jobs[idx] = None
-                self.hybrid_cpu_source_refs[idx] = None
+                self.hybrid_cpu_source_refs[idx].clear()
                 self.hybrid_cpu_source_release_started[idx] = False
+                self.hybrid_cpu_stream_chunk_ids[idx] = 0
+                self.hybrid_cpu_stream_token_offsets[idx] = None
+                self.hybrid_cpu_stream_token_counts[idx] = None
+                self.hybrid_cpu_stream_seen[idx] = None
                 self.hybrid_gpu_stream_chunk_ids[idx] = 0
                 self.hybrid_gpu_stream_token_offsets[idx] = None
                 self.hybrid_gpu_stream_token_counts[idx] = None
+                self.hybrid_gpu_stream_middle_starts[idx] = 0
                 self.hybrid_staging_keys[idx] = None
                 self.hybrid_staging_values[idx] = None
                 self.hybrid_staging_seen[idx] = None
-                self.hybrid_staging_token_counts[idx] = None
+                self.hybrid_gpu_finish_scheduled[idx] = False
                 self.hybrid_search_metadata_cpu[idx] = None
                 self.hybrid_search_metadata_gpu[idx] = None
-            self.hybrid_gpu_pending = [None] * self.layer_num
-            self.hybrid_gpu_pending_order = []
         if hasattr(self, "hybrid_gpu_profile_rows"):
             self.hybrid_gpu_profile_rows = []
         if hasattr(self, "hybrid_finish_scheduler") and self.hybrid_finish_scheduler is not None:

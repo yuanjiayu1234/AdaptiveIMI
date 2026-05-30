@@ -3,7 +3,6 @@ from importlib import import_module
 __all__ = [
     "flash_attn_cache",
     "flash_attn_cache_offload",
-    "adpimi_cache",
 ]
 
 
@@ -11,7 +10,6 @@ def __getattr__(name):
     mapping = {
         "flash_attn_cache": ("full_cache", "flash_attn_cache"),
         "flash_attn_cache_offload": ("offload_cache", "flash_attn_cache_offload"),
-        "adpimi_cache": ("adaptive_imi", "adpimi_cache"),
     }
     if name in mapping:
         module_name, attr_name = mapping[name]

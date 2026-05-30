@@ -8,16 +8,8 @@
         "buffer_cluster_num": 32,
         "cache_ratio": 0.05,
         "gpu_only": false,
-        "subspace_parts": 4,
-        "pipeline": {
-            "total_cpu_threads": 96,
-            "max_concurrent_prefill": 16,
-            "worker_threads": 96,
-            "kmeans_concurrency": 16,
-            "chunk_buffer_count": 8,
-            "enable_omp_nested": true,
-            "omp_max_active_levels": 2
-        },
+        "engine": "hybrid_8way_v2",
+        "subspace_parts": 8,
         "kmeans": {
             "max_iters": 15,
             "tol": 0.0005,
@@ -34,12 +26,7 @@
             "tiles_per_layer": 1
         },
         "prefill": {
-            "prefill_chunk_size": 16384,
-            "enable_prefill_attn_chunk": true,
-            "streaming": {
-                "prefill_queue_depth": 8,
-                "prefill_stage_slots": 8
-            }
+            "prefill_chunk_size": 16384
         },
         "cpu_threads": 24
     }
