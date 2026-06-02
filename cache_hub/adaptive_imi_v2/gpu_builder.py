@@ -16,7 +16,6 @@ _HYBRID_8WAY_CUDA_EXT = None
 @dataclass
 class HybridBuildResult:
     metadata: List[Dict[str, object]]
-    search_metadata_gpu: Optional[Dict[str, torch.Tensor]] = None
     base_metadata_gpu: Optional[Dict[str, torch.Tensor]] = None
     stats: Dict[str, float] = field(default_factory=dict)
 
@@ -245,21 +244,17 @@ class HybridLayerBuildJob:
         self,
         *,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         rows = self.batch_size * self.kv_heads
         heads = self.partition_spec["heads"]
-        max_pairs = 1
         max_sub_dim = 1
         for head_idx in range(self.kv_heads):
             head_spec = heads[str(head_idx)]
             for pairs in head_spec["groups"]:
-                max_pairs = max(max_pairs, len(pairs))
                 max_sub_dim = max(max_sub_dim, len(pairs) * 2)
 
         subspace_dim_ids = torch.zeros((rows, 8, max_sub_dim), dtype=torch.int64, device=device)
         subspace_dim_masks = torch.ones((rows, 8, max_sub_dim), dtype=torch.bool, device=device)
-        subspace_pair_ids = torch.full((rows, 8, max_pairs), -1, dtype=torch.int64, device=device)
-        subspace_pair_masks = torch.ones((rows, 8, max_pairs), dtype=torch.bool, device=device)
 
         for batch_idx in range(self.batch_size):
             for head_idx in range(self.kv_heads):
@@ -267,20 +262,13 @@ class HybridLayerBuildJob:
                 head_spec = heads[str(head_idx)]
                 groups = head_spec["groups"]
                 for subspace_idx, pairs in enumerate(groups):
-                    pair_tensor = torch.tensor(pairs, dtype=torch.int64, device=device)
                     dim_tensor = _pair_dim_indices(pairs, self.head_dim, device)
-                    subspace_pair_ids[row_idx, subspace_idx, : pair_tensor.numel()].copy_(pair_tensor)
-                    subspace_pair_masks[row_idx, subspace_idx, : pair_tensor.numel()] = False
                     subspace_dim_ids[row_idx, subspace_idx, : dim_tensor.numel()].copy_(dim_tensor)
                     subspace_dim_masks[row_idx, subspace_idx, : dim_tensor.numel()] = False
 
         return (
             subspace_dim_ids,
             subspace_dim_masks,
-            subspace_pair_ids,
-            subspace_pair_masks,
-            max_sub_dim,
-            max_pairs,
         )
 
     def _build_metadata_batched_cuda(self, keys: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -301,24 +289,11 @@ class HybridLayerBuildJob:
         (
             subspace_dim_ids,
             subspace_dim_masks,
-            subspace_pair_ids,
-            subspace_pair_masks,
-            max_sub_dim,
-            max_pairs,
         ) = self._prepare_partition_tensors(device=keys.device)
 
         row_token_counts = self._row_token_counts(keys.device)
         k_values_tensor = torch.tensor(k_values, dtype=torch.int32, device=keys.device)
-        (
-            subspace_centroids_cuda,
-            subspace_centroid_masks_cuda,
-            token_ids_by_cluster,
-            compact_codes,
-            cluster_sizes,
-            cluster_offsets,
-            cluster_counts,
-            full_centroids,
-        ) = ext.run_hybrid_8way_kmeans(
+        build_outputs = ext.run_hybrid_8way_kmeans(
             keys.contiguous(),
             row_token_counts.contiguous(),
             subspace_dim_ids.contiguous(),
@@ -328,6 +303,29 @@ class HybridLayerBuildJob:
             int(max_k),
             int(max_compact_clusters),
         )
+        if len(build_outputs) == 5:
+            (
+                token_ids_by_cluster,
+                cluster_sizes,
+                cluster_offsets,
+                cluster_counts,
+                full_centroids,
+            ) = build_outputs
+        elif len(build_outputs) == 8:
+            (
+                _subspace_centroids_cuda,
+                _subspace_centroid_masks_cuda,
+                token_ids_by_cluster,
+                _compact_codes,
+                cluster_sizes,
+                cluster_offsets,
+                cluster_counts,
+                full_centroids,
+            ) = build_outputs
+        else:
+            raise RuntimeError(
+                f"hybrid 8-way builder returned {len(build_outputs)} tensors; expected 5 flat-only tensors"
+            )
         metadata = {
             "token_counts": row_token_counts.to(torch.int32),
             "cluster_counts": cluster_counts.to(torch.int32),
@@ -335,15 +333,6 @@ class HybridLayerBuildJob:
             "cluster_offsets": cluster_offsets.to(torch.int32),
             "centroids": full_centroids.to(torch.float32),
             "token_ids_by_cluster": token_ids_by_cluster.to(torch.int32),
-            "compact_codes": compact_codes.to(torch.int32),
-            "subspace_centroids": subspace_centroids_cuda.to(torch.float32),
-            "subspace_centroid_masks": subspace_centroid_masks_cuda.to(torch.bool),
-            "subspace_dims": (~subspace_dim_masks).sum(dim=2).to(torch.int32),
-            "subspace_pair_ids": subspace_pair_ids,
-            "subspace_pair_masks": subspace_pair_masks,
-            "subspace_dim_ids": subspace_dim_ids,
-            "subspace_dim_masks": subspace_dim_masks,
-            "k_values": k_values_tensor,
         }
         return metadata
 
@@ -456,7 +445,6 @@ class HybridLayerBuildJob:
         list_keys: torch.Tensor,
         list_values: torch.Tensor,
         *,
-        keep_search_metadata: bool = True,
         on_sources_consumed=None,
     ) -> HybridBuildResult:
         self.wait_gpu_sources_consumed()
@@ -512,29 +500,17 @@ class HybridLayerBuildJob:
             "batch_groups": float(self.batch_size * self.kv_heads),
         }
 
-        search_gpu = None
         base_gpu = {
             "centroids": self._metadata_device["centroids"],
             "cluster_sizes": self._metadata_device["cluster_sizes"],
             "cluster_counts": self._metadata_device["cluster_counts"],
         }
-        if keep_search_metadata:
-            active_clusters = max(int(metadata_cpu["cluster_counts"].max().item()), 1)
-            search_keys = (
-                "subspace_centroids",
-                "subspace_centroid_masks",
-                "subspace_dim_ids",
-                "subspace_dim_masks",
-            )
-            search_gpu = {key: self._metadata_device[key] for key in search_keys}
-            search_gpu["compact_codes"] = self._metadata_device["compact_codes"][:, :active_clusters, :]
         self._metadata_device = None
         self._metadata_cpu = None
         self._keys_ref = None
         self._values_ref = None
         return HybridBuildResult(
             metadata=structured,
-            search_metadata_gpu=search_gpu,
             base_metadata_gpu=base_gpu,
             stats=stats,
         )

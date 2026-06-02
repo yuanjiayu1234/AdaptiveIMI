@@ -1,4 +1,3 @@
-import math
 from typing import Dict, List, Optional
 
 
@@ -16,26 +15,29 @@ def choose_learned_k_values(
     *,
     default_m: Optional[int] = None,
 ) -> List[int]:
-    raw = spec.get("k_values") or spec.get("K")
-    token_count = max(int(token_count), 1)
-    if raw:
-        return [max(1, min(int(value), token_count)) for value in raw]
+    """Choose balanced adjacent k values from current context length.
 
+    Partition specs define only subspace layout. Runtime k is derived from the
+    current token count so product(k) covers token_count / target_cluster_size.
+    """
+    token_count = max(int(token_count), 1)
     m = int(spec.get("subspace_parts", spec.get("M", default_m or 1)) or default_m or 1)
     m = max(m, 1)
-    target = max(float(token_count) / float(max(int(target_cluster_size), 1)), 1.0)
-    log_target = math.log(target)
+    target = float(token_count) / float(max(int(target_cluster_size), 1))
 
-    best_num_threes = 0
-    best_error = float("inf")
-    best_product = 0
-    for num_threes in range(m + 1):
-        product = (3 ** num_threes) * (2 ** (m - num_threes))
-        error = abs(math.log(float(product)) - log_target)
-        if error < best_error or (error == best_error and product < best_product):
-            best_error = error
-            best_num_threes = num_threes
-            best_product = product
+    base = min(3, token_count)
+    while True:
+        product = base ** m
+        if float(product) > target:
+            return [base] * m
 
-    values = [3] * best_num_threes + [2] * (m - best_num_threes)
-    return [min(value, token_count) for value in values]
+        high = min(base + 1, token_count)
+        if high == base:
+            return [base] * m
+
+        for high_count in range(1, m + 1):
+            product = (high ** high_count) * (base ** (m - high_count))
+            if float(product) > target:
+                return [high] * high_count + [base] * (m - high_count)
+
+        base = high

@@ -128,11 +128,18 @@ class Hybrid8WayIMICache(adpimi_cache):
         self._init_hybrid_gpu_build_state(hybrid_cfg)
         self.decode_search_config = dict(runtime_config.get("decode_search") or {})
         decode_search_mode = str(self.decode_search_config.get("mode", "flat")).lower()
-        if decode_search_mode not in ("flat", "subspace_rerank"):
+        if decode_search_mode != "flat":
             raise ValueError(
-                "hybrid_8way_v2 decode_search.mode must be 'flat' or 'subspace_rerank'; "
+                "hybrid_8way_v2 decode_search.mode now supports only 'flat'; "
                 f"got {decode_search_mode!r}"
             )
+        flat_score_mode = str(self.decode_search_config.get("flat_score", "raw_sum")).lower()
+        if flat_score_mode not in ("raw_sum", "head_softmax_sum", "per_head_softmax_sum"):
+            raise ValueError(
+                "hybrid_8way_v2 decode_search.flat_score must be 'raw_sum' or "
+                f"'head_softmax_sum'; got {flat_score_mode!r}"
+            )
+        self.flat_score_mode = "head_softmax_sum" if flat_score_mode == "per_head_softmax_sum" else flat_score_mode
         max_concurrent, total_build_threads = self._init_hybrid_cpu_finish_scheduler(runtime_config)
 
         print(
@@ -163,8 +170,6 @@ class Hybrid8WayIMICache(adpimi_cache):
         self.hybrid_staging_keys: list[Optional[torch.Tensor]] = [None] * self.layer_num
         self.hybrid_staging_values: list[Optional[torch.Tensor]] = [None] * self.layer_num
         self.hybrid_staging_seen: list[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.hybrid_search_metadata_cpu: list[Optional[Dict[str, torch.Tensor]]] = [None] * self.layer_num
-        self.hybrid_search_metadata_gpu: list[Optional[Dict[str, torch.Tensor]]] = [None] * self.layer_num
         self.hybrid_gpu_profile_rows = []
         self.hybrid_gpu_finish_scheduled = [False] * self.layer_num
         self.hybrid_cpu_submit_queue: thread_queue.Queue[Optional[_PendingCpuSubmit]] = thread_queue.Queue()
@@ -456,33 +461,9 @@ class Hybrid8WayIMICache(adpimi_cache):
         self.prefill_stream_done_events[prev_layer].wait()
         self._raise_prefill_stream_error(prev_layer)
 
-    def _materialize_decode_search_metadata_gpu(self) -> None:
-        if not self._decode_search_enabled():
-            return
-        search_keys = (
-            "subspace_centroids",
-            "subspace_centroid_masks",
-            "subspace_dim_ids",
-            "subspace_dim_masks",
-            "compact_codes",
-        )
-        for layer_idx, metadata_cpu in enumerate(self.hybrid_search_metadata_cpu):
-            if self.hybrid_search_metadata_gpu[layer_idx] is not None:
-                continue
-            if metadata_cpu is None:
-                continue
-            device = self.layer_mapping[str(layer_idx)]
-            self.hybrid_search_metadata_gpu[layer_idx] = {
-                key: value.to(device=device, non_blocking=True)
-                for key, value in metadata_cpu.items()
-                if key in search_keys and torch.is_tensor(value)
-            }
-
     def prepare_cache(self, skip_prefetch: bool = False):
         self._wait_for_hybrid_background_finishes()
-        result = super().prepare_cache(skip_prefetch=True)
-        self._materialize_decode_search_metadata_gpu()
-        return result
+        return super().prepare_cache(skip_prefetch=True)
 
     def ensure_layer_ready(self, layer_idx):
         layer_idx = int(layer_idx)
@@ -506,8 +487,7 @@ class Hybrid8WayIMICache(adpimi_cache):
         return self.layer_build_modes[int(layer_idx)] == "gpu"
 
     def _decode_search_enabled(self) -> bool:
-        mode = str(self.decode_search_config.get("mode", "flat")).lower()
-        return mode == "subspace_rerank"
+        return False
 
     def _token_rerank_enabled(self) -> bool:
         try:
@@ -519,73 +499,20 @@ class Hybrid8WayIMICache(adpimi_cache):
         return False
 
     def _select_clusters_for_decode(self, layer_idx: int, query_grouped: torch.Tensor, device: str) -> torch.Tensor:
-        if not self._decode_search_enabled():
-            return self._select_clusters_flat(layer_idx, query_grouped, device)
-
-        metadata = self.hybrid_search_metadata_gpu[layer_idx]
-        required = (
-            "subspace_centroids",
-            "subspace_centroid_masks",
-            "subspace_dim_ids",
-            "subspace_dim_masks",
-            "compact_codes",
-        )
-        if metadata is None or any(key not in metadata for key in required):
-            raise RuntimeError(f"hybrid decode search metadata missing on layer {layer_idx}")
-
-        batch_groups = int(query_grouped.size(0))
-
-        if int(metadata["subspace_dim_ids"].size(0)) != batch_groups:
-            raise RuntimeError(
-                f"hybrid decode search metadata rows mismatch: "
-                f"{metadata['subspace_dim_ids'].size(0)} != {batch_groups}"
-            )
-
-        dim_ids = metadata["subspace_dim_ids"].to(device=query_grouped.device)
-        dim_masks = metadata["subspace_dim_masks"].to(device=query_grouped.device)
-        subspace_centroids = metadata["subspace_centroids"].to(device=query_grouped.device)
-        subspace_masks = metadata["subspace_centroid_masks"].to(device=query_grouped.device)
-        compact_codes = metadata["compact_codes"].to(device=query_grouped.device)
-        active_clusters = int(compact_codes.size(1))
-        if active_clusters <= 0:
-            return torch.full(
-                (batch_groups, self.nprobe),
-                self.padding_cluster_id,
-                dtype=torch.int64,
-                device=query_grouped.device,
-            )
-
-        default_candidates = max(self.nprobe * 4, 1024)
-        candidate_limit = int(self.decode_search_config.get("candidate_clusters", default_candidates))
-        candidate_limit = max(1, min(max(candidate_limit, self.nprobe), active_clusters))
-        fused_select = getattr(imi_gpu_kernels, "fused_subspace_rerank_select", None)
-        if not callable(fused_select):
-            raise RuntimeError(
-                "subspace_rerank requires gpu_cluster_manager_cpp.fused_subspace_rerank_select. "
-                "Rebuild library/AdaptiveIMI/cpp_extensions; PyTorch fallback has been removed."
-            )
-        return fused_select(
-            query_grouped.contiguous(),
-            subspace_centroids.contiguous(),
-            subspace_masks.contiguous(),
-            dim_ids.contiguous(),
-            dim_masks.contiguous(),
-            compact_codes.contiguous(),
-            self.cluster_sizes_gpu[layer_idx].to(device=query_grouped.device).contiguous(),
-            int(self.nprobe),
-            int(candidate_limit),
-            int(self.max_retrieval_tokens),
-            int(self.padding_cluster_id),
-        )
+        return self._select_clusters_flat(layer_idx, query_grouped, device)
 
     def _select_clusters_flat(self, layer_idx: int, query_grouped: torch.Tensor, device: str) -> torch.Tensor:
-        similarities = imi_gpu_kernels.fused_query_group_similarities(
-            query_grouped,
-            self.centroids[layer_idx],
-            self.similarity_buffer_dict[device],
-        )
-        similarities.masked_fill_(self.centroids_mask[layer_idx], float("-inf"))
-        selected = self._select_clusters(layer_idx, similarities)
+        if self.flat_score_mode == "head_softmax_sum":
+            similarities = imi_gpu_kernels.fused_query_group_softmax_sum_similarities(
+                query_grouped,
+                self.centroids[layer_idx],
+                self._softmax_logits_buffer(device),
+                self.similarity_buffer_dict[device],
+            )
+            similarities.masked_fill_(self.centroids_mask[layer_idx], float("-inf"))
+            selected = self._select_clusters(layer_idx, similarities)
+        else:
+            selected = self._select_clusters_raw_sum_flat(layer_idx, query_grouped, device)
         return selected
 
     def _rerank_execution_tokens_for_decode(self, layer_idx: int, device: str, query_grouped: torch.Tensor) -> None:
@@ -1484,22 +1411,10 @@ class Hybrid8WayIMICache(adpimi_cache):
             print(f"[IMI HYBRID INDEX] layer={layer_idx} mode={build_mode} phase=start", flush=True)
 
         self._ensure_list_storage(layer_idx)
-        keep_search_metadata = self._decode_search_enabled()
-
         result = job.finish(
             self.list_keys[layer_idx],
             self.list_values[layer_idx],
-            keep_search_metadata=keep_search_metadata,
         )
-        if keep_search_metadata:
-            self.hybrid_search_metadata_cpu[layer_idx] = None
-            if result.search_metadata_gpu is None:
-                self.hybrid_search_metadata_gpu[layer_idx] = None
-            else:
-                self.hybrid_search_metadata_gpu[layer_idx] = result.search_metadata_gpu
-        else:
-            self.hybrid_search_metadata_cpu[layer_idx] = None
-            self.hybrid_search_metadata_gpu[layer_idx] = None
         self.hybrid_gpu_jobs[layer_idx] = None
 
         placeholder = torch.empty((self.batch_groups, 0, self.head_dim), dtype=self.dtype, pin_memory=True)
@@ -1643,7 +1558,6 @@ class Hybrid8WayIMICache(adpimi_cache):
         pipeline.set_worker_threads(worker_threads)
         metadata = pipeline.finish_index(self.list_keys[layer_idx], self.list_values[layer_idx])
         stats = pipeline.get_last_pipeline_stats() or {}
-        search_metadata_cpu = pipeline.get_last_search_metadata_cpu()
 
         placeholder = torch.empty((self.batch_groups, 0, self.head_dim), dtype=self.dtype, pin_memory=True)
         if self.adpimi_index[layer_idx] is not None:
@@ -1664,9 +1578,6 @@ class Hybrid8WayIMICache(adpimi_cache):
         stats["build_device"] = "cpu_pipeline"
         self.hybrid_gpu_profile_rows.append(stats)
         self.hybrid_cpu_source_refs[layer_idx].clear()
-        if self._decode_search_enabled() and search_metadata_cpu is not None:
-            self.hybrid_search_metadata_cpu[layer_idx] = search_metadata_cpu
-            self.hybrid_search_metadata_gpu[layer_idx] = None
         if self.profile_prefill:
             self.prefill_breakdown_rows.append({
                 "layer_idx": int(layer_idx),
@@ -1728,8 +1639,6 @@ class Hybrid8WayIMICache(adpimi_cache):
         self.hybrid_staging_values = [None] * self.layer_num
         self.hybrid_staging_seen = [None] * self.layer_num
         self.hybrid_gpu_finish_scheduled = [False] * self.layer_num
-        self.hybrid_search_metadata_cpu = [None] * self.layer_num
-        self.hybrid_search_metadata_gpu = [None] * self.layer_num
         self.hybrid_gpu_profile_rows = []
 
     def cleanup(self):
@@ -1759,8 +1668,6 @@ class Hybrid8WayIMICache(adpimi_cache):
                 self.hybrid_staging_values[idx] = None
                 self.hybrid_staging_seen[idx] = None
                 self.hybrid_gpu_finish_scheduled[idx] = False
-                self.hybrid_search_metadata_cpu[idx] = None
-                self.hybrid_search_metadata_gpu[idx] = None
         if hasattr(self, "hybrid_gpu_profile_rows"):
             self.hybrid_gpu_profile_rows = []
         if hasattr(self, "hybrid_finish_scheduler") and self.hybrid_finish_scheduler is not None:

@@ -131,10 +131,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 max_compact_clusters: min(prod(k_values), max_tokens), supplied by Python to avoid GPU scalar sync.
 
             Returns:
-                subspace_centroids: float32[batch_groups, 8, max_k, max_sub_dim]
-                subspace_centroid_masks: bool[batch_groups, 8, max_k]
                 token_ids_by_cluster: int32[batch_groups, max_tokens]
-                compact_codes: int32[batch_groups, max_compact_clusters, 8]
                 cluster_sizes: int32[batch_groups, max_compact_clusters]
                 cluster_offsets: int32[batch_groups, max_compact_clusters + 1]
                 cluster_counts: int32[batch_groups]
@@ -151,6 +148,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("row_token_counts"),
         py::arg("out_keys_cpu"),
         py::arg("out_values_cpu"),
+        py::call_guard<py::gil_scoped_release>(),
         R"pbdoc(
             Reorder raw CPU KV by CUDA-produced token ids into compact cluster order.
         )pbdoc"

@@ -35,7 +35,7 @@
             "prefill_chunk_size": 131072
         },
         "async_update": {
-            "enabled": true,
+            "enabled": false,
             "batch": 16,
             "threshold": 16,
             "delta_tokens": 512

@@ -80,7 +80,6 @@ class PrefillMixin:
 
         hidden_chunk = hidden_cpu[:, chunk_start:chunk_end, :].to(device, non_blocking=True)
 
-        pre_attn_total_start = self._start_prefill_gpu_segment()
         temp_hidden_states = self.layernorm(
             hidden_chunk,
             layer.input_layernorm_variance_epsilon,
@@ -99,7 +98,6 @@ class PrefillMixin:
 
         key_states[:, chunk_start:chunk_end, :, :].copy_(key_chunk)
         value_states[:, chunk_start:chunk_end, :, :].copy_(value_chunk)
-        self._finish_prefill_gpu_total_segment(layer_idx, pre_attn_total_start)
 
         return hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk
     def _streaming_finish_chunk(
@@ -135,13 +133,6 @@ class PrefillMixin:
             if not v_prefix.is_contiguous():
                 v_prefix = v_prefix.contiguous()
 
-            start_event = None
-            end_event = None
-            if self.profile_prefill_gpu:
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-
             attn_chunk = self.prefill_attention(
                 q_sub,
                 k_prefix,
@@ -162,10 +153,6 @@ class PrefillMixin:
                     flush=True,
                 )
 
-            if self.profile_prefill_gpu:
-                end_event.record()
-                self._record_prefill_gpu_attn_events(layer_idx, start_event, end_event)
-
             hidden_chunk[:, q_local_start:, :] += self.wo(
                 attn_chunk,
                 layer,
@@ -175,7 +162,6 @@ class PrefillMixin:
             )
             del attn_chunk, q_sub, k_prefix, v_prefix
 
-        post_attn_total_start = self._start_prefill_gpu_segment()
         hidden_states_norm = self.layernorm(
             hidden_chunk,
             layer.post_attention_layernorm_variance_epsilon,
@@ -183,7 +169,6 @@ class PrefillMixin:
         )
         mlp_out = self.mlp(hidden_states_norm, layer)
         hidden_chunk = hidden_chunk + mlp_out
-        self._finish_prefill_gpu_total_segment(layer_idx, post_attn_total_start)
 
         output_cpu[:, chunk_start:chunk_end, :].copy_(hidden_chunk, non_blocking=True)
         del hidden_chunk, hidden_states_norm, mlp_out, temp_hidden_states, query_chunk, key_chunk, value_chunk
@@ -214,7 +199,9 @@ class PrefillMixin:
         for chunk_start in range(0, seq_len, chunk_size):
             chunk_end = min(seq_len, chunk_start + chunk_size)
             chunk_idx = chunk_start // chunk_size
+            breakdown_enabled = getattr(self, "breakdown_enabled", False)
             chunk_t0 = time.perf_counter() if self._streaming_progress_enabled() else None
+            build_t0 = time.perf_counter() if breakdown_enabled else None
             hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk = self._streaming_build_kv_chunk(
                 hidden_cpu,
                 chunk_start,
@@ -225,11 +212,14 @@ class PrefillMixin:
                 key_states,
                 value_states,
             )
+            if build_t0 is not None:
+                self.prefill_kv_build_wall_ms += (time.perf_counter() - build_t0) * 1000.0
             if (
                 kv_cache is not None
                 and hasattr(kv_cache, "prefill_submit_kv_chunk")
                 and not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI")
             ):
+                submit_t0 = time.perf_counter() if breakdown_enabled else None
                 kv_cache.prefill_submit_kv_chunk(
                     key_states,
                     value_states,
@@ -238,6 +228,9 @@ class PrefillMixin:
                     chunk_start,
                     chunk_end,
                 )
+                if submit_t0 is not None:
+                    self.prefill_index_submit_block_ms += (time.perf_counter() - submit_t0) * 1000.0
+            finish_t0 = time.perf_counter() if breakdown_enabled else None
             self._streaming_finish_chunk(
                 layer,
                 layer_idx,
@@ -254,6 +247,8 @@ class PrefillMixin:
                 output_cpu,
                 debug_align,
             )
+            if finish_t0 is not None:
+                self.prefill_layer_compute_wall_ms += (time.perf_counter() - finish_t0) * 1000.0
             if chunk_t0 is not None:
                 elapsed_ms = (time.perf_counter() - chunk_t0) * 1000.0
                 self._log_streaming_progress(
@@ -262,8 +257,11 @@ class PrefillMixin:
 
         if kv_cache is not None and not (self._debug_skip_prefill_kv_update() and self.attention_type == "AdaptiveIMI"):
             finalize_t0 = time.perf_counter() if self._streaming_progress_enabled() else None
+            breakdown_finalize_t0 = time.perf_counter() if getattr(self, "breakdown_enabled", False) else None
             kv_cache.prefill_update_kv_cache(None, key_states, value_states, layer_idx, start_bdx)
             kv_cache.sync(layer_idx, start_bdx)
+            if breakdown_finalize_t0 is not None:
+                self.prefill_index_finalize_block_ms += (time.perf_counter() - breakdown_finalize_t0) * 1000.0
             if finalize_t0 is not None:
                 elapsed_ms = (time.perf_counter() - finalize_t0) * 1000.0
                 self._log_streaming_progress(
@@ -272,10 +270,8 @@ class PrefillMixin:
 
         del key_states, value_states
 
-        self._flush_prefill_gpu_layer_events(layer_idx)
         self._log_streaming_progress(f"[IMI STREAM] layer={layer_idx} phase=done")
     def prefill_forward_chunked(self, inputs_ids):
-        self._reset_prefill_gpu_profile()
         bsz, seq_len = inputs_ids.shape
         device = self.layers[0].device
         chunk_size = max(int(self.prefill_attn_chunk_size), 1)
@@ -296,11 +292,14 @@ class PrefillMixin:
         hidden_cpu = torch.empty((bsz, seq_len, self.hidden_size), **hidden_kwargs)
         next_cpu = torch.empty_like(hidden_cpu)
 
+        embed_t0 = time.perf_counter() if getattr(self, "breakdown_enabled", False) else None
         for chunk_start in range(0, seq_len, chunk_size):
             chunk_end = min(seq_len, chunk_start + chunk_size)
             ids_chunk = inputs_ids[:, chunk_start:chunk_end].to(device, non_blocking=True)
             embed_chunk = self.word_embedding(ids_chunk)
             hidden_cpu[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=True)
+        if embed_t0 is not None:
+            self.prefill_embedding_wall_ms += (time.perf_counter() - embed_t0) * 1000.0
         self._log_streaming_progress("[IMI STREAM] embedding_done")
 
         batch_ranges = self._prefill_chunked_batch_ranges(bsz)
@@ -328,9 +327,12 @@ class PrefillMixin:
 
         self._log_streaming_progress("[IMI STREAM] all_layers_done")
 
+        output_t0 = time.perf_counter() if getattr(self, "breakdown_enabled", False) else None
         last_hidden = hidden_cpu[:, -1:, :].to(device, non_blocking=True)
         last_hidden = self.layernorm(last_hidden, self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(last_hidden)
+        if output_t0 is not None:
+            self.prefill_output_head_wall_ms += (time.perf_counter() - output_t0) * 1000.0
         return logits
     def prefill_forward(self, inputs_ids):
         return self.prefill_forward_chunked(inputs_ids)

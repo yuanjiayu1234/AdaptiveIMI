@@ -35,11 +35,23 @@ class LLM(PrefillMixin, SamplingMixin):
         self.device_map = device_map
         self.prefill_chunk_size = 65536
         self.prefill_attn_chunk_size = self.prefill_chunk_size
-        self.profile_prefill_gpu = os.getenv("IMI_PROFILE_PREFILL_GPU", "0") == "1"
-        self.prefill_gpu_layer_rows = []
-        self._prefill_gpu_attn_events = {}
-        self._prefill_gpu_total_events = {}
         self._prefill_prefix_kv_workspace = {}
+        self.breakdown_enabled = os.getenv("IMI_BREAKDOWN_BENCHMARK", "0") == "1"
+        self.breakdown_mode = os.getenv("IMI_BREAKDOWN_MODE", "wall")
+        self.last_timing_stats = {}
+        self.cache_init_ms = 0.0
+        self.cache_reused = False
+        self.prefill_embedding_wall_ms = 0.0
+        self.prefill_forward_wall_ms = 0.0
+        self.prefill_kv_build_wall_ms = 0.0
+        self.prefill_layer_compute_wall_ms = 0.0
+        self.prefill_output_head_wall_ms = 0.0
+        self.prefill_sampling_ms = 0.0
+        self.prepare_cache_ms = 0.0
+        self.prefill_final_sync_ms = 0.0
+        self.prefill_index_submit_block_ms = 0.0
+        self.prefill_index_finalize_block_ms = 0.0
+        self._adaptiveimi_runtime_preflight_signatures = set()
 
     @staticmethod
     def _resolve_model_path(model_path: str) -> str:
@@ -214,19 +226,42 @@ class LLM(PrefillMixin, SamplingMixin):
 
         from cache_hub.adaptive_imi_v2.cache import Hybrid8WayIMICache as imi_cache_cls
 
+        reuse_signature = json.dumps(
+            {
+                "attention_type": self.attention_type,
+                "batch_size": self.batch_size,
+                "max_length": self.max_length,
+                "num_key_value_heads": self.num_key_value_heads,
+                "num_heads": self.num_heads,
+                "head_dim": self.head_dim,
+                "dtype": str(self.dtype),
+                "layer_mapping": self.layer_mapping,
+                "prefill_bsz": self.prefill_bsz if adaptive_prefill_bsz is None else adaptive_prefill_bsz,
+                "num_gpus": self.num_gpus,
+                "adaptive_imi": imi_config,
+            },
+            sort_keys=True,
+            default=str,
+        )
         existing_cache = getattr(self, "kv_cache", None)
-        if isinstance(existing_cache, imi_cache_cls) and existing_cache.can_reuse_for_next_sequence(
-            valid_start,
-            self.max_new_length,
-            self.input_length,
+        if (
+            isinstance(existing_cache, imi_cache_cls)
+            and getattr(existing_cache, "reuse_signature", None) == reuse_signature
+            and existing_cache.can_reuse_for_next_sequence(
+                valid_start,
+                self.max_new_length,
+                self.input_length,
+            )
         ):
             existing_cache.reset_for_next_sequence(
                 valid_start,
                 self.max_new_length,
                 self.input_length,
             )
+            self.cache_reused = True
             return
 
+        self.cache_reused = False
         self._reset_kv_cache_state()
         self.kv_cache = imi_cache_cls(
             valid_start=valid_start,
@@ -264,6 +299,7 @@ class LLM(PrefillMixin, SamplingMixin):
                 "decode_search": imi_config.get("decode_search", {}),
             },
         )
+        self.kv_cache.reuse_signature = reuse_signature
 
     def apply_prefill_config(self, model_config: dict) -> None:
         if not model_config:
@@ -290,48 +326,135 @@ class LLM(PrefillMixin, SamplingMixin):
                 self.prefill_chunk_size = chunk_size
                 self.prefill_attn_chunk_size = chunk_size
 
-    def _reset_prefill_gpu_profile(self):
-        self.prefill_gpu_layer_rows = []
-        self._prefill_gpu_attn_events = {}
-        self._prefill_gpu_total_events = {}
-    def _record_prefill_gpu_attn_events(self, layer_idx: int, start_event, end_event) -> None:
-        if not self.profile_prefill_gpu:
-            return
-        self._prefill_gpu_attn_events.setdefault(int(layer_idx), []).append((start_event, end_event))
-    def _record_prefill_gpu_total_events(self, layer_idx: int, start_event, end_event) -> None:
-        if not self.profile_prefill_gpu:
-            return
-        self._prefill_gpu_total_events.setdefault(int(layer_idx), []).append((start_event, end_event))
-    def _sum_prefill_gpu_events(self, events) -> float:
-        total_ms = 0.0
-        for start_event, end_event in events:
-            end_event.synchronize()
-            total_ms += float(start_event.elapsed_time(end_event))
-        return total_ms
-    def _start_prefill_gpu_segment(self):
-        if not self.profile_prefill_gpu:
-            return None
-        start_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        return start_event
-    def _finish_prefill_gpu_total_segment(self, layer_idx: int, start_event) -> None:
-        if not self.profile_prefill_gpu or start_event is None:
-            return
-        end_event = torch.cuda.Event(enable_timing=True)
-        end_event.record()
-        self._record_prefill_gpu_total_events(layer_idx, start_event, end_event)
-    def _flush_prefill_gpu_layer_events(self, layer_idx: int) -> None:
-        if not self.profile_prefill_gpu:
-            return
-        attn_events = self._prefill_gpu_attn_events.pop(int(layer_idx), [])
-        total_events = self._prefill_gpu_total_events.pop(int(layer_idx), [])
-        if not attn_events and not total_events:
-            return
-        self.prefill_gpu_layer_rows.append({
-            "layer_idx": int(layer_idx),
-            "prefill_gpu_attn_ms": round(self._sum_prefill_gpu_events(attn_events), 4),
-            "prefill_gpu_layer_total_ms": round(self._sum_prefill_gpu_events(total_events), 4),
-        })
+    def _reset_breakdown_profile(self):
+        self.breakdown_enabled = os.getenv("IMI_BREAKDOWN_BENCHMARK", "0") == "1"
+        self.breakdown_mode = os.getenv("IMI_BREAKDOWN_MODE", "wall")
+        self.last_timing_stats = {}
+        self.cache_init_ms = 0.0
+        self.cache_reused = False
+        self.prefill_embedding_wall_ms = 0.0
+        self.prefill_forward_wall_ms = 0.0
+        self.prefill_kv_build_wall_ms = 0.0
+        self.prefill_layer_compute_wall_ms = 0.0
+        self.prefill_output_head_wall_ms = 0.0
+        self.prefill_sampling_ms = 0.0
+        self.prepare_cache_ms = 0.0
+        self.prefill_final_sync_ms = 0.0
+        self.prefill_index_submit_block_ms = 0.0
+        self.prefill_index_finalize_block_ms = 0.0
+
+    @staticmethod
+    def _sum_profile_rows(rows, key):
+        return float(sum(float(row.get(key, 0.0) or 0.0) for row in (rows or [])))
+
+    @staticmethod
+    def _max_profile_rows(rows, key):
+        values = [float(row.get(key, 0.0) or 0.0) for row in (rows or [])]
+        return float(max(values)) if values else 0.0
+
+    def _build_breakdown_stats(self):
+        kv_cache = getattr(self, "kv_cache", None)
+        rows = list(getattr(kv_cache, "hybrid_gpu_profile_rows", []) or [])
+        detail_mode = getattr(self, "breakdown_mode", "wall") == "detail"
+        prefill_forward_wall_ms = float(getattr(self, "prefill_forward_wall_ms", 0.0) or 0.0)
+        submit_block_ms = float(getattr(self, "prefill_index_submit_block_ms", 0.0) or 0.0)
+        finalize_block_ms = float(getattr(self, "prefill_index_finalize_block_ms", 0.0) or 0.0)
+        embedding_ms = float(getattr(self, "prefill_embedding_wall_ms", 0.0) or 0.0)
+        kv_build_ms = float(getattr(self, "prefill_kv_build_wall_ms", 0.0) or 0.0)
+        layer_compute_ms = float(getattr(self, "prefill_layer_compute_wall_ms", 0.0) or 0.0)
+        output_head_ms = float(getattr(self, "prefill_output_head_wall_ms", 0.0) or 0.0)
+        model_residual_ms = max(
+            prefill_forward_wall_ms - submit_block_ms - finalize_block_ms,
+            0.0,
+        )
+
+        decode_steps = int(getattr(self, "decode_steps", 0) or 0)
+        decode_total_ms = float(getattr(self, "decode_latency_s", 0.0) or 0.0) * 1000.0
+        decode_ms_per_step = decode_total_ms / decode_steps if decode_steps > 0 else 0.0
+        decode_sparse = dict(getattr(kv_cache, "decode_breakdown", None) or {})
+        if not decode_sparse:
+            accum = dict(getattr(kv_cache, "decode_breakdown_accum", {}) or {})
+            count = int(getattr(kv_cache, "profile_decode_count", 0) or 0)
+            if accum and count > 0:
+                decode_sparse = {key: float(value) / float(count) for key, value in accum.items()}
+        sparse_total_ms = float(decode_sparse.get("total_ms", 0.0) or 0.0)
+        decode_sparse["non_sparse_model_ms"] = max(decode_ms_per_step - sparse_total_ms, 0.0)
+
+        layer_rows = []
+        for row in rows:
+            layer_entry = {
+                "layer_idx": int(row.get("layer_idx", -1)),
+                "build_device": str(row.get("build_device", "")),
+                "gpu_build_ms": round(float(row.get("gpu_build_ms", 0.0) or 0.0), 4),
+                "job_create_ms": round(float(row.get("job_create_ms", 0.0) or 0.0), 4),
+                "raw_d2h_submit_ms": round(float(row.get("raw_d2h_submit_ms", 0.0) or 0.0), 4),
+                "metadata_submit_ms": round(float(row.get("metadata_submit_ms", 0.0) or 0.0), 4),
+                "metadata_wait_wall_ms": round(float(row.get("metadata_wait_wall_ms", 0.0) or 0.0), 4),
+                "metadata_wait_gap_ms": round(float(row.get("metadata_wait_gap_ms", 0.0) or 0.0), 4),
+                "finish_total_wall_ms": round(float(row.get("finish_total_wall_ms", 0.0) or 0.0), 4),
+                "raw_d2h_wait_ms": round(float(row.get("raw_d2h_wait_ms", 0.0) or 0.0), 4),
+                "metadata_d2h_ms": round(float(row.get("metadata_d2h_ms", 0.0) or 0.0), 4),
+                "reorganize_ms": round(float(row.get("reorganize_ms", 0.0) or 0.0), 4),
+                "total_tokens": int(float(row.get("total_tokens", 0.0) or 0.0)),
+            }
+            if detail_mode:
+                layer_entry["raw_d2h_elapsed_ms"] = round(float(row.get("raw_d2h_elapsed_ms", 0.0) or 0.0), 4)
+                layer_entry["metadata_d2h_elapsed_ms"] = round(
+                    float(row.get("metadata_d2h_elapsed_ms", 0.0) or 0.0),
+                    4,
+                )
+            layer_rows.append(layer_entry)
+
+        prefill_stats = {
+                "cache_init_ms": round(float(getattr(self, "cache_init_ms", 0.0) or 0.0), 4),
+                "cache_reused": bool(getattr(self, "cache_reused", False)),
+                "total_ms": round(float(getattr(self, "prefill_latency_s", 0.0) or 0.0) * 1000.0, 4),
+                "forward_wall_ms": round(prefill_forward_wall_ms, 4),
+                "model_residual_ms": round(model_residual_ms, 4),
+                "embedding_wall_ms": round(embedding_ms, 4),
+                "kv_build_wall_ms": round(kv_build_ms, 4),
+                "layer_compute_wall_ms": round(layer_compute_ms, 4),
+                "output_head_wall_ms": round(output_head_ms, 4),
+                "index_submit_block_ms": round(submit_block_ms, 4),
+                "index_finalize_block_ms": round(finalize_block_ms, 4),
+                "sampling_ms": round(float(getattr(self, "prefill_sampling_ms", 0.0) or 0.0), 4),
+                "prepare_cache_ms": round(float(getattr(self, "prepare_cache_ms", 0.0) or 0.0), 4),
+                "final_sync_ms": round(float(getattr(self, "prefill_final_sync_ms", 0.0) or 0.0), 4),
+                "background_finish_wait_ms": round(
+                    float(getattr(kv_cache, "hybrid_background_finish_wait_ms", 0.0) or 0.0),
+                    4,
+                ),
+                "cluster_gpu_build_ms": round(self._sum_profile_rows(rows, "gpu_build_ms"), 4),
+                "cluster_gpu_build_max_ms": round(self._max_profile_rows(rows, "gpu_build_ms"), 4),
+                "index_job_create_ms": round(self._sum_profile_rows(rows, "job_create_ms"), 4),
+                "raw_d2h_submit_ms": round(self._sum_profile_rows(rows, "raw_d2h_submit_ms"), 4),
+                "metadata_submit_ms": round(self._sum_profile_rows(rows, "metadata_submit_ms"), 4),
+                "index_metadata_wait_wall_ms": round(self._sum_profile_rows(rows, "metadata_wait_wall_ms"), 4),
+                "index_metadata_wait_gap_ms": round(self._sum_profile_rows(rows, "metadata_wait_gap_ms"), 4),
+                "index_finish_total_wall_ms": round(self._sum_profile_rows(rows, "finish_total_wall_ms"), 4),
+                "raw_kv_d2h_wait_ms": round(self._sum_profile_rows(rows, "raw_d2h_wait_ms"), 4),
+                "metadata_d2h_wait_ms": round(self._sum_profile_rows(rows, "metadata_d2h_ms"), 4),
+                "reorganize_ms": round(self._sum_profile_rows(rows, "reorganize_ms"), 4),
+                "layer_rows": layer_rows,
+        }
+        if detail_mode:
+            prefill_stats["raw_kv_d2h_elapsed_ms"] = round(self._sum_profile_rows(rows, "raw_d2h_elapsed_ms"), 4)
+            prefill_stats["metadata_d2h_elapsed_ms"] = round(
+                self._sum_profile_rows(rows, "metadata_d2h_elapsed_ms"),
+                4,
+            )
+
+        return {
+            "prefill": prefill_stats,
+            "decode": {
+                "total_ms": round(decode_total_ms, 4),
+                "steps": decode_steps,
+                "ms_per_step": round(decode_ms_per_step, 4),
+                "sparse_avg_per_step_ms": {
+                    key: round(float(value), 4) for key, value in decode_sparse.items()
+                },
+            },
+        }
     def layer_decode(self, layer_idx, hidden_states):
         # print(f'Layer = {layer_idx}')
 
@@ -403,12 +526,12 @@ class LLM(PrefillMixin, SamplingMixin):
             print(message, flush=True)
 
     def move(self):
-        torch.cuda.empty_cache()
         if self.attention_type in ('Full_Flash_Attn', 'Full_Flash_Attn_Offload'):
+            torch.cuda.empty_cache()
             self.kv_cache.move_gpu()
+            torch.cuda.empty_cache()
         elif self.attention_type == "AdaptiveIMI":
             self.kv_cache.prepare_cache()
-        torch.cuda.empty_cache()
 
     def word_embedding(self, inputs_id):
         return F.embedding(inputs_id, self.embed_tokens)
@@ -441,61 +564,49 @@ class LLM(PrefillMixin, SamplingMixin):
         top_k=20,
         ignore_eos=True,
         stop_token_ids=None,
+        runtime_preflight=False,
     ):
         outputs_ids = []    # multi iteration, multi request
         output_ids = []     # single iteration, multi request
         
         # Prefilling
-        print("Start prefilling ...")
+        if not runtime_preflight:
+            print("Start prefilling ...")
         torch.cuda.synchronize()
-        prefill_start = time.time()
-        profile_prefill_phases = os.getenv("IMI_PROFILE_PREFILL_PHASES", "0") == "1"
+        prefill_start = time.perf_counter()
         phase_start = time.perf_counter()
 
         logits = self.prefill_forward(inputs_ids=inputs_ids)
         prefill_forward_end = time.perf_counter()
         output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
         sampling_end = time.perf_counter()
+        self.prefill_forward_wall_ms = (prefill_forward_end - phase_start) * 1000.0
+        self.prefill_sampling_ms = (sampling_end - prefill_forward_end) * 1000.0
         outputs_ids.append(output_ids)
         self._debug_log_token_ids("prefill", output_ids)
 
         if self._debug_stop_after_prefill():
             torch.cuda.synchronize()
             final_sync_end = time.perf_counter()
-            prefill_end = time.time()
+            self.prefill_final_sync_ms = (final_sync_end - sampling_end) * 1000.0
+            prefill_end = time.perf_counter()
             self.prefill_latency_s = prefill_end - prefill_start
-            if profile_prefill_phases:
-                print(
-                    "[IMI prefill phases] "
-                    f"prefill_forward_ms={(prefill_forward_end - phase_start) * 1000.0:.2f} "
-                    f"sampling_ms={(sampling_end - prefill_forward_end) * 1000.0:.2f} "
-                    f"move_prepare_cache_ms=0.00 "
-                    f"final_sync_ms={(final_sync_end - sampling_end) * 1000.0:.2f} "
-                    f"total_ms={(final_sync_end - phase_start) * 1000.0:.2f}",
-                    flush=True,
-                )
-            print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
+            if not runtime_preflight:
+                print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
             return torch.cat(outputs_ids, dim=-1).tolist()
 
         move_start = time.perf_counter()
         self.move()
         move_end = time.perf_counter()
+        self.prepare_cache_ms = (move_end - move_start) * 1000.0
 
         torch.cuda.synchronize()
         final_sync_end = time.perf_counter()
-        prefill_end = time.time()
+        self.prefill_final_sync_ms = (final_sync_end - move_end) * 1000.0
+        prefill_end = time.perf_counter()
         self.prefill_latency_s = prefill_end - prefill_start
-        if profile_prefill_phases:
-            print(
-                "[IMI prefill phases] "
-                f"prefill_forward_ms={(prefill_forward_end - phase_start) * 1000.0:.2f} "
-                f"sampling_ms={(sampling_end - prefill_forward_end) * 1000.0:.2f} "
-                f"move_prepare_cache_ms={(move_end - move_start) * 1000.0:.2f} "
-                f"final_sync_ms={(final_sync_end - move_end) * 1000.0:.2f} "
-                f"total_ms={(final_sync_end - phase_start) * 1000.0:.2f}",
-                flush=True,
-            )
-        print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
+        if not runtime_preflight:
+            print(colored(f"Prefilling latency: {round(self.prefill_latency_s, 4)} s", 'green'))
 
         # CUDAGraph Capture (if enabled)
         if self.attention_type == "AdaptiveIMI":
@@ -520,17 +631,22 @@ class LLM(PrefillMixin, SamplingMixin):
             end_of_text |= (output_ids.unsqueeze(-1) == stop_tokens).any(-1)
         
         # Decoding
-        print("Start decoding ...")
-        decode_start = time.time()
+        if not runtime_preflight:
+            print("Start decoding ...")
+        decode_start = time.perf_counter()
         self.decode_latency_s = 0.0
         self.decode_steps = 0
         debug_max_decode_steps = self._debug_max_decode_steps()
         debug_decode_steps = 0
 
         if end_of_text is not None and end_of_text.all():
-            print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
+            if not runtime_preflight:
+                print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
         else:
-            for _ in range(self.max_new_length-1):
+            max_decode_steps = self.max_new_length - 1
+            if runtime_preflight:
+                max_decode_steps = min(max_decode_steps, 1)
+            for _ in range(max_decode_steps):
                 logits = self.decode_forward(inputs_ids=output_ids)
                 output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 debug_decode_steps += 1
@@ -538,18 +654,21 @@ class LLM(PrefillMixin, SamplingMixin):
                 if end_of_text is not None:
                     end_of_text |= (output_ids.unsqueeze(-1) == stop_tokens).any(-1)
                     if end_of_text.all():
-                        print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
+                        if not runtime_preflight:
+                            print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
                         outputs_ids.append(output_ids)
                         break
                 outputs_ids.append(output_ids)
                 if debug_max_decode_steps is not None and debug_decode_steps >= debug_max_decode_steps:
                     break
 
-        decode_end = time.time()
+        decode_end = time.perf_counter()
         self.decode_latency_s = decode_end - decode_start
         decode_steps = max(len(outputs_ids) - 1, 0)
         self.decode_steps = decode_steps
-        if decode_steps == 0:
+        if runtime_preflight:
+            pass
+        elif decode_steps == 0:
             print(colored(
                 f"Decoding latency: {round(self.decode_latency_s, 4)} s (0 ms/step), Throughput: 0 tokens/s",
                 'green'
@@ -562,11 +681,108 @@ class LLM(PrefillMixin, SamplingMixin):
             ))
 
         self.end2end_latency_s = self.prefill_latency_s + self.decode_latency_s
-        print(colored(f"End2End Latency: {round(self.end2end_latency_s, 4)} s\n", 'green'))
+        self.last_timing_stats = {
+            "prefill_time": float(self.prefill_latency_s),
+            "decode_time": float(self.decode_latency_s),
+            "total_time": float(self.end2end_latency_s),
+            "actual_generated": len(outputs_ids),
+            "decode_steps": int(decode_steps),
+            "breakdown": self._build_breakdown_stats() if self.breakdown_enabled else {},
+        }
+        if not runtime_preflight:
+            print(colored(f"End2End Latency: {round(self.end2end_latency_s, 4)} s\n", 'green'))
         
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
         
         return outputs_ids
+
+    def _adaptiveimi_runtime_preflight_input_length(self) -> int:
+        max_prompt_length = max(1, int(self.max_length) - int(self.max_new_length))
+        bucket = 1024
+        bucketed_length = ((int(self.input_length) + bucket - 1) // bucket) * bucket
+        return max(1, min(bucketed_length, max_prompt_length))
+
+    def _adaptiveimi_runtime_preflight_signature(self, attn_config) -> str:
+        if attn_config is not None:
+            self.apply_prefill_config(attn_config)
+            adaptive_imi = attn_config.get("AdaptiveIMI")
+            if isinstance(adaptive_imi, dict):
+                streaming_cfg = adaptive_imi.setdefault("streaming", {})
+                streaming_cfg["prefill_chunk_size"] = self.prefill_attn_chunk_size
+        preflight_input_length = self._adaptiveimi_runtime_preflight_input_length()
+        return json.dumps(
+            {
+                "attention_type": self.attention_type,
+                "batch_size": self.batch_size,
+                "input_length": preflight_input_length,
+                "max_new_length": self.max_new_length,
+                "max_length": self.max_length,
+                "num_key_value_heads": self.num_key_value_heads,
+                "num_heads": self.num_heads,
+                "head_dim": self.head_dim,
+                "dtype": str(self.dtype),
+                "layer_mapping": self.layer_mapping,
+                "prefill_bsz": self.prefill_bsz,
+                "num_gpus": self.num_gpus,
+                "adaptive_imi": (attn_config or {}).get("AdaptiveIMI", {}),
+                "prefill_chunk_size": self.prefill_attn_chunk_size,
+            },
+            sort_keys=True,
+            default=str,
+        )
+
+    def _maybe_preflight_adaptiveimi_runtime(self, valid_start, attn_config) -> None:
+        if self.attention_type != "AdaptiveIMI":
+            return
+        preflight_input_length = self._adaptiveimi_runtime_preflight_input_length()
+        signature = self._adaptiveimi_runtime_preflight_signature(attn_config)
+        if signature in self._adaptiveimi_runtime_preflight_signatures:
+            return
+
+        device = self.layers[0].device
+        print(
+            "[AdaptiveIMI preflight] "
+            f"len={preflight_input_length} batch={self.batch_size} max_new={self.max_new_length} "
+            "decode_steps=1 status=start",
+            flush=True,
+        )
+        start_ts = time.perf_counter()
+        real_input_length = self.input_length
+        try:
+            self.input_length = preflight_input_length
+            self._reset_breakdown_profile()
+            cache_init_start = time.perf_counter()
+            self.init_kv_cache(valid_start, attn_config)
+            cache_init_ms = (time.perf_counter() - cache_init_start) * 1000.0
+            dummy_inputs = torch.zeros(
+                (self.batch_size, preflight_input_length),
+                dtype=torch.long,
+                device=device,
+            )
+            self.inference(
+                dummy_inputs,
+                do_sample=False,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=1,
+                ignore_eos=True,
+                stop_token_ids=None,
+                runtime_preflight=True,
+            )
+            torch.cuda.synchronize()
+            self._adaptiveimi_runtime_preflight_signatures.add(signature)
+            total_ms = (time.perf_counter() - start_ts) * 1000.0
+            cache_mode = "reuse" if getattr(self, "cache_reused", False) else "allocate"
+            print(
+                "[AdaptiveIMI preflight] "
+                f"status=done total_ms={total_ms:.2f} cache_mode={cache_mode} "
+                f"cache_init_ms={cache_init_ms:.2f}",
+                flush=True,
+            )
+        finally:
+            self.input_length = real_input_length
+            self._reset_breakdown_profile()
+
     def generate(self, attention_type, inputs_ids, attention_masks, max_new_length, attn_config,
                  do_sample=False, temperature=0.6, top_p=0.95, top_k=20, ignore_eos=True,
                  prefill_bsz=1, stop_token_ids=None):
@@ -581,6 +797,7 @@ class LLM(PrefillMixin, SamplingMixin):
             prefill_bsz (int): The batch size for prefill.
         """
         self.attention_type = attention_type
+        self._reset_breakdown_profile()
 
         bs, input_length = inputs_ids.shape
         self.batch_size = bs
@@ -595,8 +812,22 @@ class LLM(PrefillMixin, SamplingMixin):
 
         self.prefill_bsz = min(prefill_bsz, self.batch_size)
 
-        print("Allocate GPU buffers and CPU pin memory ...")
+        if self.attention_type == "AdaptiveIMI":
+            self.apply_prefill_config(attn_config)
+        self._maybe_preflight_adaptiveimi_runtime(valid_start, attn_config)
+        self.attention_type = attention_type
+        self.batch_size = bs
+        self.input_length = input_length
+        self.max_new_length = max_new_length
+        self.prefill_bsz = min(prefill_bsz, self.batch_size)
+        self._reset_breakdown_profile()
+
+        print("Prepare GPU buffers and CPU pin memory ...")
+        cache_init_start = time.perf_counter()
         self.init_kv_cache(valid_start, attn_config)
+        self.cache_init_ms = (time.perf_counter() - cache_init_start) * 1000.0
+        cache_mode = "reuse" if getattr(self, "cache_reused", False) else "allocate"
+        print(f"[cache] mode={cache_mode} latency={self.cache_init_ms:.4f} ms", flush=True)
 
         outputs = self.inference(
             inputs_ids, 

@@ -124,7 +124,6 @@ class IMIPipeline:
         self._pipeline = None
         self._batch_allocate_cpu_buffer_callback = None
         self._last_pipeline_stats: Optional[Dict[str, object]] = None
-        self._last_search_metadata_cpu: Optional[Dict[str, torch.Tensor]] = None
 
     def _get_pipeline(self):
         if _pipeline_cpp is None:
@@ -337,22 +336,6 @@ class IMIPipeline:
             print(json.dumps(stats_payload, ensure_ascii=False), flush=True)
 
         metadata = pipeline.get_metadata_result()
-        search_keys = (
-            "subspace_centroids",
-            "subspace_centroid_masks",
-            "subspace_dim_ids",
-            "subspace_dim_masks",
-            "compact_codes",
-            "token_ids_by_cluster",
-            "cluster_sizes",
-            "cluster_offsets",
-            "cluster_counts",
-        )
-        self._last_search_metadata_cpu = {
-            key: metadata[key]
-            for key in search_keys
-            if key in metadata and torch.is_tensor(metadata[key])
-        }
         if not self.enable_direct_write:
             reorganized = pipeline.get_reorganize_results()
             for head_idx, head_reorg in enumerate(reorganized):
@@ -367,11 +350,6 @@ class IMIPipeline:
         if self._last_pipeline_stats is None:
             return None
         return dict(self._last_pipeline_stats)
-
-    def get_last_search_metadata_cpu(self) -> Optional[Dict[str, torch.Tensor]]:
-        if self._last_search_metadata_cpu is None:
-            return None
-        return dict(self._last_search_metadata_cpu)
 
     def _build_metadata_from_tensors(
         self,

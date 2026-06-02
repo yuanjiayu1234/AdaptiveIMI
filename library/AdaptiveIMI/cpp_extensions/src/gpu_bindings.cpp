@@ -11,6 +11,11 @@ namespace imi_decode {
                                                  const torch::Tensor& centroids,
                                                  c10::optional<torch::Tensor> out);
 
+    torch::Tensor fused_query_group_softmax_sum_similarities(const torch::Tensor& query_grouped,
+                                                            const torch::Tensor& centroids,
+                                                            const torch::Tensor& logits,
+                                                            c10::optional<torch::Tensor> out);
+
     torch::Tensor fused_subspace_rerank_select(const torch::Tensor& query_grouped,
                                                const torch::Tensor& subspace_centroids,
                                                const torch::Tensor& subspace_centroid_masks,
@@ -59,6 +64,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
             Returns:
                 [kv_heads, n_clusters] FP32 相似度矩阵
+        )pbdoc");
+
+    m.def("fused_query_group_softmax_sum_similarities",
+        [](const torch::Tensor& query_grouped,
+           const torch::Tensor& centroids,
+           const torch::Tensor& logits,
+           c10::optional<torch::Tensor> out) {
+            return imi_decode::fused_query_group_softmax_sum_similarities(
+                query_grouped,
+                centroids,
+                logits,
+                std::move(out)
+            );
+        },
+        py::arg("query_grouped"),
+        py::arg("centroids"),
+        py::arg("logits"),
+        py::arg("out") = py::none(),
+        R"pbdoc(
+            Flat decode scoring compatible with RetroInfer-style voting:
+            per query head dot-product logits -> softmax over clusters -> sum
+            probabilities within each GQA group.
+
+            Args:
+                query_grouped: [rows, num_query_groups, dim] BF16/FP16
+                centroids: [rows, n_clusters, dim] FP32
+                logits: [rows, num_query_groups, n_clusters] FP32 scratch
+
+            Returns:
+                [rows, n_clusters] FP32 summed softmax probabilities
         )pbdoc");
 
     m.def("fused_subspace_rerank_select",

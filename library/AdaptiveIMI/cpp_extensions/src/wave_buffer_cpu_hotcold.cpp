@@ -9,10 +9,23 @@
 #include <tuple>
 #include <stdexcept>
 #include <cstdlib>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <omp.h>
 #include "thread_pool.hpp"
 
 #define PRE_ALLOCATED_NUM 4
+
+namespace py = pybind11;
+
+static inline uint64_t now_us() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count()
+    );
+}
 
 
 class AdpIMI_ThreadPool {
@@ -70,8 +83,51 @@ private:
     int hit_num = 0;                    // number of hit keys
     int64_t* _miss_keys = nullptr;      // missing keys
     int64_t* _hit_keys = nullptr;       // hit keys
+    int last_hit_clusters = 0;
+    int last_miss_clusters = 0;
+    int last_hit_blocks = 0;
+    int last_miss_blocks = 0;
+    int last_selected_valid_clusters = 0;
+    int last_considered_blocks = 0;
+    int last_truncated_by_buffer = 0;
+    int last_dropped_clusters_after_budget = 0;
+    int last_admitted_clusters = 0;
+    int last_update_blocks = 0;
+    int last_evicted_clusters = 0;
+    int last_evicted_blocks = 0;
+    int last_free_blocks_before = 0;
+    int last_free_blocks_after = 0;
+    int last_hot_blocks = 0;
+    int last_cold_blocks = 0;
+    int last_hot_promotions = 0;
+    int last_hot_demotions = 0;
+    int8_t* cache_flags_mirror = nullptr;
+    int* cache_block_ids_mirror = nullptr;
+    int cache_block_ids_stride = 0;
 
     static constexpr double kDefaultHotRatio = 0.3;
+
+    inline void mirror_cache_insert(int64_t key) noexcept {
+        if (cache_flags_mirror == nullptr || cache_block_ids_mirror == nullptr || cache_block_ids_stride <= 0) {
+            return;
+        }
+        auto& desc = cluster_descriptors[key];
+        if (desc.BlockNum > cache_block_ids_stride) {
+            cache_flags_mirror[key] = 0;
+            return;
+        }
+        int* dst = cache_block_ids_mirror + key * cache_block_ids_stride;
+        for (int i = 0; i < desc.BlockNum; ++i) {
+            dst[i] = desc.GPUBlockIDs[i];
+        }
+        cache_flags_mirror[key] = 1;
+    }
+
+    inline void mirror_cache_evict(int64_t key) noexcept {
+        if (cache_flags_mirror != nullptr) {
+            cache_flags_mirror[key] = 0;
+        }
+    }
 
     inline int resolve_hot_capacity() const noexcept {
         const char* env_value = std::getenv("IMI_HOTCOLD_HOT_RATIO");
@@ -133,6 +189,7 @@ private:
             hot_blocks -= desc.BlockNum;
             list_push_front(demote_key, cold_head, cold_tail);
             cold_blocks += desc.BlockNum;
+            last_hot_demotions++;
         }
     }
 
@@ -161,16 +218,18 @@ private:
         desc.in_hot = true;
         list_push_front(key, hot_head, hot_tail);
         hot_blocks += desc.BlockNum;
+        last_hot_promotions++;
         demote_hot_if_needed();
     }
 
-    inline void removeLeastRecentlyUsed() noexcept {
+    inline int removeLeastRecentlyUsed() noexcept {
         int64_t victim = cold_tail >= 0 ? cold_tail : hot_tail;
         if (victim < 0) {
-            return;
+            return 0;
         }
 
         auto& desc = cluster_descriptors[victim];
+        const int evicted_blocks = desc.BlockNum;
         if (desc.in_hot) {
             list_remove(victim, hot_head, hot_tail);
             hot_blocks -= desc.BlockNum;
@@ -184,9 +243,17 @@ private:
         free_block_ids.insert(free_block_ids.end(), block_ids, block_ids + desc.BlockNum);
 
         desc.inBlockCache = false;
+        mirror_cache_evict(victim);
+        return evicted_blocks;
     }
 
 public:
+    void set_lookup_mirror(int8_t* flags, int* block_ids, int block_ids_stride) noexcept {
+        cache_flags_mirror = flags;
+        cache_block_ids_mirror = block_ids;
+        cache_block_ids_stride = block_ids_stride;
+    }
+
     BufferManager(
         int capacity,
         int nprobe,
@@ -219,6 +286,18 @@ public:
     inline std::tuple<int, int> batch_update(
         int* update_block_ids, int* update_block_sizes, int* update_block_sizes_cumsum
     ) noexcept {
+        last_dropped_clusters_after_budget = 0;
+        last_admitted_clusters = 0;
+        last_update_blocks = 0;
+        last_evicted_clusters = 0;
+        last_evicted_blocks = 0;
+        last_free_blocks_before = static_cast<int>(free_block_ids.size());
+        last_free_blocks_after = last_free_blocks_before;
+        last_hot_blocks = hot_blocks;
+        last_cold_blocks = cold_blocks;
+        last_hot_promotions = 0;
+        last_hot_demotions = 0;
+
         for (int i = hit_num - 1; i >= 0; --i) {
             const int64_t& key = _hit_keys[i];
             auto& cluster_descriptor = cluster_descriptors[key];
@@ -244,6 +323,7 @@ public:
                 total_blocks_needed += cluster_descriptor.BlockNum;
             } else {
                 // exceed capacity, drop the following keys
+                last_dropped_clusters_after_budget = miss_num - admiss_num;
                 break;
             }
         }
@@ -252,12 +332,20 @@ public:
             // reset
             miss_num = 0;
             hit_num = 0;
+            last_free_blocks_after = static_cast<int>(free_block_ids.size());
+            last_hot_blocks = hot_blocks;
+            last_cold_blocks = cold_blocks;
             return { 0, 0 };
         }
 
         // evict to ensure the have enough space for the admissible keys
         while (free_block_ids.size() < static_cast<size_t>(total_blocks_needed)) {
-            removeLeastRecentlyUsed();
+            const int evicted_blocks = removeLeastRecentlyUsed();
+            if (evicted_blocks <= 0) {
+                break;
+            }
+            last_evicted_clusters++;
+            last_evicted_blocks += evicted_blocks;
         }
 
         // insert the admissible keys into the cache
@@ -287,6 +375,7 @@ public:
 
             list_push_front(key, cold_head, cold_tail);
             cold_blocks += block_num;
+            mirror_cache_insert(key);
         }
 
         // if (update_block_num != total_blocks_needed) {
@@ -296,6 +385,11 @@ public:
         // reset
         miss_num = 0;
         hit_num = 0;
+        last_admitted_clusters = admiss_num;
+        last_update_blocks = update_block_num;
+        last_free_blocks_after = static_cast<int>(free_block_ids.size());
+        last_hot_blocks = hot_blocks;
+        last_cold_blocks = cold_blocks;
 
         return { admiss_num, update_block_num };
     }
@@ -305,6 +399,13 @@ public:
         int* hit_block_ids, int* hit_block_sizes, int* hit_block_sizes_cumsum,
         int* miss_block_ids, int* miss_block_sizes, int* miss_block_sizes_cumsum
     ) noexcept {
+        last_hit_clusters = 0;
+        last_miss_clusters = 0;
+        last_hit_blocks = 0;
+        last_miss_blocks = 0;
+        last_selected_valid_clusters = 0;
+        last_considered_blocks = 0;
+        last_truncated_by_buffer = 0;
         if (num == 0) {
             return { 0, 0, 0, 0 };
         }
@@ -324,10 +425,13 @@ public:
                 continue;
             }
 
-            consider_block_num += cluster_descriptor.BlockNum;
-            if (consider_block_num > max_consider_block) {
+            const int next_consider_block_num = consider_block_num + cluster_descriptor.BlockNum;
+            if (next_consider_block_num > max_consider_block) {
+                last_truncated_by_buffer = 1;
                 break;
             }
+            consider_block_num = next_consider_block_num;
+            last_selected_valid_clusters++;
 
             // miss keys, copy from CPU
             if (!cluster_descriptor.inBlockCache) {
@@ -366,9 +470,33 @@ public:
                 hit_block_num++;
             }
         }
+        last_hit_clusters = hit_num;
+        last_miss_clusters = miss_num;
+        last_hit_blocks = hit_block_num;
+        last_miss_blocks = miss_block_num;
+        last_considered_blocks = consider_block_num;
 
         return { hit_num, miss_num, hit_block_num, miss_block_num };
     }
+
+    int hit_clusters() const noexcept { return last_hit_clusters; }
+    int miss_clusters() const noexcept { return last_miss_clusters; }
+    int hit_blocks() const noexcept { return last_hit_blocks; }
+    int miss_blocks() const noexcept { return last_miss_blocks; }
+    int selected_valid_clusters() const noexcept { return last_selected_valid_clusters; }
+    int considered_blocks() const noexcept { return last_considered_blocks; }
+    int truncated_by_buffer() const noexcept { return last_truncated_by_buffer; }
+    int dropped_clusters_after_budget() const noexcept { return last_dropped_clusters_after_budget; }
+    int admitted_clusters() const noexcept { return last_admitted_clusters; }
+    int update_blocks() const noexcept { return last_update_blocks; }
+    int evicted_clusters() const noexcept { return last_evicted_clusters; }
+    int evicted_blocks() const noexcept { return last_evicted_blocks; }
+    int free_blocks_before() const noexcept { return last_free_blocks_before; }
+    int free_blocks_after() const noexcept { return last_free_blocks_after; }
+    int hot_block_count() const noexcept { return last_hot_blocks; }
+    int cold_block_count() const noexcept { return last_cold_blocks; }
+    int hot_promotions() const noexcept { return last_hot_promotions; }
+    int hot_demotions() const noexcept { return last_hot_demotions; }
 };
 
 
@@ -397,6 +525,9 @@ private:
 
     // pointer to the retrieved clusters, [batch_size*group_num, nprobe]
     int64_t* searched_clusters_ptr;         
+    int8_t* cache_flags_mirror_ptr = nullptr;
+    int* cache_block_ids_mirror_ptr = nullptr;
+    int cache_block_ids_mirror_stride = 0;
 
     // input data to re-organize keys & values based on the clustering results
     // groups = prefill_bsz*group_num when build index during prefilling
@@ -417,6 +548,186 @@ private:
     int last_n_centroids;
     uint64_t last_hit_blocks = 0;
     uint64_t last_miss_blocks = 0;
+    uint64_t last_hit_clusters = 0;
+    uint64_t last_miss_clusters = 0;
+    uint64_t last_selected_valid_clusters = 0;
+    uint64_t last_considered_blocks = 0;
+    uint64_t last_truncated_groups = 0;
+    uint64_t last_dropped_clusters_after_budget = 0;
+    uint64_t last_admitted_clusters = 0;
+    uint64_t last_update_blocks = 0;
+    uint64_t last_evicted_clusters = 0;
+    uint64_t last_evicted_blocks = 0;
+    uint64_t last_free_blocks_before = 0;
+    uint64_t last_free_blocks_after = 0;
+    uint64_t last_hot_blocks = 0;
+    uint64_t last_cold_blocks = 0;
+    uint64_t last_hot_promotions = 0;
+    uint64_t last_hot_demotions = 0;
+    uint64_t last_batch_access_us = 0;
+    uint64_t last_sync_wait_us = 0;
+    uint64_t last_batch_update_us = 0;
+    uint64_t last_access_worker_max_us = 0;
+    uint64_t last_access_worker_sum_us = 0;
+    uint64_t last_update_worker_max_us = 0;
+    uint64_t last_update_worker_sum_us = 0;
+    uint64_t last_max_group_access_us = 0;
+    uint64_t last_max_group_update_us = 0;
+    int last_max_group_access_id = -1;
+    int last_max_group_update_id = -1;
+    int last_max_group_considered_blocks = 0;
+    int last_max_group_update_blocks = 0;
+    int last_max_group_miss_blocks = 0;
+    int last_max_group_evicted_blocks = 0;
+    std::vector<uint64_t> access_worker_us;
+    std::vector<uint64_t> update_worker_us;
+    std::vector<uint64_t> access_group_us;
+    std::vector<uint64_t> update_group_us;
+    int access_pending = 0;
+    int update_pending = 0;
+    std::mutex access_wait_mutex;
+    std::mutex update_wait_mutex;
+    std::condition_variable access_wait_cv;
+    std::condition_variable update_wait_cv;
+
+    void set_access_pending(int count) {
+        std::lock_guard<std::mutex> lock(access_wait_mutex);
+        access_pending = count;
+    }
+
+    void set_update_pending(int count) {
+        std::lock_guard<std::mutex> lock(update_wait_mutex);
+        update_pending = count;
+    }
+
+    void finish_access_task() {
+        bool notify = false;
+        {
+            std::lock_guard<std::mutex> lock(access_wait_mutex);
+            access_pending--;
+            notify = access_pending == 0;
+        }
+        if (notify) {
+            access_wait_cv.notify_one();
+        }
+    }
+
+    void finish_update_task() {
+        bool notify = false;
+        {
+            std::lock_guard<std::mutex> lock(update_wait_mutex);
+            update_pending--;
+            notify = update_pending == 0;
+        }
+        if (notify) {
+            update_wait_cv.notify_one();
+        }
+    }
+
+    void wait_access_tasks() {
+        std::unique_lock<std::mutex> lock(access_wait_mutex);
+        access_wait_cv.wait(lock, [this] {
+            return access_pending == 0;
+        });
+    }
+
+    void wait_update_tasks() {
+        std::unique_lock<std::mutex> lock(update_wait_mutex);
+        update_wait_cv.wait(lock, [this] {
+            return update_pending == 0;
+        });
+    }
+
+    void aggregate_access_stats(uint64_t total_us) noexcept {
+        last_batch_access_us = total_us;
+        last_hit_blocks = 0;
+        last_miss_blocks = 0;
+        last_hit_clusters = 0;
+        last_miss_clusters = 0;
+        last_selected_valid_clusters = 0;
+        last_considered_blocks = 0;
+        last_truncated_groups = 0;
+        last_access_worker_max_us = 0;
+        last_access_worker_sum_us = 0;
+        last_max_group_access_us = 0;
+        last_max_group_access_id = -1;
+        last_max_group_considered_blocks = 0;
+        last_max_group_miss_blocks = 0;
+
+        for (int i = 0; i < batch_groups; ++i) {
+            const auto* cache = caches[i];
+            if (cache == nullptr) {
+                continue;
+            }
+            last_hit_blocks += static_cast<uint64_t>(cache->hit_blocks());
+            last_miss_blocks += static_cast<uint64_t>(cache->miss_blocks());
+            last_hit_clusters += static_cast<uint64_t>(cache->hit_clusters());
+            last_miss_clusters += static_cast<uint64_t>(cache->miss_clusters());
+            last_selected_valid_clusters += static_cast<uint64_t>(cache->selected_valid_clusters());
+            last_considered_blocks += static_cast<uint64_t>(cache->considered_blocks());
+            last_truncated_groups += static_cast<uint64_t>(cache->truncated_by_buffer());
+            if (access_group_us[i] > last_max_group_access_us) {
+                last_max_group_access_us = access_group_us[i];
+                last_max_group_access_id = i;
+                last_max_group_considered_blocks = cache->considered_blocks();
+                last_max_group_miss_blocks = cache->miss_blocks();
+            }
+        }
+        for (int i = 0; i < num_threads; ++i) {
+            last_access_worker_sum_us += access_worker_us[i];
+            last_access_worker_max_us = std::max(last_access_worker_max_us, access_worker_us[i]);
+        }
+    }
+
+    void aggregate_update_stats(uint64_t sync_wait_us) noexcept {
+        last_sync_wait_us = sync_wait_us;
+        last_dropped_clusters_after_budget = 0;
+        last_admitted_clusters = 0;
+        last_update_blocks = 0;
+        last_evicted_clusters = 0;
+        last_evicted_blocks = 0;
+        last_free_blocks_before = 0;
+        last_free_blocks_after = 0;
+        last_hot_blocks = 0;
+        last_cold_blocks = 0;
+        last_hot_promotions = 0;
+        last_hot_demotions = 0;
+        last_update_worker_max_us = 0;
+        last_update_worker_sum_us = 0;
+        last_max_group_update_us = 0;
+        last_max_group_update_id = -1;
+        last_max_group_update_blocks = 0;
+        last_max_group_evicted_blocks = 0;
+
+        for (int i = 0; i < batch_groups; ++i) {
+            const auto* cache = caches[i];
+            if (cache == nullptr) {
+                continue;
+            }
+            last_dropped_clusters_after_budget += static_cast<uint64_t>(cache->dropped_clusters_after_budget());
+            last_admitted_clusters += static_cast<uint64_t>(cache->admitted_clusters());
+            last_update_blocks += static_cast<uint64_t>(cache->update_blocks());
+            last_evicted_clusters += static_cast<uint64_t>(cache->evicted_clusters());
+            last_evicted_blocks += static_cast<uint64_t>(cache->evicted_blocks());
+            last_free_blocks_before += static_cast<uint64_t>(cache->free_blocks_before());
+            last_free_blocks_after += static_cast<uint64_t>(cache->free_blocks_after());
+            last_hot_blocks += static_cast<uint64_t>(cache->hot_block_count());
+            last_cold_blocks += static_cast<uint64_t>(cache->cold_block_count());
+            last_hot_promotions += static_cast<uint64_t>(cache->hot_promotions());
+            last_hot_demotions += static_cast<uint64_t>(cache->hot_demotions());
+            if (update_group_us[i] > last_max_group_update_us) {
+                last_max_group_update_us = update_group_us[i];
+                last_max_group_update_id = i;
+                last_max_group_update_blocks = cache->update_blocks();
+                last_max_group_evicted_blocks = cache->evicted_blocks();
+            }
+        }
+        for (int i = 0; i < num_threads; ++i) {
+            last_update_worker_sum_us += update_worker_us[i];
+            last_update_worker_max_us = std::max(last_update_worker_max_us, update_worker_us[i]);
+        }
+        last_batch_update_us = last_update_worker_max_us;
+    }
 
 public:
     // output indices buffer    
@@ -479,6 +790,10 @@ public:
         last_seq_lengths = new int[batch_groups];
         std::fill(last_seq_lengths, last_seq_lengths + batch_groups, 0);
         last_n_centroids = 0;
+        access_worker_us.resize(num_threads, 0);
+        update_worker_us.resize(num_threads, 0);
+        access_group_us.resize(batch_groups, 0);
+        update_group_us.resize(batch_groups, 0);
 
         // store descriptor of each cluster
         if (final_n_centroids == 0) {   // will not build index at all
@@ -600,6 +915,37 @@ public:
 
         searched_clusters_ptr = static_cast<int64_t*>(searched_clusters.data_ptr<int64_t>());
         // AT_ASSERT(searched_clusters.size(-1) == nprobe, "Wrong searched clusters size.");
+    }
+
+    void set_lookup_mirror(torch::Tensor& cache_flags, torch::Tensor& cache_block_ids) {
+        AT_ASSERT(cache_flags.dtype() == torch::kInt8, "cache_flags must be int8");
+        AT_ASSERT(cache_block_ids.dtype() == torch::kInt32, "cache_block_ids must be int32");
+        AT_ASSERT(cache_flags.size(0) == batch_groups, "cache_flags groups mismatch");
+        AT_ASSERT(cache_flags.size(1) == final_n_centroids, "cache_flags centroids mismatch");
+        AT_ASSERT(cache_block_ids.size(0) == batch_groups, "cache_block_ids groups mismatch");
+        AT_ASSERT(cache_block_ids.size(1) == final_n_centroids, "cache_block_ids centroids mismatch");
+        AT_ASSERT(cache_block_ids.dim() == 3, "cache_block_ids must be [groups, centroids, max_blocks]");
+        cache_flags_mirror_ptr = static_cast<int8_t*>(cache_flags.data_ptr<int8_t>());
+        cache_block_ids_mirror_ptr = static_cast<int*>(cache_block_ids.data_ptr<int32_t>());
+        cache_block_ids_mirror_stride = static_cast<int>(cache_block_ids.size(2));
+        std::fill(
+            cache_flags_mirror_ptr,
+            cache_flags_mirror_ptr + static_cast<int64_t>(batch_groups) * final_n_centroids,
+            static_cast<int8_t>(0)
+        );
+        std::fill(
+            cache_block_ids_mirror_ptr,
+            cache_block_ids_mirror_ptr
+                + static_cast<int64_t>(batch_groups) * final_n_centroids * cache_block_ids_mirror_stride,
+            -1
+        );
+        for (int i = 0; i < batch_groups; ++i) {
+            caches[i]->set_lookup_mirror(
+                cache_flags_mirror_ptr + static_cast<int64_t>(i) * final_n_centroids,
+                cache_block_ids_mirror_ptr + static_cast<int64_t>(i) * final_n_centroids * cache_block_ids_mirror_stride,
+                cache_block_ids_mirror_stride
+            );
+        }
     }
 
     void set_kv(
@@ -898,8 +1244,10 @@ public:
         int thread_idx = reinterpret_cast<std::intptr_t>(para);
         int _start = thread_idx * group_per_thread;
         int _end = std::min((thread_idx + 1) * group_per_thread, batch_groups);
+        const uint64_t worker_start_us = now_us();
 
         for (int i = _start; i < _end; ++i) {
+            const uint64_t group_start_us = now_us();
             // used for hit keys
             auto hit_block_ids_group = hit_block_ids + i * buffer_size;
             auto hit_block_sizes_group = hit_block_sizes + i * buffer_size;
@@ -925,15 +1273,19 @@ public:
 
             hit_block_nums[i] = hit_block_num;
             miss_block_nums[i] = miss_block_num;
+            access_group_us[i] = now_us() - group_start_us;
         }
+        access_worker_us[thread_idx] = now_us() - worker_start_us;
     }
 
     void batch_update(void* para) {
         int thread_idx = reinterpret_cast<std::intptr_t>(para);
         int _start = thread_idx * group_per_thread;
         int _end = std::min((thread_idx + 1) * group_per_thread, batch_groups);
+        const uint64_t worker_start_us = now_us();
 
         for (int i = _start; i < _end; ++i) {
+            const uint64_t group_start_us = now_us();
             auto update_cache_block_ids_group = update_cache_indices + i * buffer_size;
             auto update_block_sizes_group = update_block_sizes + i * buffer_size;
             auto update_buffer_indices_group = update_buffer_indices + i * buffer_size;
@@ -945,13 +1297,19 @@ public:
             // std::fill(update_buffer_indices_group + update_block_num, update_buffer_indices_group + buffer_size, 0);
 
             update_block_nums[i] = update_block_num;
+            update_group_us[i] = now_us() - group_start_us;
         }
+        update_worker_us[thread_idx] = now_us() - worker_start_us;
     }
 
-    void para_batch_updata() {
+    void submit_batch_update_tasks() {
+        set_update_pending(num_threads);
         pool_->LockQueue();
         for (int i = 0; i < num_threads; ++i) {
-            pool_->QueueJobWOLock([this](void* para) { this->batch_update(para); }, 
+            pool_->QueueJobWOLock([this](void* para) {
+                                      this->batch_update(para);
+                                      this->finish_update_task();
+                                  },
                                   reinterpret_cast<void*>(static_cast<std::intptr_t>(i)));
         }
         pool_->AddNumTask(num_threads);
@@ -960,32 +1318,29 @@ public:
     }
 
     void para_batch_access() {
+        const uint64_t access_start_us = now_us();
+        std::fill(access_worker_us.begin(), access_worker_us.end(), 0);
+        std::fill(update_worker_us.begin(), update_worker_us.end(), 0);
+        std::fill(access_group_us.begin(), access_group_us.end(), 0);
+        std::fill(update_group_us.begin(), update_group_us.end(), 0);
         // create tasks
+        set_access_pending(num_threads);
         pool_->LockQueue();
         for (int i = 0; i < num_threads; ++i) {
-            pool_->QueueJobWOLock([this](void* para) { this->batch_access(para); }, 
+            pool_->QueueJobWOLock([this](void* para) {
+                                      this->batch_access(para);
+                                      this->finish_access_task();
+                                  },
                                   reinterpret_cast<void*>(static_cast<std::intptr_t>(i)));
         }
         pool_->AddNumTask(num_threads);
         pool_->UnlockQueue();
         pool_->NotifyAll();
-        pool_->Wait();
+        wait_access_tasks();
+        aggregate_access_stats(now_us() - access_start_us);
 
-        uint64_t hit_blocks = 0;
-        uint64_t miss_blocks = 0;
-        for (int i = 0; i < batch_groups; ++i) {
-            hit_blocks += static_cast<uint64_t>(hit_block_nums[i]);
-            miss_blocks += static_cast<uint64_t>(miss_block_nums[i]);
-        }
-        last_hit_blocks = hit_blocks;
-        last_miss_blocks = miss_blocks;
-
-        // submit aysnc update tasks
-        pool_->LockQueue();
-        pool_->QueueJobWOLock([this](void* para) { this->para_batch_updata(); }, nullptr);
-        pool_->AddNumTask(1);
-        pool_->UnlockQueue();
-        pool_->NotifyOne();
+        // Submit the LRU/cache-admission update, but sync only this layer's update tasks later.
+        submit_batch_update_tasks();
         
         return;
     }
@@ -994,15 +1349,52 @@ public:
         return {last_hit_blocks, last_miss_blocks};
     }
 
+    py::dict get_last_cache_stats() const {
+        py::dict stats;
+        stats["hit_clusters"] = last_hit_clusters;
+        stats["miss_clusters"] = last_miss_clusters;
+        stats["hit_blocks"] = last_hit_blocks;
+        stats["miss_blocks"] = last_miss_blocks;
+        stats["selected_valid_clusters"] = last_selected_valid_clusters;
+        stats["considered_blocks"] = last_considered_blocks;
+        stats["truncated_groups"] = last_truncated_groups;
+        stats["dropped_clusters_after_budget"] = last_dropped_clusters_after_budget;
+        stats["admitted_clusters"] = last_admitted_clusters;
+        stats["update_blocks"] = last_update_blocks;
+        stats["evicted_clusters"] = last_evicted_clusters;
+        stats["evicted_blocks"] = last_evicted_blocks;
+        stats["free_blocks_before"] = last_free_blocks_before;
+        stats["free_blocks_after"] = last_free_blocks_after;
+        stats["hot_blocks"] = last_hot_blocks;
+        stats["cold_blocks"] = last_cold_blocks;
+        stats["hot_promotions"] = last_hot_promotions;
+        stats["hot_demotions"] = last_hot_demotions;
+        stats["batch_access_us"] = last_batch_access_us;
+        stats["batch_update_us"] = last_batch_update_us;
+        stats["sync_wait_us"] = last_sync_wait_us;
+        stats["access_worker_max_us"] = last_access_worker_max_us;
+        stats["access_worker_sum_us"] = last_access_worker_sum_us;
+        stats["update_worker_max_us"] = last_update_worker_max_us;
+        stats["update_worker_sum_us"] = last_update_worker_sum_us;
+        stats["max_group_access_us"] = last_max_group_access_us;
+        stats["max_group_update_us"] = last_max_group_update_us;
+        stats["max_group_access_id"] = last_max_group_access_id;
+        stats["max_group_update_id"] = last_max_group_update_id;
+        stats["max_group_considered_blocks"] = last_max_group_considered_blocks;
+        stats["max_group_miss_blocks"] = last_max_group_miss_blocks;
+        stats["max_group_update_blocks"] = last_max_group_update_blocks;
+        stats["max_group_evicted_blocks"] = last_max_group_evicted_blocks;
+        return stats;
+    }
+
     void sync() {
-        pool_->Wait();
+        const uint64_t sync_start_us = now_us();
+        wait_update_tasks();
+        aggregate_update_stats(now_us() - sync_start_us);
         return;
     }
 
 };
-
-
-namespace py = pybind11;
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1018,6 +1410,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("searched_clusters"))
         .def("set_kv", &AdpIMI_Index::set_kv, 
             py::arg("ivf_key"), py::arg("ivf_value"), py::arg("input_keys"), py::arg("input_values"))
+        .def("set_lookup_mirror", &AdpIMI_Index::set_lookup_mirror,
+            py::arg("cache_flags"), py::arg("cache_block_ids"))
         .def("set_cluster_metadata", &AdpIMI_Index::set_cluster_metadata,
             py::arg("cluster_sizes"), py::arg("cluster_offsets"), py::arg("start_bdx"))
         .def("async_construction", &AdpIMI_Index::async_construction, 
@@ -1027,6 +1421,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("update_keys"), py::arg("update_values"), py::arg("clusters"), py::arg("cluster_size"), py::arg("searched_clusters"))
         .def("batch_access", &AdpIMI_Index::para_batch_access, py::call_guard<py::gil_scoped_release>())
         .def("get_last_block_stats", &AdpIMI_Index::get_last_block_stats)
+        .def("get_last_cache_stats", &AdpIMI_Index::get_last_cache_stats)
         .def("sync", &AdpIMI_Index::sync, py::call_guard<py::gil_scoped_release>());
     
     py::class_<MyThreadPool>(m, "AdpIMI_MyThreadPool", py::module_local())

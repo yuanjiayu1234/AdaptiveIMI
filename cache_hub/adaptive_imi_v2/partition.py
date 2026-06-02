@@ -93,12 +93,6 @@ def load_hybrid_partition_specs(
             "M": required_m,
             "heads": heads,
         }
-        if "k_values" in group:
-            spec["k_values"] = [int(value) for value in group["k_values"]]
-        elif "K" in group:
-            spec["k_values"] = [int(value) for value in group["K"]]
-        if "k_values" in spec and len(spec["k_values"]) != required_m:
-            raise ValueError(f"k_values must have length {required_m}")
 
         for layer_idx in range(layer_start, layer_end):
             specs[layer_idx] = spec

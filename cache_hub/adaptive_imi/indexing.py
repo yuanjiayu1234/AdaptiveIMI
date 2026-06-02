@@ -1,6 +1,5 @@
 from typing import Dict, List, Optional, Tuple
 import json
-import math
 import os
 import queue
 import threading
@@ -188,6 +187,11 @@ class AdaptiveIMIIndexingMixin:
             if self.cluster_sizes_gpu[ldx] is not None:
                 device = self.cluster_sizes_gpu[ldx].device
                 self.cluster_sizes_gpu[ldx] = self.cluster_sizes_cpu[ldx].to(device) if self.cluster_sizes_cpu[ldx] is not None else None
+            if self.cluster_offsets_gpu[ldx] is not None:
+                device = self.cluster_offsets_gpu[ldx].device
+                self.cluster_offsets_gpu[ldx] = self.cluster_offsets_cpu[ldx].to(device) if self.cluster_offsets_cpu[ldx] is not None else None
+            if getattr(self, "cluster_cumsum_gpu_retrieval", None) is not None:
+                self.cluster_cumsum_gpu_retrieval[ldx] = None
             if self.centroids[ldx] is not None:
                 device = self.centroids[ldx].device
                 resized = torch.zeros(
@@ -276,6 +280,12 @@ class AdaptiveIMIIndexingMixin:
         self.centroids_mask_cpu[layer_idx] = centroids_mask_cpu
         if self.cluster_sizes_gpu[layer_idx] is not None:
             self.cluster_sizes_gpu[layer_idx].copy_(cluster_sizes)
+        if self.cluster_offsets_gpu[layer_idx] is not None:
+            self.cluster_offsets_gpu[layer_idx].copy_(cluster_offsets)
+        if getattr(self, "cluster_cumsum_gpu_retrieval", None) is not None:
+            cumsum = self.cluster_cumsum_gpu_retrieval[layer_idx]
+            if cumsum is not None and self.cluster_offsets_gpu[layer_idx] is not None:
+                cumsum.copy_(self.cluster_offsets_gpu[layer_idx][:, 1:].contiguous())
         if self.centroids[layer_idx] is not None:
             self.centroids[layer_idx].copy_(centroids_cpu)
         if self.centroids_mask[layer_idx] is not None:
@@ -286,35 +296,22 @@ class AdaptiveIMIIndexingMixin:
     def _ensure_metadata_buffers(self) -> None:
         if self.n_centroids <= 0:
             n_tokens = max(self.list_capacity, self.list_stride, 1)
-            if getattr(self, "learned_partition_enabled", False):
-                kmeans_cfg = self.runtime_config.get("kmeans") or {}
-                target_cluster_size = max(int(kmeans_cfg.get("target_cluster_size", kmeans_cfg.get("cluster_size", 16))), 1)
-                max_clusters = 1
-                for spec in getattr(self, "learned_partition_specs", []):
-                    if spec is None:
-                        continue
-                    m = max(int(spec.get("subspace_parts", 1)), 1)
-                    k_values = choose_learned_k_values(
-                        spec,
-                        n_tokens,
-                        target_cluster_size,
-                        default_m=m,
-                    )
-                    product = product_k_values(k_values)
-                    max_clusters = max(max_clusters, min(product, n_tokens))
-                self.n_centroids = int(max_clusters) + 1
-            elif self.subspace_parts == 0:
-                # IVF: n_centroids = round(T / 16)
-                self.n_centroids = max(int(round(n_tokens / 16.0)), 1) + 1
-            elif self.subspace_parts == 4:
-                total_clusters_f = max(n_tokens / 16.0, 1.0)
-                k = max(int(round(total_clusters_f ** 0.25)), 2)
-                self.n_centroids = k ** 4 + 1
-            else:
-                # 2-way IMI
-                total_clusters = max(int(n_tokens / 16), 1)
-                k = max(int(math.sqrt(total_clusters)), 32)
-                self.n_centroids = k * k + 1
+            kmeans_cfg = self.runtime_config.get("kmeans") or {}
+            target_cluster_size = max(int(kmeans_cfg.get("target_cluster_size", kmeans_cfg.get("cluster_size", 16))), 1)
+            max_clusters = 1
+            for spec in getattr(self, "learned_partition_specs", []):
+                if spec is None:
+                    raise RuntimeError("AdaptiveIMI hybrid_8way_v2 requires learned partition metadata for every layer")
+                m = max(int(spec.get("subspace_parts", 1)), 1)
+                k_values = choose_learned_k_values(
+                    spec,
+                    n_tokens,
+                    target_cluster_size,
+                    default_m=m,
+                )
+                product = product_k_values(k_values)
+                max_clusters = max(max_clusters, min(product, n_tokens))
+            self.n_centroids = int(max_clusters) + 1
             self.padding_cluster_id = self.n_centroids - 1
             self.nprobe = max(round((self.n_centroids - 1) * self.retrieval_budget), 1)
             self.nprobe = min(self.nprobe, self.n_centroids - 1)
@@ -337,6 +334,10 @@ class AdaptiveIMIIndexingMixin:
             if self.allocated:
                 if self.cluster_sizes_gpu[ldx] is None:
                     self.cluster_sizes_gpu[ldx] = cluster_sizes.to(self.layer_mapping[str(ldx)])
+                if self.cluster_offsets_gpu[ldx] is None:
+                    self.cluster_offsets_gpu[ldx] = cluster_offsets.to(self.layer_mapping[str(ldx)])
+                if getattr(self, "cluster_cumsum_gpu_retrieval", None) is not None:
+                    self.cluster_cumsum_gpu_retrieval[ldx] = None
                 if self.centroids_mask[ldx] is None:
                     self.centroids_mask[ldx] = torch.ones(
                         (self.batch_groups, self.n_centroids),
@@ -613,7 +614,11 @@ class AdaptiveIMIIndexingMixin:
         self.valid_lengths_dict.clear()
         self.static_len_tensor_dict.clear()
         self.static_lengths_dict.clear()
+        self.nprobe_tensor_dict.clear()
         self.similarity_buffer_dict.clear()
+        self.softmax_logits_buffer_dict.clear()
+        self.selected_cluster_buffer_dict.clear()
+        self.gpu_cache_promote_streams.clear()
 
         # 6. Clear GPU tensor lists
         self.steady_zone_keys.clear()
@@ -621,6 +626,8 @@ class AdaptiveIMIIndexingMixin:
         self.cache_keys.clear()
         self.cache_values.clear()
         self.cluster_sizes_gpu.clear()
+        self.cluster_offsets_gpu.clear()
+        self.cluster_cumsum_gpu_retrieval.clear()
         self.centroids.clear()
         self.centroids_mask.clear()
 
@@ -640,6 +647,19 @@ class AdaptiveIMIIndexingMixin:
         self.update_cache_indices.clear()
         self.update_num_units.clear()
         self.cluster_ids.clear()
+        self.gpu_cache_aware_hit_unit_idices.clear()
+        self.gpu_cache_aware_hit_unit_sizes.clear()
+        self.gpu_cache_aware_hit_unit_sizes_cumsum.clear()
+        self.gpu_cache_aware_hit_num_units.clear()
+        self.gpu_cache_aware_miss_unit_idices.clear()
+        self.gpu_cache_aware_miss_unit_sizes.clear()
+        self.gpu_cache_aware_miss_unit_sizes_cumsum.clear()
+        self.gpu_cache_aware_miss_num_units.clear()
+        self.gpu_cache_aware_miss_page_keys.clear()
+        self.gpu_cache_hash_keys.clear()
+        self.gpu_cache_hash_values.clear()
+        self.gpu_cache_slot_keys.clear()
+        self.gpu_cache_next_slots.clear()
 
         # 8. Clear CPU metadata
         self.cluster_sizes_cpu.clear()

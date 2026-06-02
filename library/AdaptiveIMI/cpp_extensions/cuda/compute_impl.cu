@@ -103,6 +103,164 @@ __global__ void fused_query_group_similarity_kernel(
     }
 }
 
+template<typename InputT, int WARPS_PER_BLOCK>
+__global__ void fused_query_group_similarity_cluster_kernel(
+    const InputT* __restrict__ query_grouped,   // [kv_heads, num_query_groups, dim]
+    const float* __restrict__ centroids,        // [kv_heads, n_clusters, dim]
+    float* __restrict__ similarities,           // [kv_heads, n_clusters]
+    int kv_heads,
+    int num_query_groups,
+    int n_clusters,
+    int dim
+) {
+    extern __shared__ float shared_query[];
+
+    const int head_idx = blockIdx.x;
+    const int warp_idx = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int cluster = blockIdx.y * WARPS_PER_BLOCK + warp_idx;
+    if (head_idx >= kv_heads) {
+        return;
+    }
+
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float acc = 0.0f;
+        const InputT* head_ptr = query_grouped + head_idx * (num_query_groups * dim) + d;
+        for (int g = 0; g < num_query_groups; ++g) {
+            acc += to_float(head_ptr[g * dim]);
+        }
+        shared_query[d] = acc;
+    }
+    __syncthreads();
+
+    if (cluster >= n_clusters) {
+        return;
+    }
+
+    const float* centroid_ptr = centroids + (static_cast<int64_t>(head_idx) * n_clusters + cluster) * dim;
+    float sim = 0.0f;
+    for (int d = lane; d < dim; d += 32) {
+        sim += shared_query[d] * centroid_ptr[d];
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sim += __shfl_down_sync(0xffffffff, sim, offset);
+    }
+
+    if (lane == 0) {
+        similarities[static_cast<int64_t>(head_idx) * n_clusters + cluster] = sim;
+    }
+}
+
+__device__ __forceinline__ bool better_score(float lhs_score, int lhs_idx, float rhs_score, int rhs_idx) {
+    if (lhs_score > rhs_score) {
+        return true;
+    }
+    if (lhs_score < rhs_score) {
+        return false;
+    }
+    if (lhs_idx < 0) {
+        return false;
+    }
+    return rhs_idx < 0 || lhs_idx < rhs_idx;
+}
+
+template<typename InputT>
+__global__ void per_head_logits_kernel(
+    const InputT* __restrict__ query_grouped,   // [rows, groups, dim]
+    const float* __restrict__ centroids,        // [rows, n_clusters, dim]
+    float* __restrict__ logits,                 // [rows, groups, n_clusters]
+    int rows,
+    int groups,
+    int n_clusters,
+    int dim,
+    float scale
+) {
+    const int row = blockIdx.x;
+    const int group = blockIdx.y;
+    if (row >= rows || group >= groups) {
+        return;
+    }
+
+    const InputT* query = query_grouped + row * groups * dim + group * dim;
+    const float* row_centroids = centroids + row * n_clusters * dim;
+    float* row_logits = logits + (row * groups + group) * n_clusters;
+
+    for (int cluster = threadIdx.x; cluster < n_clusters; cluster += blockDim.x) {
+        const float* centroid = row_centroids + cluster * dim;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < dim; ++d) {
+            dot += to_float(query[d]) * centroid[d];
+        }
+        row_logits[cluster] = dot * scale;
+    }
+}
+
+__global__ void softmax_sum_logits_kernel(
+    const float* __restrict__ logits,       // [rows, groups, n_clusters]
+    float* __restrict__ similarities,       // [rows, n_clusters]
+    int rows,
+    int groups,
+    int n_clusters
+) {
+    extern __shared__ float scratch[];
+    float* reduce_max = scratch;
+    float* reduce_sum = scratch + blockDim.x;
+
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    float* row_out = similarities + row * n_clusters;
+
+    for (int group = 0; group < groups; ++group) {
+        const float* row_logits = logits + (row * groups + group) * n_clusters;
+
+        float local_max = -FLT_MAX;
+        for (int cluster = threadIdx.x; cluster < n_clusters; cluster += blockDim.x) {
+            local_max = fmaxf(local_max, row_logits[cluster]);
+        }
+        reduce_max[threadIdx.x] = local_max;
+        __syncthreads();
+
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                reduce_max[threadIdx.x] = fmaxf(reduce_max[threadIdx.x], reduce_max[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        const float max_val = reduce_max[0];
+
+        float local_sum = 0.0f;
+        for (int cluster = threadIdx.x; cluster < n_clusters; cluster += blockDim.x) {
+            local_sum += expf(row_logits[cluster] - max_val);
+        }
+        reduce_sum[threadIdx.x] = local_sum;
+        __syncthreads();
+
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                reduce_sum[threadIdx.x] += reduce_sum[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        const float denom = fmaxf(reduce_sum[0], 1.0e-20f);
+
+        for (int cluster = threadIdx.x; cluster < n_clusters; cluster += blockDim.x) {
+            const float prob = expf(row_logits[cluster] - max_val) / denom;
+            if (group == 0) {
+                row_out[cluster] = prob;
+            } else {
+                row_out[cluster] += prob;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 template<typename InputT>
 __global__ void subspace_rerank_coarse_kernel(
     const InputT* __restrict__ query_grouped,             // [rows, groups, dim]
@@ -383,9 +541,11 @@ void fused_query_group_similarities_bf16(
     int dim,
     cudaStream_t stream
 ) {
-    int threads = determine_thread_block(dim);
+    constexpr int warps_per_block = 4;
+    constexpr int threads = warps_per_block * 32;
     size_t shared_mem = dim * sizeof(float);
-    fused_query_group_similarity_kernel<__nv_bfloat16><<<kv_heads, threads, shared_mem, stream>>>(
+    dim3 grid(kv_heads, (n_clusters + warps_per_block - 1) / warps_per_block);
+    fused_query_group_similarity_cluster_kernel<__nv_bfloat16, warps_per_block><<<grid, threads, shared_mem, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(query_grouped),
         centroids,
         similarities,
@@ -406,9 +566,11 @@ void fused_query_group_similarities_fp16(
     int dim,
     cudaStream_t stream
 ) {
-    int threads = determine_thread_block(dim);
+    constexpr int warps_per_block = 4;
+    constexpr int threads = warps_per_block * 32;
     size_t shared_mem = dim * sizeof(float);
-    fused_query_group_similarity_kernel<__half><<<kv_heads, threads, shared_mem, stream>>>(
+    dim3 grid(kv_heads, (n_clusters + warps_per_block - 1) / warps_per_block);
+    fused_query_group_similarity_cluster_kernel<__half, warps_per_block><<<grid, threads, shared_mem, stream>>>(
         reinterpret_cast<const __half*>(query_grouped),
         centroids,
         similarities,
@@ -416,6 +578,74 @@ void fused_query_group_similarities_fp16(
         num_query_groups,
         n_clusters,
         dim
+    );
+}
+
+void fused_query_group_softmax_sum_similarities_bf16(
+    const void* query_grouped,
+    const float* centroids,
+    float* logits,
+    float* similarities,
+    int groups,
+    int n_clusters,
+    int rows,
+    int dim,
+    cudaStream_t stream
+) {
+    constexpr int threads = 256;
+    const float scale = rsqrtf(static_cast<float>(dim));
+    dim3 logits_grid(rows, groups);
+    per_head_logits_kernel<__nv_bfloat16><<<logits_grid, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(query_grouped),
+        centroids,
+        logits,
+        rows,
+        groups,
+        n_clusters,
+        dim,
+        scale
+    );
+    const size_t shared_mem = static_cast<size_t>(threads) * 2 * sizeof(float);
+    softmax_sum_logits_kernel<<<rows, threads, shared_mem, stream>>>(
+        logits,
+        similarities,
+        rows,
+        groups,
+        n_clusters
+    );
+}
+
+void fused_query_group_softmax_sum_similarities_fp16(
+    const void* query_grouped,
+    const float* centroids,
+    float* logits,
+    float* similarities,
+    int groups,
+    int n_clusters,
+    int rows,
+    int dim,
+    cudaStream_t stream
+) {
+    constexpr int threads = 256;
+    const float scale = rsqrtf(static_cast<float>(dim));
+    dim3 logits_grid(rows, groups);
+    per_head_logits_kernel<__half><<<logits_grid, threads, 0, stream>>>(
+        reinterpret_cast<const __half*>(query_grouped),
+        centroids,
+        logits,
+        rows,
+        groups,
+        n_clusters,
+        dim,
+        scale
+    );
+    const size_t shared_mem = static_cast<size_t>(threads) * 2 * sizeof(float);
+    softmax_sum_logits_kernel<<<rows, threads, shared_mem, stream>>>(
+        logits,
+        similarities,
+        rows,
+        groups,
+        n_clusters
     );
 }
 

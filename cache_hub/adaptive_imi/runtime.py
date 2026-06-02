@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import time
 
@@ -15,8 +14,6 @@ class AdaptiveIMIRuntimeMixin:
         if not self.build_index_when_prefilling:
             return
         if self.cache_prepared:
-            if self.prefetch_enabled and not self.prefetch_done and not skip_prefetch:
-                self._warmup_prefetch()
             return
 
         profile_prepare = os.getenv("IMI_PROFILE_PREPARE_CACHE", "0") == "1"
@@ -31,32 +28,67 @@ class AdaptiveIMIRuntimeMixin:
                 print(f"[IMI prepare_cache] {stage}={elapsed_ms:.2f} ms", flush=True)
                 last_ts = now
 
+        def tensor_matches(tensor, shape, dtype, device=None, pin_memory=None) -> bool:
+            if tensor is None:
+                return False
+            if tuple(tensor.shape) != tuple(shape) or tensor.dtype != dtype:
+                return False
+            if device is not None and torch.device(tensor.device) != torch.device(device):
+                return False
+            if pin_memory is not None and tensor.device.type == "cpu" and tensor.is_pinned() != pin_memory:
+                return False
+            return True
+
+        def ensure_list_tensor(items, idx, shape, dtype, *, device=None, pin_memory=False, zero_new=True):
+            while len(items) <= idx:
+                items.append(None)
+            if tensor_matches(items[idx], shape, dtype, device=device, pin_memory=pin_memory):
+                return items[idx]
+            if device is None:
+                if zero_new:
+                    tensor = torch.zeros(shape, dtype=dtype, pin_memory=pin_memory)
+                else:
+                    tensor = torch.empty(shape, dtype=dtype, pin_memory=pin_memory)
+            else:
+                if zero_new:
+                    tensor = torch.zeros(shape, dtype=dtype, device=device)
+                else:
+                    tensor = torch.empty(shape, dtype=dtype, device=device)
+            items[idx] = tensor.contiguous()
+            return items[idx]
+
+        def ensure_dict_tensor(items, key, shape, dtype, *, device, zero_new=True):
+            tensor = items.get(key)
+            if tensor_matches(tensor, shape, dtype, device=device):
+                return tensor
+            if zero_new:
+                tensor = torch.zeros(shape, dtype=dtype, device=device)
+            else:
+                tensor = torch.empty(shape, dtype=dtype, device=device)
+            items[key] = tensor.contiguous()
+            return items[key]
+
+        def next_power_of_two(value: int) -> int:
+            value = max(int(value), 1)
+            return 1 << (value - 1).bit_length()
+
         n_tokens = max(self.list_capacity, 1)
-        if getattr(self, "learned_partition_enabled", False):
-            kmeans_cfg = self.runtime_config.get("kmeans") or {}
-            target_cluster_size = max(int(kmeans_cfg.get("target_cluster_size", kmeans_cfg.get("cluster_size", 16))), 1)
-            max_clusters = 1
-            for spec in getattr(self, "learned_partition_specs", []):
-                if spec is None:
-                    continue
-                m = max(int(spec.get("subspace_parts", 1)), 1)
-                k_values = choose_learned_k_values(
-                    spec,
-                    n_tokens,
-                    target_cluster_size,
-                    default_m=m,
-                )
-                product = product_k_values(k_values)
-                max_clusters = max(max_clusters, min(product, n_tokens))
-            self.n_centroids = int(max_clusters) + 1
-        elif self.subspace_parts == 4:
-            total_clusters_f = max(n_tokens / 16.0, 1.0)
-            k = max(int(round(total_clusters_f ** 0.25)), 2)
-            self.n_centroids = k ** 4 + 1
-        else:
-            total_clusters = max(int(n_tokens / 16), 1)
-            k = max(int(math.sqrt(total_clusters)), 32)
-            self.n_centroids = k * k + 1
+        kmeans_cfg = self.runtime_config.get("kmeans") or {}
+        target_cluster_size = max(int(kmeans_cfg.get("target_cluster_size", kmeans_cfg.get("cluster_size", 16))), 1)
+        max_clusters = 1
+        for spec in getattr(self, "learned_partition_specs", []):
+            if spec is None:
+                raise RuntimeError("AdaptiveIMI hybrid_8way_v2 requires learned partition metadata for every layer")
+            m = max(int(spec.get("subspace_parts", 1)), 1)
+            k_values = choose_learned_k_values(
+                spec,
+                n_tokens,
+                target_cluster_size,
+                default_m=m,
+            )
+            product = product_k_values(k_values)
+            max_clusters = max(max_clusters, min(product, n_tokens))
+        self.n_centroids = int(max_clusters) + 1
         self.padding_cluster_id = self.n_centroids - 1
         self.nprobe = max(round((self.n_centroids - 1) * self.retrieval_budget), 1)
         self.nprobe = min(self.nprobe, self.n_centroids - 1)
@@ -97,12 +129,6 @@ class AdaptiveIMIRuntimeMixin:
                 f"retrieval_execution_tokens={self.retrieval_execution_stride} "
                 f"retrieval_tokens={self.max_retrieval_tokens} retrieval_pages={self.max_retrieval_pages}"
             )
-
-        if self.prefetch_enabled and self.prefetch_ratio > 0:
-            self.prefetch_k = max(int(self.nprobe * self.prefetch_ratio), 1)
-            self.prefetch_k = min(self.prefetch_k, self.n_centroids - 1)
-        else:
-            self.prefetch_enabled = False
 
         thread_pool_pointer = self.thread_pool.get()
         for ldx in range(self.layer_num):
@@ -187,46 +213,46 @@ class AdaptiveIMIRuntimeMixin:
         if profile_prepare:
             log_step("async_update")
 
-        for _ in range(self.layer_num):
-            self.hit_unit_idices.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.hit_unit_sizes.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.hit_unit_sizes_cumsum.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.hit_num_units.append(
-                torch.zeros((self.batch_groups), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.miss_unit_idices.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.miss_unit_sizes.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.miss_unit_sizes_cumsum.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.miss_num_units.append(
-                torch.zeros((self.batch_groups), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.update_buffer_indices.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.update_unit_sizes.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.update_cache_indices.append(
-                torch.zeros((self.batch_groups, self.buffer_size), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.update_num_units.append(
-                torch.zeros((self.batch_groups), dtype=torch.int32, pin_memory=True).contiguous()
-            )
-            self.cluster_ids.append(
-                torch.empty((self.batch_groups, self.nprobe), dtype=torch.int64, pin_memory=True).contiguous()
-            )
+        buffer_shape = (self.batch_groups, self.buffer_size)
+        ring_buffer_shape = (self.gpu_cache_aware_ring_size, self.batch_groups, self.buffer_size)
+        ring_count_shape = (self.gpu_cache_aware_ring_size, self.batch_groups)
+        count_shape = (self.batch_groups,)
+        cluster_id_shape = (self.batch_groups, self.nprobe)
+        self.gpu_cache_hash_size = next_power_of_two(max(self.cache_size * 4, 16))
+        hash_shape = (self.batch_groups, self.gpu_cache_hash_size)
+        cache_slot_shape = (self.batch_groups, self.cache_size)
+        for ldx in range(self.layer_num):
+            ensure_list_tensor(self.hit_unit_idices, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.hit_unit_sizes, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.hit_unit_sizes_cumsum, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.hit_num_units, ldx, count_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.miss_unit_idices, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.miss_unit_sizes, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.miss_unit_sizes_cumsum, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.miss_num_units, ldx, count_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.update_buffer_indices, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.update_unit_sizes, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.update_cache_indices, ldx, buffer_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.update_num_units, ldx, count_shape, torch.int32, pin_memory=True)
+            ensure_list_tensor(self.cluster_ids, ldx, cluster_id_shape, torch.int64, pin_memory=True, zero_new=False)
+            device = self.layer_mapping[str(ldx)]
+            ensure_list_tensor(self.gpu_cache_aware_hit_unit_idices, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_hit_unit_sizes, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_hit_unit_sizes_cumsum, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_hit_num_units, ldx, ring_count_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_miss_unit_idices, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_miss_unit_sizes, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_miss_unit_sizes_cumsum, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_miss_num_units, ldx, ring_count_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_miss_page_keys, ldx, ring_buffer_shape, torch.int64, device=device, zero_new=False)
+            hash_keys = ensure_list_tensor(self.gpu_cache_hash_keys, ldx, hash_shape, torch.int64, device=device, zero_new=False)
+            hash_values = ensure_list_tensor(self.gpu_cache_hash_values, ldx, hash_shape, torch.int32, device=device, zero_new=False)
+            slot_keys = ensure_list_tensor(self.gpu_cache_slot_keys, ldx, cache_slot_shape, torch.int64, device=device, zero_new=False)
+            next_slots = ensure_list_tensor(self.gpu_cache_next_slots, ldx, count_shape, torch.int32, device=device)
+            hash_keys.fill_(-1)
+            hash_values.fill_(-1)
+            slot_keys.fill_(-1)
+            next_slots.zero_()
 
         if profile_prepare:
             log_step("cpu_buffers")
@@ -282,6 +308,8 @@ class AdaptiveIMIRuntimeMixin:
 
             if self.cluster_sizes_gpu[ldx] is None:
                 self.cluster_sizes_gpu[ldx] = cluster_sizes.to(device)
+            if self.cluster_offsets_gpu[ldx] is None:
+                self.cluster_offsets_gpu[ldx] = cluster_offsets.to(device)
             if self.centroids_mask[ldx] is None:
                 self.centroids_mask[ldx] = torch.ones(
                     (self.batch_groups, self.n_centroids),
@@ -332,67 +360,81 @@ class AdaptiveIMIRuntimeMixin:
 
         for ldx in range(self.layer_num):
             device = self.layer_mapping[str(ldx)]
-            self.cache_keys.append(
-                torch.zeros(
-                    (self.batch_size, self.kv_head, self.cache_size, self.page_size, self.head_dim),
-                    dtype=self.dtype,
-                    device=device,
-                ).contiguous()
-            )
-            self.cache_values.append(
-                torch.zeros(
-                    (self.batch_size, self.kv_head, self.cache_size, self.page_size, self.head_dim),
-                    dtype=self.dtype,
-                    device=device,
-                ).contiguous()
-            )
+            cache_shape = (self.batch_size, self.kv_head, self.cache_size, self.page_size, self.head_dim)
+            ensure_list_tensor(self.cache_keys, ldx, cache_shape, self.dtype, device=device)
+            ensure_list_tensor(self.cache_values, ldx, cache_shape, self.dtype, device=device)
 
         if profile_prepare:
             log_step("cache_kv")
 
         for device_idx in self.device_list:
-            self.execution_buffer_keys_dict[device_idx] = torch.zeros(
-                (self.batch_groups, self.execution_stride, 1, self.head_dim),
-                dtype=self.dtype,
-                device=device_idx,
-            ).contiguous()
-            self.execution_buffer_values_dict[device_idx] = torch.zeros(
-                (self.batch_groups, self.execution_stride, 1, self.head_dim),
-                dtype=self.dtype,
-                device=device_idx,
-            ).contiguous()
-            self.valid_lengths_dict[device_idx] = torch.zeros(
-                (self.batch_groups),
-                dtype=torch.int32,
-                device=device_idx,
-            ).contiguous()
-            self.static_len_tensor_dict[device_idx] = torch.tensor(
-                self.static_pattern_total,
-                dtype=torch.int32,
+            exec_shape = (self.batch_groups, self.execution_stride, 1, self.head_dim)
+            ensure_dict_tensor(self.execution_buffer_keys_dict, device_idx, exec_shape, self.dtype, device=device_idx)
+            ensure_dict_tensor(self.execution_buffer_values_dict, device_idx, exec_shape, self.dtype, device=device_idx)
+            valid_lengths = ensure_dict_tensor(
+                self.valid_lengths_dict,
+                device_idx,
+                (self.batch_groups,),
+                torch.int32,
                 device=device_idx,
             )
-            self.static_lengths_dict[device_idx] = torch.zeros(
-                (self.batch_groups),
-                dtype=torch.int32,
+            valid_lengths.zero_()
+            static_len = self.static_len_tensor_dict.get(device_idx)
+            if not tensor_matches(static_len, (), torch.int32, device=device_idx):
+                static_len = torch.tensor(self.static_pattern_total, dtype=torch.int32, device=device_idx)
+                self.static_len_tensor_dict[device_idx] = static_len
+            else:
+                static_len.fill_(self.static_pattern_total)
+            static_lengths = ensure_dict_tensor(
+                self.static_lengths_dict,
+                device_idx,
+                (self.batch_groups,),
+                torch.int32,
                 device=device_idx,
-            ).contiguous()
-            self.similarity_buffer_dict[device_idx] = torch.zeros(
+            )
+            static_lengths.zero_()
+            nprobe_tensor = self.nprobe_tensor_dict.get(device_idx)
+            if not tensor_matches(nprobe_tensor, (), torch.int32, device=device_idx):
+                nprobe_tensor = torch.tensor(int(self.nprobe), dtype=torch.int32, device=device_idx)
+                self.nprobe_tensor_dict[device_idx] = nprobe_tensor
+            else:
+                nprobe_tensor.fill_(int(self.nprobe))
+            ensure_dict_tensor(
+                self.similarity_buffer_dict,
+                device_idx,
                 (self.batch_groups, self.n_centroids),
-                dtype=torch.float32,
+                torch.float32,
                 device=device_idx,
-            ).contiguous()
+            )
+            ensure_dict_tensor(
+                self.selected_cluster_buffer_dict,
+                device_idx,
+                (self.batch_groups, self.nprobe),
+                torch.int64,
+                device=device_idx,
+                zero_new=False,
+            )
+            flat_score_mode = str(getattr(self, "flat_score_mode", "raw_sum")).lower()
+            if flat_score_mode in ("head_softmax_sum", "per_head_softmax_sum"):
+                ensure_dict_tensor(
+                    self.softmax_logits_buffer_dict,
+                    device_idx,
+                    (self.batch_groups, self.group_size, self.n_centroids),
+                    torch.float32,
+                    device=device_idx,
+                )
 
         if profile_prepare:
             log_step("execution_buffers")
 
+        for device in self.device_list:
+            if device not in self.gpu_cache_promote_streams:
+                self.gpu_cache_promote_streams[device] = torch.cuda.Stream(device)
 
         self.attn_func = self.sparse_attention
         self.cache_prepared = True
-        if self.prefetch_enabled and not skip_prefetch:
-            self._warmup_prefetch()
 
         if profile_prepare:
-            log_step("prefetch")
             total_ms = (time.perf_counter() - start_ts) * 1000.0
             print(f"[IMI prepare_cache] total={total_ms:.2f} ms", flush=True)
     def decode_update_kv_cache(self, key_states, value_states, layer_idx):

@@ -578,19 +578,6 @@ __device__ __forceinline__ uint64_t pack_code8_uint64(
     return code;
 }
 
-__device__ __forceinline__ int decode_code_digit_uint64(
-    uint64_t code,
-    const int32_t* __restrict__ k_values,
-    int subspace
-) {
-    for (int s = 0; s < subspace; ++s) {
-        const int kval = k_values[s] > 1 ? k_values[s] : 1;
-        code /= kval;
-    }
-    const int kval = k_values[subspace] > 1 ? k_values[subspace] : 1;
-    return static_cast<int>(code % static_cast<uint64_t>(kval));
-}
-
 __global__ void init_segment_offsets_kernel(
     int64_t* __restrict__ offsets,
     int rows,
@@ -654,9 +641,7 @@ __global__ void fill_sorted_compact_metadata_kernel(
     const int32_t* __restrict__ start_flags,
     const int32_t* __restrict__ cluster_scan,
     const int32_t* __restrict__ row_token_counts,
-    const int32_t* __restrict__ k_values,
     int32_t* __restrict__ token_ids_by_cluster,
-    int32_t* __restrict__ compact_codes,
     int32_t* __restrict__ cluster_offsets,
     int32_t* __restrict__ cluster_counts,
     int rows,
@@ -681,11 +666,6 @@ __global__ void fill_sorted_compact_metadata_kernel(
         if (is_start != 0) {
             if (compact < max_clusters) {
                 cluster_offsets[row * (max_clusters + 1) + compact] = pos;
-                const int code_base = (row * max_clusters + compact) * kSubspaces;
-                #pragma unroll
-                for (int s = 0; s < kSubspaces; ++s) {
-                    compact_codes[code_base + s] = decode_code_digit_uint64(code, k_values, s);
-                }
             }
         }
         if (pos == token_count - 1) {
@@ -698,28 +678,22 @@ __global__ void fill_sorted_compact_metadata_kernel(
 }
 
 __global__ void initialize_compact_outputs_kernel(
-    int32_t* __restrict__ compact_codes,
     int32_t* __restrict__ cluster_sizes,
     int32_t* __restrict__ cluster_offsets,
     int32_t* __restrict__ cluster_counts,
     float* __restrict__ full_centroids,
     int rows,
-    int max_tokens,
     int max_clusters,
     int head_dim
 ) {
     const int64_t cluster_total = static_cast<int64_t>(rows) * max_clusters;
-    const int64_t code_total = cluster_total * kSubspaces;
     const int64_t offset_total = static_cast<int64_t>(rows) * (max_clusters + 1);
     const int64_t centroid_total = cluster_total * head_dim;
-    int64_t total = code_total > centroid_total ? code_total : centroid_total;
+    int64_t total = cluster_total > centroid_total ? cluster_total : centroid_total;
     total = total > offset_total ? total : offset_total;
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         if (i < cluster_total) {
             cluster_sizes[i] = 0;
-        }
-        if (i < code_total) {
-            compact_codes[i] = -1;
         }
         if (i < offset_total) {
             cluster_offsets[i] = 0;
@@ -868,7 +842,6 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     auto sums = torch::zeros_like(centroids);
     auto counts = torch::zeros({rows, kSubspaces, max_k}, keys.options().dtype(torch::kFloat32));
     auto token_ids = torch::empty({rows, max_tokens}, keys.options().dtype(torch::kInt32));
-    auto compact_codes = torch::empty({rows, max_compact_clusters, kSubspaces}, keys.options().dtype(torch::kInt32));
     auto cluster_sizes = torch::empty({rows, max_compact_clusters}, keys.options().dtype(torch::kInt32));
     auto cluster_offsets = torch::empty({rows, max_compact_clusters + 1}, keys.options().dtype(torch::kInt32));
     auto cluster_counts = torch::empty({rows}, keys.options().dtype(torch::kInt32));
@@ -1093,18 +1066,16 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     const int64_t compact_total = static_cast<int64_t>(rows) * max_tokens;
     const int compact_blocks = capped_blocks(compact_total, threads, sm_count);
     const int64_t init_compact_total = std::max<int64_t>(
-        static_cast<int64_t>(rows) * max_compact_clusters * std::max<int64_t>(kSubspaces, head_dim),
+        static_cast<int64_t>(rows) * max_compact_clusters * head_dim,
         std::max<int64_t>(compact_total, static_cast<int64_t>(rows) * (max_compact_clusters + 1))
     );
     const int init_compact_blocks = capped_blocks(init_compact_total, threads, sm_count);
     initialize_compact_outputs_kernel<<<init_compact_blocks, threads, 0, stream>>>(
-        compact_codes.data_ptr<int32_t>(),
         cluster_sizes.data_ptr<int32_t>(),
         cluster_offsets.data_ptr<int32_t>(),
         cluster_counts.data_ptr<int32_t>(),
         full_centroids.data_ptr<float>(),
         rows,
-        static_cast<int>(max_tokens),
         static_cast<int>(max_compact_clusters),
         static_cast<int>(head_dim)
     );
@@ -1193,9 +1164,7 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
         start_flags.data_ptr<int32_t>(),
         cluster_scan.data_ptr<int32_t>(),
         row_token_counts.data_ptr<int32_t>(),
-        k_values.data_ptr<int32_t>(),
         token_ids.data_ptr<int32_t>(),
-        compact_codes.data_ptr<int32_t>(),
         cluster_offsets.data_ptr<int32_t>(),
         cluster_counts.data_ptr<int32_t>(),
         rows,
@@ -1240,10 +1209,7 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {
-        centroids,
-        centroid_masks,
         token_ids,
-        compact_codes,
         cluster_sizes,
         cluster_offsets,
         cluster_counts,

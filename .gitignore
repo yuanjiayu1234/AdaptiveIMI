@@ -19,7 +19,9 @@
 /build/
 /models/
 /data/
+/experiments/
 /ruler_eval_result/
+/longbench_eval_result/
 # Mono auto generated files
 mono_crash.*
 
