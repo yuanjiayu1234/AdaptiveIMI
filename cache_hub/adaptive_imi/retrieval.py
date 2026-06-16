@@ -2,12 +2,13 @@ from typing import Optional
 
 import os
 import torch
+
 from weighted_flash_decoding import weighted_flash_decoding
 
 from library.AdaptiveIMI.imi_adapter import get_imi_kernels
 from library.AdaptiveIMI.cpp_extensions import (
     build_cache_aware_retrieval_plan,
-    gather_copy_and_concat,
+    gather_copy_and_concat_chunk_parallel,
     promote_cache_pages_from_list,
 )
 
@@ -57,17 +58,7 @@ class AdaptiveIMIRetrievalMixin:
         "max_group_evicted_blocks",
     )
 
-    def _flat_score_mode(self) -> str:
-        return str(getattr(self, "flat_score_mode", "raw_sum")).lower()
-
-    def _softmax_logits_buffer(self, device: str) -> torch.Tensor:
-        buffer = self.softmax_logits_buffer_dict.get(device)
-        shape = (self.batch_groups, self.group_size, self.n_centroids)
-        if buffer is None or tuple(buffer.shape) != shape or buffer.device != torch.device(device):
-            buffer = torch.empty(shape, dtype=torch.float32, device=device)
-            self.softmax_logits_buffer_dict[device] = buffer
-        return buffer
-    def _select_clusters_raw_sum_flat(self, layer_idx: int, query_grouped: torch.Tensor, device: str) -> torch.Tensor:
+    def _select_clusters_raw_sum(self, layer_idx: int, query_grouped: torch.Tensor, device: str) -> torch.Tensor:
         similarities = imi_gpu_kernels.fused_query_group_similarities(
             query_grouped,
             self.centroids[layer_idx],
@@ -143,6 +134,15 @@ class AdaptiveIMIRetrievalMixin:
         return event
     def _elapsed_ms(self, start: torch.cuda.Event, end: torch.cuda.Event) -> float:
         return float(start.elapsed_time(end))
+    def _ensure_execution_buffer(self, device: str) -> None:
+        shape = (self.batch_groups, self.execution_stride, 1, self.head_dim)
+        dev = torch.device(device)
+        keys = self.execution_buffer_keys_dict.get(device)
+        if keys is None or tuple(keys.shape) != shape or keys.dtype != self.dtype or torch.device(keys.device) != dev:
+            self.execution_buffer_keys_dict[device] = torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
+        values = self.execution_buffer_values_dict.get(device)
+        if values is None or tuple(values.shape) != shape or values.dtype != self.dtype or torch.device(values.device) != dev:
+            self.execution_buffer_values_dict[device] = torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
     def _run_retrieval_full_gpu_cache_aware(
         self,
         layer_idx: int,
@@ -185,7 +185,8 @@ class AdaptiveIMIRetrievalMixin:
             lookup_end_event = self._record_timing_event()
             gather_start_event = self._record_timing_event()
 
-        gather_copy_and_concat(
+        self._ensure_execution_buffer(device)
+        gather_copy_and_concat_chunk_parallel(
             self.steady_zone_keys[layer_idx],
             self.list_keys[layer_idx],
             self.cache_keys[layer_idx],
@@ -371,21 +372,9 @@ class AdaptiveIMIRetrievalMixin:
             start_event = self._record_timing_event()
 
         query_grouped = queries.view(self.batch_groups, self.group_size, self.head_dim).contiguous()
-        custom_selector = getattr(self, "_select_clusters_for_decode", None)
-        if custom_selector is None:
-            if self._flat_score_mode() in ("head_softmax_sum", "per_head_softmax_sum"):
-                similarities = imi_gpu_kernels.fused_query_group_softmax_sum_similarities(
-                    query_grouped,
-                    self.centroids[layer_idx],
-                    self._softmax_logits_buffer(device),
-                    self.similarity_buffer_dict[device],
-                )
-                similarities.masked_fill_(self.centroids_mask[layer_idx], float("-inf"))
-                selected = self._select_clusters(layer_idx, similarities)
-            else:
-                selected = self._select_clusters_raw_sum_flat(layer_idx, query_grouped, device)
-        else:
-            selected = custom_selector(layer_idx, query_grouped, device)
+        # Fixed flat decode path: score the query group against materialized
+        # cluster centroids, then select clusters directly from that score table.
+        selected = self._select_clusters_raw_sum(layer_idx, query_grouped, device)
 
         if profile:
             sim_event = self._record_timing_event()
@@ -435,10 +424,6 @@ class AdaptiveIMIRetrievalMixin:
             h2d_ms += retrieval_timing["h2d_ms"]
             cache_sync_ms += retrieval_timing.get("cache_sync_ms", retrieval_timing["h2d_ms"])
             scatter_ms += retrieval_timing.get("scatter_ms", 0.0)
-
-        token_reranker = getattr(self, "_rerank_execution_tokens_for_decode", None)
-        if token_reranker is not None:
-            token_reranker(layer_idx, device, query_grouped)
 
         if profile:
             attn_start_event = self._record_timing_event()

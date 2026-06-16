@@ -10,7 +10,7 @@ import torch
 from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
 
 
-class _KmeansScheduler:
+class _BuildJobScheduler:
     def __init__(
         self,
         total_cores: int,
@@ -37,7 +37,7 @@ class _KmeansScheduler:
         self._dispatcher = threading.Thread(
             target=self._dispatch_loop,
             daemon=True,
-            name="imi-kmeans-dispatcher",
+            name="imi-build-dispatcher",
         )
         self._dispatcher.start()
     def submit(self, priority: tuple[int, int], fn) -> None:
@@ -96,7 +96,7 @@ class _KmeansScheduler:
                 target=self._run_job,
                 args=(fn, worker_threads),
                 daemon=True,
-                name="imi-kmeans-worker",
+                name="imi-build-worker",
             )
             with self._cv:
                 self._workers.add(thread)
@@ -190,8 +190,6 @@ class AdaptiveIMIIndexingMixin:
             if self.cluster_offsets_gpu[ldx] is not None:
                 device = self.cluster_offsets_gpu[ldx].device
                 self.cluster_offsets_gpu[ldx] = self.cluster_offsets_cpu[ldx].to(device) if self.cluster_offsets_cpu[ldx] is not None else None
-            if getattr(self, "cluster_cumsum_gpu_retrieval", None) is not None:
-                self.cluster_cumsum_gpu_retrieval[ldx] = None
             if self.centroids[ldx] is not None:
                 device = self.centroids[ldx].device
                 resized = torch.zeros(
@@ -250,6 +248,10 @@ class AdaptiveIMIIndexingMixin:
             if cluster_count < self.n_centroids:
                 centroids_mask_cpu[head_idx, cluster_count:] = True
 
+        self.layer_index_stats[layer_idx] = {
+            "non_empty_clusters": int((cluster_sizes > 0).sum().item()),
+        }
+
         if os.getenv("IMI_DEBUG_INDEX_METADATA", "0") == "1":
             nonzero_heads = 0
             total_clusters = 0
@@ -282,16 +284,10 @@ class AdaptiveIMIIndexingMixin:
             self.cluster_sizes_gpu[layer_idx].copy_(cluster_sizes)
         if self.cluster_offsets_gpu[layer_idx] is not None:
             self.cluster_offsets_gpu[layer_idx].copy_(cluster_offsets)
-        if getattr(self, "cluster_cumsum_gpu_retrieval", None) is not None:
-            cumsum = self.cluster_cumsum_gpu_retrieval[layer_idx]
-            if cumsum is not None and self.cluster_offsets_gpu[layer_idx] is not None:
-                cumsum.copy_(self.cluster_offsets_gpu[layer_idx][:, 1:].contiguous())
         if self.centroids[layer_idx] is not None:
             self.centroids[layer_idx].copy_(centroids_cpu)
         if self.centroids_mask[layer_idx] is not None:
             self.centroids_mask[layer_idx].copy_(centroids_mask_cpu)
-        if self.adpimi_index[layer_idx] is not None:
-            self.adpimi_index[layer_idx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
         self.layer_ready[layer_idx] = True
     def _ensure_metadata_buffers(self) -> None:
         if self.n_centroids <= 0:
@@ -336,8 +332,6 @@ class AdaptiveIMIIndexingMixin:
                     self.cluster_sizes_gpu[ldx] = cluster_sizes.to(self.layer_mapping[str(ldx)])
                 if self.cluster_offsets_gpu[ldx] is None:
                     self.cluster_offsets_gpu[ldx] = cluster_offsets.to(self.layer_mapping[str(ldx)])
-                if getattr(self, "cluster_cumsum_gpu_retrieval", None) is not None:
-                    self.cluster_cumsum_gpu_retrieval[ldx] = None
                 if self.centroids_mask[ldx] is None:
                     self.centroids_mask[ldx] = torch.ones(
                         (self.batch_groups, self.n_centroids),
@@ -350,58 +344,6 @@ class AdaptiveIMIIndexingMixin:
                         dtype=torch.float32,
                         device=self.layer_mapping[str(ldx)],
                     )
-    def _finish_layer_index(self, layer_idx: int):
-        progress = os.getenv("IMI_STREAMING_PROGRESS", "0") == "1"
-        start_ts = time.perf_counter() if progress else None
-        if progress:
-            print(f"[IMI INDEX] layer={layer_idx} phase=start", flush=True)
-        self._ensure_list_storage(layer_idx)
-        metadata = self.imi_pipelines[layer_idx].finish_index(
-            self.list_keys[layer_idx],
-            self.list_values[layer_idx],
-        )
-        placeholder = torch.empty((self.batch_groups, 0, self.head_dim), dtype=self.dtype, pin_memory=True)
-        self.adpimi_index[layer_idx].set_kv(
-            self.list_keys[layer_idx],
-            self.list_values[layer_idx],
-            placeholder,
-            placeholder,
-        )
-        if os.getenv("IMI_DEBUG_STREAMING_CHECK", "0") == "1":
-            expected_len = self._expected_middle_len[layer_idx]
-            pipeline_stats = self.imi_pipelines[layer_idx].get_last_pipeline_stats()
-            actual_len = None
-            if pipeline_stats is not None:
-                actual_len = int(pipeline_stats.get("total_tokens", 0))
-            print(
-                "[IMI STREAM CHECK]"
-                f" layer={layer_idx} expected_tokens={expected_len}"
-                f" actual_tokens={actual_len}",
-                flush=True,
-            )
-        if self.profile_prefill:
-            pipeline_stats = self.imi_pipelines[layer_idx].get_last_pipeline_stats()
-            if pipeline_stats is not None:
-                self.prefill_breakdown_rows.append({
-                    "layer_idx": int(layer_idx),
-                    "d2h_ms": round(float(pipeline_stats.get("d2h_ms", 0.0)), 4),
-                    "cpu_copy_ms": round(float(pipeline_stats.get("cpu_copy_ms", 0.0)), 4),
-                    "kmeans_ms": round(float(pipeline_stats.get("kmeans_ms", 0.0)), 4),
-                    "kmeans_cpu_time_ms": round(float(pipeline_stats.get("kmeans_cpu_time_ms", 0.0)), 4),
-                    "kmeans_cpu_util_cores": round(float(pipeline_stats.get("kmeans_cpu_util_cores", 0.0)), 4),
-                    "reorganize_ms": round(float(pipeline_stats.get("reorganize_ms", 0.0)), 4),
-                    "write_ms": round(float(pipeline_stats.get("write_ms", 0.0)), 4),
-                    "kmeans_gate_wait_ms": round(float(pipeline_stats.get("kmeans_gate_wait_ms", 0.0)), 4),
-                    "total_chunks": int(pipeline_stats.get("total_chunks", 0)),
-                    "total_tokens": int(pipeline_stats.get("total_tokens", 0)),
-                })
-        self._ensure_metadata_buffers()
-        with self._metadata_lock:
-            self._load_layer_metadata(layer_idx, metadata)
-        self._log_index_summary_once(layer_idx)
-        if progress and start_ts is not None:
-            elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
-            print(f"[IMI INDEX] layer={layer_idx} phase=done elapsed_ms={elapsed_ms:.2f}", flush=True)
     def _log_index_summary_once(self, layer_idx: int) -> None:
         if os.getenv("IMI_DEBUG_INDEX_SUMMARY", "0") != "1":
             return
@@ -417,31 +359,6 @@ class AdaptiveIMIIndexingMixin:
             f" non_empty_ratio={stats.get('non_empty_ratio'):.4f}",
             flush=True,
         )
-    def _schedule_finish_layer_index(self, layer_idx: int) -> None:
-        done_event = self.prefill_stream_done_events[layer_idx]
-
-        with self._kmeans_job_lock:
-            job_seq = self._kmeans_job_seq
-            self._kmeans_job_seq += 1
-
-        def _run(worker_threads: int) -> None:
-            try:
-                pipeline = self.imi_pipelines[layer_idx]
-                if pipeline is None:
-                    return
-                pipeline.set_worker_threads(worker_threads)
-                self._finish_layer_index(layer_idx)
-            except Exception as exc:
-                print(
-                    f"[IMI ERROR] layer={layer_idx} background index failed: {exc}",
-                    flush=True,
-                )
-                if self.prefill_stream_errors[layer_idx] is None:
-                    self.prefill_stream_errors[layer_idx] = exc
-            finally:
-                done_event.set()
-
-        self._kmeans_scheduler.submit((int(layer_idx), job_seq), _run)
     def get_index_stats(self) -> Dict[str, object]:
         ideal_clusters_per_head = max(float(self.list_capacity) / 16.0, 0.0)
         total_heads = int(self.layer_num * self.batch_groups)
@@ -449,15 +366,22 @@ class AdaptiveIMIIndexingMixin:
 
         non_empty_clusters_total = 0
         ready_layers = 0
-        for metadata in self.layer_metadata:
-            if not metadata:
+        for layer_idx, stats in enumerate(getattr(self, "layer_index_stats", [])):
+            if not stats:
                 continue
             ready_layers += 1
-            for head_meta in metadata:
-                sizes_tensor = head_meta.get("cluster_sizes")
-                if sizes_tensor is None:
+            non_empty_clusters_total += int(stats.get("non_empty_clusters", 0))
+
+        if ready_layers == 0:
+            for metadata in self.layer_metadata:
+                if not metadata:
                     continue
-                non_empty_clusters_total += int((sizes_tensor > 0).sum().item())
+                ready_layers += 1
+                for head_meta in metadata:
+                    sizes_tensor = head_meta.get("cluster_sizes")
+                    if sizes_tensor is None:
+                        continue
+                    non_empty_clusters_total += int((sizes_tensor > 0).sum().item())
 
         centroid_bytes_per_layer = int(self.batch_groups * self.n_centroids * self.head_dim * 4)
         total_centroid_bytes_gpu = int(ready_layers * centroid_bytes_per_layer)
@@ -481,110 +405,9 @@ class AdaptiveIMIIndexingMixin:
         err = self.prefill_stream_errors[layer_idx]
         if err is not None:
             raise RuntimeError(f"IMI streaming prefill failed on layer {layer_idx}") from err
-    def _prefill_stream_worker_loop(self, layer_idx: int):
-        worker_queue = self.prefill_stream_queues[layer_idx]
-        if worker_queue is None:
-            return
-
-        stop_event = self.prefill_stream_stop_events[layer_idx]
-        done_event = self.prefill_stream_done_events[layer_idx]
-
-        while True:
-            task = worker_queue.get()
-            if task is None:
-                if stop_event.is_set():
-                    return
-                continue
-
-            slot_id = task["slot_id"]
-            try:
-                task["copy_done_event"].synchronize()
-                if self.prefill_stream_errors[layer_idx] is not None:
-                    continue
-
-                chunk_id = task["chunk_id"]
-                token_offset = task["token_offset"]
-                chunk_len = task["chunk_len"]
-                is_last = task["is_last"]
-
-                expected_chunk_id = self.prefill_stream_expected_chunk_id[layer_idx]
-                expected_token_offset = self.prefill_stream_expected_token_offset[layer_idx]
-                if chunk_id != expected_chunk_id:
-                    raise RuntimeError(
-                        f"layer {layer_idx}: chunk_id out of order, expected {expected_chunk_id}, got {chunk_id}"
-                    )
-                if token_offset != expected_token_offset:
-                    raise RuntimeError(
-                        f"layer {layer_idx}: token_offset out of order, expected {expected_token_offset}, got {token_offset}"
-                    )
-
-                stage_keys = task.get("stage_keys")
-                stage_values = task.get("stage_values")
-                if stage_keys is None or stage_values is None:
-                    stage_keys = self.prefill_stream_stage_keys[layer_idx][slot_id]
-                    stage_values = self.prefill_stream_stage_values[layer_idx][slot_id]
-
-                self.imi_pipelines[layer_idx].submit_index_stream_chunk(
-                    stage_keys[:, :, :chunk_len, :],
-                    stage_values[:, :, :chunk_len, :],
-                    chunk_id=chunk_id,
-                    token_offset=token_offset,
-                    is_last=is_last,
-                )
-
-                self.prefill_stream_expected_chunk_id[layer_idx] += 1
-                self.prefill_stream_expected_token_offset[layer_idx] += chunk_len
-
-                if is_last:
-                    if self.prefill_stream_last_chunk_seen[layer_idx]:
-                        raise RuntimeError(f"layer {layer_idx}: duplicate last chunk")
-                    self.prefill_stream_last_chunk_seen[layer_idx] = True
-                    self.prefill_stream_end_submitted[layer_idx] = True
-                    self._finish_layer_index(layer_idx)
-                    done_event.set()
-            except Exception as exc:
-                if self.prefill_stream_errors[layer_idx] is None:
-                    self.prefill_stream_errors[layer_idx] = exc
-                done_event.set()
-            finally:
-                free_slots = self.prefill_stream_free_slots[layer_idx]
-                if free_slots is not None and slot_id is not None:
-                    free_slots.put(slot_id)
-    def _ensure_prefill_stream_worker(self, layer_idx: int):
-        if self.prefill_stream_queues[layer_idx] is None:
-            self.prefill_stream_queues[layer_idx] = queue.SimpleQueue()
-
-        worker = self.prefill_stream_workers[layer_idx]
-        if worker is not None and worker.is_alive():
-            return
-
-        self.prefill_stream_stop_events[layer_idx].clear()
-        worker = threading.Thread(
-            target=self._prefill_stream_worker_loop,
-            args=(layer_idx,),
-            daemon=True,
-            name=f"imi-prefill-consumer-{layer_idx}",
-        )
-        worker.start()
-        self.prefill_stream_workers[layer_idx] = worker
-    def _shutdown_stream_workers(self):
-        for layer_idx in range(self.layer_num):
-            worker = self.prefill_stream_workers[layer_idx]
-            worker_queue = self.prefill_stream_queues[layer_idx]
-            if worker is None or worker_queue is None:
-                continue
-            if not worker.is_alive():
-                continue
-            self.prefill_stream_stop_events[layer_idx].set()
-            worker_queue.put(None)
-            worker.join()
-            self.prefill_stream_workers[layer_idx] = None
     def cleanup(self):
         """Explicitly release all resources. Call this before destroying the cache."""
-        # 1. Shutdown background threads first (most critical)
-        self._shutdown_stream_workers()
-
-        # 2. Cancel C++ IMI pipelines before touching Python callbacks/storage.
+        # 1. Cancel C++ IMI pipelines before touching Python callbacks/storage.
         for pipeline in getattr(self, "imi_pipelines", []):
             if pipeline is None:
                 continue
@@ -593,11 +416,11 @@ class AdaptiveIMIIndexingMixin:
             except Exception:
                 pass
 
-        # 3. Wait for scheduled finish jobs to exit after pipeline cancellation.
-        if hasattr(self, "_kmeans_scheduler") and self._kmeans_scheduler is not None:
-            self._kmeans_scheduler.shutdown()
+        # 2. Wait for scheduled finish jobs to exit after pipeline cancellation.
+        if hasattr(self, "_build_job_scheduler") and self._build_job_scheduler is not None:
+            self._build_job_scheduler.shutdown()
 
-        # 4. Release pipeline wrappers.
+        # 3. Release pipeline wrappers.
         for i in range(self.layer_num):
             pipeline = self.imi_pipelines[i]
             if pipeline is None:
@@ -608,7 +431,7 @@ class AdaptiveIMIIndexingMixin:
                 pass
             self.imi_pipelines[i] = None
 
-        # 5. Clear GPU tensor dicts
+        # 4. Clear GPU tensor dicts
         self.execution_buffer_keys_dict.clear()
         self.execution_buffer_values_dict.clear()
         self.valid_lengths_dict.clear()
@@ -616,37 +439,22 @@ class AdaptiveIMIIndexingMixin:
         self.static_lengths_dict.clear()
         self.nprobe_tensor_dict.clear()
         self.similarity_buffer_dict.clear()
-        self.softmax_logits_buffer_dict.clear()
         self.selected_cluster_buffer_dict.clear()
         self.gpu_cache_promote_streams.clear()
 
-        # 6. Clear GPU tensor lists
+        # 5. Clear GPU tensor lists
         self.steady_zone_keys.clear()
         self.steady_zone_values.clear()
         self.cache_keys.clear()
         self.cache_values.clear()
         self.cluster_sizes_gpu.clear()
         self.cluster_offsets_gpu.clear()
-        self.cluster_cumsum_gpu_retrieval.clear()
         self.centroids.clear()
         self.centroids_mask.clear()
 
-        # 7. Clear pinned memory lists
+        # 6. Clear pinned memory lists
         self.list_keys.clear()
         self.list_values.clear()
-        self.hit_unit_idices.clear()
-        self.hit_unit_sizes.clear()
-        self.hit_unit_sizes_cumsum.clear()
-        self.hit_num_units.clear()
-        self.miss_unit_idices.clear()
-        self.miss_unit_sizes.clear()
-        self.miss_unit_sizes_cumsum.clear()
-        self.miss_num_units.clear()
-        self.update_buffer_indices.clear()
-        self.update_unit_sizes.clear()
-        self.update_cache_indices.clear()
-        self.update_num_units.clear()
-        self.cluster_ids.clear()
         self.gpu_cache_aware_hit_unit_idices.clear()
         self.gpu_cache_aware_hit_unit_sizes.clear()
         self.gpu_cache_aware_hit_unit_sizes_cumsum.clear()
@@ -661,116 +469,15 @@ class AdaptiveIMIIndexingMixin:
         self.gpu_cache_slot_keys.clear()
         self.gpu_cache_next_slots.clear()
 
-        # 8. Clear CPU metadata
+        # 7. Clear CPU metadata
         self.cluster_sizes_cpu.clear()
         self.cluster_offsets_cpu.clear()
         self.centroids_cpu.clear()
         self.centroids_mask_cpu.clear()
 
-        # 9. Clear streaming prefill resources
-        for i in range(self.layer_num):
-            self.prefill_stream_stage_keys[i] = None
-            self.prefill_stream_stage_values[i] = None
-            self.prefill_stream_free_slots[i] = None
-            self.prefill_stream_queues[i] = None
-            self.prefill_stream_copy_streams[i] = None
-            self.prefill_stream_main_events[i] = None
-            self.prefill_stream_copy_events[i] = None
-
-        # 10. Clear wave buffers and IMI pipelines
-        for i in range(self.layer_num):
-            self.adpimi_index[i] = None
-
-        # 11. Shutdown thread pool
-        if hasattr(self, 'thread_pool') and self.thread_pool is not None:
-            try:
-                del self.thread_pool
-            except Exception:
-                pass
-            self.thread_pool = None
+        # 8. CPU construction resources are owned by IMIPipeline and released above.
     def __del__(self):
         try:
             self.cleanup()
         except Exception:
             pass
-    def prefill_update_kv_cache(self, query_states, key_states, value_states, layer_idx, start_bdx):
-        bsz, seq_len, _, _ = key_states.shape
-        if bsz != 1:
-            raise ValueError("IMI cache currently supports batch_size=1 for prefilling.")
-
-        valid_start = self.valid_start_list[start_bdx]
-
-        if self.build_index_when_prefilling:
-            middle_start = valid_start + self.static_pattern_start
-            middle_end = seq_len - self.static_pattern_end
-            middle_len = max(middle_end - middle_start, 0)
-            if middle_len <= 0:
-                raise ValueError("IMI cache requires a non-empty middle segment.")
-            self._expected_middle_len[layer_idx] = int(middle_len)
-
-            if not self.layer_started[layer_idx]:
-                if self.prefill_chunk_size > 0 and middle_len > self.prefill_chunk_size:
-                    self.imi_pipelines[layer_idx].start_index_chunked(
-                        key_states,
-                        value_states,
-                        middle_start,
-                        middle_end,
-                        self.prefill_chunk_size,
-                    )
-                else:
-                    middle_keys = self._prepare_prefill_chunk(key_states, middle_start, middle_end)
-                    middle_values = self._prepare_prefill_chunk(value_states, middle_start, middle_end)
-                    self.imi_pipelines[layer_idx].start_index(
-                        middle_keys,
-                        middle_values,
-                    )
-                self.layer_started[layer_idx] = True
-
-            end_bdx = start_bdx + bsz
-            self.steady_zone_keys[layer_idx][start_bdx:end_bdx, :, : self.static_pattern_start, :] = (
-                key_states[:, valid_start : valid_start + self.static_pattern_start, :, :].transpose(1, 2)
-            )
-            self.steady_zone_values[layer_idx][start_bdx:end_bdx, :, : self.static_pattern_start, :] = (
-                value_states[:, valid_start : valid_start + self.static_pattern_start, :, :].transpose(1, 2)
-            )
-
-            self.steady_zone_keys[layer_idx][
-                start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-            ] = key_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
-            self.steady_zone_values[layer_idx][
-                start_bdx:end_bdx, :, self.static_pattern_start : self.static_pattern_total, :
-            ] = value_states[:, seq_len - self.static_pattern_end : seq_len, :, :].transpose(1, 2)
-        else:
-            end_bdx = start_bdx + bsz
-            self.steady_zone_keys[layer_idx][start_bdx:end_bdx, :, :seq_len, :].copy_(
-                key_states.transpose(1, 2)
-            )
-            self.steady_zone_values[layer_idx][start_bdx:end_bdx, :, :seq_len, :].copy_(
-                value_states.transpose(1, 2)
-            )
-
-        if (layer_idx == self.layer_num - 1) and (start_bdx + bsz == self.batch_size):
-            self.context += seq_len
-            if self.build_index_when_prefilling:
-                self.attn_func = self.sparse_attention
-            else:
-                self.static_pattern_total = seq_len
-
-        return key_states[:, valid_start:, :, :], value_states[:, valid_start:, :, :]
-    def sync(self, layer_idx, start_bdx):
-        if not self.build_index_when_prefilling:
-            return None
-        if not self.prefill_stream_started[layer_idx]:
-            return None
-
-        if not self.allocated:
-            copy_stream = self.prefill_stream_copy_streams[layer_idx]
-            if copy_stream is not None:
-                copy_stream.synchronize()
-
-        done_event = self.prefill_stream_done_events[layer_idx]
-        if done_event.is_set():
-            self._raise_prefill_stream_error(layer_idx)
-            if not self.layer_ready[layer_idx]:
-                raise RuntimeError(f"IMI streaming prefill did not finish for layer {layer_idx}")
-        return None

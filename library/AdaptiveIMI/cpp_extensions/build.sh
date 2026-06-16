@@ -6,9 +6,8 @@
 # 模块:
 #   1. library.AdaptiveIMI.cpp_extensions.gpu_cluster_manager_cpp - GPU端存储和计算
 #   2. library.AdaptiveIMI.cpp_extensions.ultra_layer_pipeline_cpp - 32层并行K-means管道
-#   3. library.AdaptiveIMI.cpp_extensions.AdpIMI_Index - AdpIMI CPU index manager
-#   4. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
-#   5. library.AdaptiveIMI.cpp_extensions.gemm_softmax - CUTLASS batch gemm softmax
+#   3. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
+#   4. library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp - hybrid GPU builder
 #
 # 使用方法:
 #   cd cpp_extensions
@@ -65,7 +64,6 @@ echo ""
 echo "🧹 Cleaning old build files..."
 rm -rf build/ dist/ *.egg-info/
 rm -f *.so
-rm -f library/AdaptiveIMI/cpp_extensions/*.so
 
 # 构建
 echo ""
@@ -80,38 +78,31 @@ echo "=============================================="
 
 BUILD_SUCCESS=true
 
-if ls library/AdaptiveIMI/cpp_extensions/gpu_cluster_manager_cpp.cpython-*.so >/dev/null 2>&1; then
-    echo "✅ gpu_cluster_manager_cpp: $(ls library/AdaptiveIMI/cpp_extensions/gpu_cluster_manager_cpp.cpython-*.so)"
+if ls gpu_cluster_manager_cpp.cpython-*.so >/dev/null 2>&1; then
+    echo "✅ gpu_cluster_manager_cpp: $(ls gpu_cluster_manager_cpp.cpython-*.so)"
 else
     echo "❌ gpu_cluster_manager_cpp: FAILED"
     BUILD_SUCCESS=false
 fi
 
-if ls library/AdaptiveIMI/cpp_extensions/ultra_layer_pipeline_cpp.cpython-*.so >/dev/null 2>&1; then
-    echo "✅ ultra_layer_pipeline_cpp: $(ls library/AdaptiveIMI/cpp_extensions/ultra_layer_pipeline_cpp.cpython-*.so)"
+if ls ultra_layer_pipeline_cpp.cpython-*.so >/dev/null 2>&1; then
+    echo "✅ ultra_layer_pipeline_cpp: $(ls ultra_layer_pipeline_cpp.cpython-*.so)"
 else
     echo "❌ ultra_layer_pipeline_cpp: FAILED"
     BUILD_SUCCESS=false
 fi
 
-if ls library/AdaptiveIMI/cpp_extensions/AdpIMI_Index.cpython-*.so >/dev/null 2>&1; then
-    echo "✅ library.AdaptiveIMI.cpp_extensions.AdpIMI_Index: $(ls library/AdaptiveIMI/cpp_extensions/AdpIMI_Index.cpython-*.so)"
-else
-    echo "❌ library.AdaptiveIMI.cpp_extensions.AdpIMI_Index: FAILED"
-    BUILD_SUCCESS=false
-fi
-
-if ls library/AdaptiveIMI/cpp_extensions/Copy.cpython-*.so >/dev/null 2>&1; then
-    echo "✅ library.AdaptiveIMI.cpp_extensions.Copy: $(ls library/AdaptiveIMI/cpp_extensions/Copy.cpython-*.so)"
+if ls Copy.cpython-*.so >/dev/null 2>&1; then
+    echo "✅ library.AdaptiveIMI.cpp_extensions.Copy: $(ls Copy.cpython-*.so)"
 else
     echo "❌ library.AdaptiveIMI.cpp_extensions.Copy: FAILED"
     BUILD_SUCCESS=false
 fi
 
-if ls library/AdaptiveIMI/cpp_extensions/gemm_softmax.cpython-*.so >/dev/null 2>&1; then
-    echo "✅ library.AdaptiveIMI.cpp_extensions.gemm_softmax: $(ls library/AdaptiveIMI/cpp_extensions/gemm_softmax.cpython-*.so)"
+if ls hybrid_8way_builder_cpp.cpython-*.so >/dev/null 2>&1; then
+    echo "✅ hybrid_8way_builder_cpp: $(ls hybrid_8way_builder_cpp.cpython-*.so)"
 else
-    echo "❌ library.AdaptiveIMI.cpp_extensions.gemm_softmax: FAILED"
+    echo "❌ hybrid_8way_builder_cpp: FAILED"
     BUILD_SUCCESS=false
 fi
 
@@ -131,12 +122,10 @@ if [ "$BUILD_SUCCESS" = true ]; then
     python -c "
 from library.AdaptiveIMI.cpp_extensions import gpu_cluster_manager_cpp as gmc
 from library.AdaptiveIMI.cpp_extensions import ultra_layer_pipeline_cpp as ulp
-from library.AdaptiveIMI.cpp_extensions import AdpIMI_Index, gather_copy_and_concat, batch_gemm_softmax
+from library.AdaptiveIMI.cpp_extensions import gather_copy_and_concat_chunk_parallel
 print('  gpu_cluster_manager_cpp:', dir(gmc)[:3], '...')
 print('  ultra_layer_pipeline_cpp:', dir(ulp)[:3], '...')
-print('  AdpIMI_Index:', AdpIMI_Index)
-print('  gather_copy_and_concat:', gather_copy_and_concat)
-print('  batch_gemm_softmax:', batch_gemm_softmax)
+print('  gather_copy_and_concat_chunk_parallel:', gather_copy_and_concat_chunk_parallel)
 print('✅ All imports successful!')
 "
 else

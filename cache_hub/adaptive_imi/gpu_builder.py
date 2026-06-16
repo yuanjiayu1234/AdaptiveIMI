@@ -30,15 +30,25 @@ def _pair_dim_indices(pairs: List[int], head_dim: int, device: torch.device) -> 
     return torch.tensor(dims, dtype=torch.long, device=device)
 
 
-def _compute_k_values(spec: Dict[str, object], token_count: int, target_cluster_size: int) -> List[int]:
-    values = choose_learned_k_values(
-        spec,
-        token_count,
-        target_cluster_size,
-        default_m=8,
-    )
+def _compute_k_values(
+    spec: Dict[str, object],
+    token_count: int,
+    target_cluster_size: int,
+    override: Optional[Sequence[int]] = None,
+) -> List[int]:
+    if override is not None:
+        values = [int(value) for value in override]
+    else:
+        values = choose_learned_k_values(
+            spec,
+            token_count,
+            target_cluster_size,
+            default_m=8,
+        )
     if len(values) != 8:
         raise ValueError("hybrid 8-way builder requires exactly 8 k_values")
+    if any(int(value) <= 0 for value in values):
+        raise ValueError("hybrid 8-way builder requires positive k_values")
     return values
 
 
@@ -275,7 +285,12 @@ class HybridLayerBuildJob:
         batch_size, kv_heads, max_token_count, head_dim = keys.shape
         rows = int(batch_size) * int(kv_heads)
         spec = self.partition_spec
-        k_values = _compute_k_values(spec, int(max(self.token_counts.max().item(), 1)), self.target_cluster_size)
+        k_values = _compute_k_values(
+            spec,
+            int(max(self.token_counts.max().item(), 1)),
+            self.target_cluster_size,
+            spec.get("k_values"),
+        )
         max_k = max(k_values)
         packed_code_space = 1
         for value in k_values:
@@ -515,5 +530,5 @@ class HybridLayerBuildJob:
             stats=stats,
         )
 
-# Backward-compatible name used by the v2 cache implementation.
+# Backward-compatible name used by the cache implementation.
 HybridGpuLayerBuildJob = HybridLayerBuildJob

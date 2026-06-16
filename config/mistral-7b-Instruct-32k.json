@@ -1,6 +1,6 @@
 {
     "AdaptiveIMI": {
-      "static_pattern_start": 32,
+      "static_pattern_start": 4,
       "static_pattern_end": 64,
       "core": 22,
       "pages_per_cluster": 2,
@@ -19,6 +19,11 @@
       },
       "prefill": {
         "prefill_chunk_size": 16384
+      },
+      "streaming": {
+        "hidden_device": "auto",
+        "hidden_gpu_limit_gb": 8.0,
+        "hidden_pinned_limit_gb": 8.0
       }
     }
 }

@@ -136,7 +136,11 @@ class IMIPipeline:
                 "kmeans": dict(self.runtime_config.kmeans),
             }
             if self.learned_partition is not None:
-                runtime_config["learned_partition"] = dict(self.learned_partition)
+                learned_partition = dict(self.learned_partition)
+                k_values = runtime_config["kmeans"].get("k_values")
+                if k_values is not None and "k_values" not in learned_partition:
+                    learned_partition["k_values"] = list(k_values)
+                runtime_config["learned_partition"] = learned_partition
             self._pipeline = _pipeline_cpp.LayerPipeline(
                 layer_idx=self.layer_idx,
                 kv_heads=self.kv_heads,

@@ -313,12 +313,20 @@ def _apply_hybrid_index_env_overrides(base_config):
     if hybrid_index:
         base_config["hybrid_index"] = hybrid_index
 
+    k_values = os.getenv("IMI_K_VALUES")
+    if k_values:
+        values = [int(part.strip()) for part in k_values.split(",") if part.strip()]
+        if values:
+            kmeans = copy.deepcopy(base_config.get("kmeans") or {})
+            kmeans["k_values"] = values
+            base_config["kmeans"] = kmeans
+
 
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=None, cache_ratio=None,
     gpu_only=None, subspace_parts=None,
-    imi_engine=None, partition_path=None, hybrid_index=None, decode_search=None
+    imi_engine=None, partition_path=None, hybrid_index=None
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     model_config_name = resolve_config_name(model_name)
@@ -369,8 +377,6 @@ def generate_config(
                 "start": "cpu",
             }
         _apply_hybrid_index_env_overrides(base_config)
-        if decode_search is not None:
-            base_config["decode_search"] = decode_search
         if context_len <= 4096:
             base_config["buffer_cluster_num"] = 150
         _config["AdaptiveIMI"] = base_config

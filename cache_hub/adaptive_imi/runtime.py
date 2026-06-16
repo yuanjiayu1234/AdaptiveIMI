@@ -80,12 +80,14 @@ class AdaptiveIMIRuntimeMixin:
             if spec is None:
                 raise RuntimeError("AdaptiveIMI hybrid_8way_v2 requires learned partition metadata for every layer")
             m = max(int(spec.get("subspace_parts", 1)), 1)
-            k_values = choose_learned_k_values(
-                spec,
-                n_tokens,
-                target_cluster_size,
-                default_m=m,
-            )
+            k_values = kmeans_cfg.get("k_values")
+            if k_values is None:
+                k_values = choose_learned_k_values(
+                    spec,
+                    n_tokens,
+                    target_cluster_size,
+                    default_m=m,
+                )
             product = product_k_values(k_values)
             max_clusters = max(max_clusters, min(product, n_tokens))
         self.n_centroids = int(max_clusters) + 1
@@ -102,6 +104,10 @@ class AdaptiveIMIRuntimeMixin:
         )
         requested_cache_pages = max(cache_cluster_num * self.pages_per_cluster, 1)
         self.cache_size = self._resolve_budget_pages(requested_cache_pages)
+        if self.batch_size > 1:
+            total_cache_pages = int(self.multibatch_cache_total_pages)
+            if total_cache_pages > 0:
+                self.cache_size = min(self.cache_size, max(1, total_cache_pages // int(self.batch_size)))
         self.cache_budget_pages = self.cache_size
 
         requested_buffer_pages = max(
@@ -129,25 +135,6 @@ class AdaptiveIMIRuntimeMixin:
                 f"retrieval_execution_tokens={self.retrieval_execution_stride} "
                 f"retrieval_tokens={self.max_retrieval_tokens} retrieval_pages={self.max_retrieval_pages}"
             )
-
-        thread_pool_pointer = self.thread_pool.get()
-        for ldx in range(self.layer_num):
-            self.adpimi_index[ldx] = self.adpimi_index_cls(
-                self.batch_size,
-                self.kv_head,
-                self.head_dim,
-                self.nprobe,
-                0,
-                self.page_size,
-                self.n_centroids,
-                self.buffer_size,
-                self.cache_size,
-                self.core,
-                thread_pool_pointer,
-            )
-
-        if profile_prepare:
-            log_step("adpimi_index")
 
         if self.async_update_enabled and not self.allocated:
             self.async_update_enabled = False
@@ -213,28 +200,13 @@ class AdaptiveIMIRuntimeMixin:
         if profile_prepare:
             log_step("async_update")
 
-        buffer_shape = (self.batch_groups, self.buffer_size)
         ring_buffer_shape = (self.gpu_cache_aware_ring_size, self.batch_groups, self.buffer_size)
         ring_count_shape = (self.gpu_cache_aware_ring_size, self.batch_groups)
         count_shape = (self.batch_groups,)
-        cluster_id_shape = (self.batch_groups, self.nprobe)
         self.gpu_cache_hash_size = next_power_of_two(max(self.cache_size * 4, 16))
         hash_shape = (self.batch_groups, self.gpu_cache_hash_size)
         cache_slot_shape = (self.batch_groups, self.cache_size)
         for ldx in range(self.layer_num):
-            ensure_list_tensor(self.hit_unit_idices, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.hit_unit_sizes, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.hit_unit_sizes_cumsum, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.hit_num_units, ldx, count_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.miss_unit_idices, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.miss_unit_sizes, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.miss_unit_sizes_cumsum, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.miss_num_units, ldx, count_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.update_buffer_indices, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.update_unit_sizes, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.update_cache_indices, ldx, buffer_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.update_num_units, ldx, count_shape, torch.int32, pin_memory=True)
-            ensure_list_tensor(self.cluster_ids, ldx, cluster_id_shape, torch.int64, pin_memory=True, zero_new=False)
             device = self.layer_mapping[str(ldx)]
             ensure_list_tensor(self.gpu_cache_aware_hit_unit_idices, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_hit_unit_sizes, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
@@ -255,38 +227,7 @@ class AdaptiveIMIRuntimeMixin:
             next_slots.zero_()
 
         if profile_prepare:
-            log_step("cpu_buffers")
-
-        placeholder = torch.empty((self.batch_groups, 0, self.head_dim), dtype=self.dtype, pin_memory=True)
-        placeholder_list = placeholder.unsqueeze(0)
-
-        for ldx in range(self.layer_num):
-            self.adpimi_index[ldx].set_indices(
-                self.hit_unit_idices[ldx],
-                self.hit_unit_sizes[ldx],
-                self.hit_unit_sizes_cumsum[ldx],
-                self.hit_num_units[ldx],
-                self.miss_unit_idices[ldx],
-                self.miss_unit_sizes[ldx],
-                self.miss_unit_sizes_cumsum[ldx],
-                self.miss_num_units[ldx],
-                self.update_buffer_indices[ldx],
-                self.update_unit_sizes[ldx],
-                self.update_cache_indices[ldx],
-                self.update_num_units[ldx],
-                self.cluster_ids[ldx],
-            )
-            list_keys = self.list_keys[ldx] if self.list_keys[ldx] is not None else placeholder_list
-            list_values = self.list_values[ldx] if self.list_values[ldx] is not None else placeholder_list
-            self.adpimi_index[ldx].set_kv(
-                list_keys,
-                list_values,
-                placeholder,
-                placeholder,
-            )
-
-        if profile_prepare:
-            log_step("wave_bind")
+            log_step("gpu_cache_plan_buffers")
 
         for ldx in range(self.layer_num):
             device = self.layer_mapping[str(ldx)]
@@ -344,16 +285,14 @@ class AdaptiveIMIRuntimeMixin:
                     flush=True,
                 )
 
-            if cluster_sizes is not None and self.centroids_mask[ldx] is not None:
+            if self.layer_ready[ldx] and cluster_sizes is not None and self.centroids_mask[ldx] is not None:
                 nonzero_clusters = int((cluster_sizes > 0).sum().item())
                 unmasked_clusters = int((~self.centroids_mask[ldx]).sum().item())
-                if self.layer_metadata[ldx] is not None and len(self.layer_metadata[ldx]) > 0 and nonzero_clusters == 0 and unmasked_clusters == 0:
+                if nonzero_clusters == 0 and unmasked_clusters == 0:
                     raise RuntimeError(
                         f"AdaptiveIMI invalid decode metadata on layer {ldx}: "
-                        "CPU metadata exists but GPU metadata remains empty."
+                        "layer is ready but decode metadata remains empty."
                     )
-
-            self.adpimi_index[ldx].set_cluster_metadata(cluster_sizes, cluster_offsets, 0)
 
         if profile_prepare:
             log_step("centroids")
@@ -414,15 +353,6 @@ class AdaptiveIMIRuntimeMixin:
                 device=device_idx,
                 zero_new=False,
             )
-            flat_score_mode = str(getattr(self, "flat_score_mode", "raw_sum")).lower()
-            if flat_score_mode in ("head_softmax_sum", "per_head_softmax_sum"):
-                ensure_dict_tensor(
-                    self.softmax_logits_buffer_dict,
-                    device_idx,
-                    (self.batch_groups, self.group_size, self.n_centroids),
-                    torch.float32,
-                    device=device_idx,
-                )
 
         if profile_prepare:
             log_step("execution_buffers")

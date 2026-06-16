@@ -4,11 +4,8 @@
 模块:
 1. library.AdaptiveIMI.cpp_extensions.gpu_cluster_manager_cpp - IMI decode kernels
 2. library.AdaptiveIMI.cpp_extensions.ultra_layer_pipeline_cpp - 32层并行K-means管道
-3. library.AdaptiveIMI.cpp_extensions.AdpIMI_Index - AdpIMI CPU index manager
-4. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
-5. library.AdaptiveIMI.cpp_extensions.gemm_softmax - CUTLASS batch gemm softmax
-6. library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp - Hybrid 8-way GPU index builder
-7. library.AdaptiveIMI.cpp_extensions.hybrid_subspace_kmeans_bench_cpp - benchmark-only subspace k-means
+3. library.AdaptiveIMI.cpp_extensions.Copy - gather/scatter CUDA kernels
+4. library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp - Hybrid 8-way GPU index builder
 
 使用方法:
     cd cpp_extensions
@@ -29,8 +26,6 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtensio
 # 获取当前目录
 HERE = Path(__file__).parent.absolute()
 REPO_ROOT = HERE.parents[2]
-LIBRARY_ROOT = REPO_ROOT / 'library'
-CUTLASS_DIR = LIBRARY_ROOT / 'cutlass'
 
 # 获取 PyTorch 和 pybind11 的 include 路径
 import torch
@@ -276,22 +271,7 @@ ultra_layer_pipeline_ext = CppExtension(
     extra_link_args=['-fopenmp'],
 )
 
-# ============================================================================
-# 模块 3: AdpIMI_Index (纯 C++)
-# ============================================================================
-adpimi_index_ext = CppExtension(
-    name='library.AdaptiveIMI.cpp_extensions.AdpIMI_Index',
-    sources=[str(HERE / 'src' / 'wave_buffer_cpu_hotcold.cpp')],
-    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
-    extra_compile_args={
-        'cxx': COMMON_CXX_FLAGS,
-    },
-    extra_link_args=['-fopenmp'],
-    language='c++',
-)
-
-# ============================================================================
-# 模块 4: Copy (CUDA)
+# 模块 3: Copy (CUDA)
 # ============================================================================
 copy_ext = CUDAExtension(
     name='library.AdaptiveIMI.cpp_extensions.Copy',
@@ -306,27 +286,7 @@ copy_ext = CUDAExtension(
 )
 
 # ============================================================================
-# 模块 5: gemm_softmax (CUDA + CUTLASS)
-# ============================================================================
-gemm_softmax_ext = CUDAExtension(
-    name='library.AdaptiveIMI.cpp_extensions.gemm_softmax',
-    sources=[str(HERE / 'cuda' / 'batch_gemm_softmax.cu')],
-    include_dirs=[
-        str(HERE / 'include'),
-        str(CUTLASS_DIR / 'include'),
-        str(CUTLASS_DIR / 'examples' / 'common'),
-        str(CUTLASS_DIR / 'tools' / 'util' / 'include'),
-    ] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
-    library_dirs=CUDA_LIB_DIRS,
-    extra_compile_args={
-        'cxx': COMMON_CXX_FLAGS,
-        'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
-    },
-    extra_link_args=['-lcuda', '-lcudart'],
-)
-
-# ============================================================================
-# 模块 6: hybrid_8way_builder_cpp (CUDA)
+# 模块 4: hybrid_8way_builder_cpp (CUDA)
 # ============================================================================
 hybrid_8way_builder_sources = [
     str(HERE / 'src' / 'hybrid_8way_bindings.cpp'),
@@ -337,26 +297,6 @@ hybrid_8way_builder_sources = [
 hybrid_8way_builder_ext = CUDAExtension(
     name='library.AdaptiveIMI.cpp_extensions.hybrid_8way_builder_cpp',
     sources=hybrid_8way_builder_sources,
-    include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
-    library_dirs=CUDA_LIB_DIRS,
-    extra_compile_args={
-        'cxx': COMMON_CXX_FLAGS,
-        'nvcc': COMMON_NVCC_FLAGS + CUDA_ARCH_FLAGS,
-    },
-    extra_link_args=['-lcuda', '-lcudart'],
-)
-
-# ============================================================================
-# 模块 7: hybrid_subspace_kmeans_bench_cpp (CUDA benchmark only)
-# ============================================================================
-hybrid_subspace_kmeans_bench_sources = [
-    str(HERE / 'src' / 'hybrid_subspace_kmeans_bench_bindings.cpp'),
-    str(HERE / 'cuda' / 'hybrid_subspace_kmeans_bench.cu'),
-]
-
-hybrid_subspace_kmeans_bench_ext = CUDAExtension(
-    name='library.AdaptiveIMI.cpp_extensions.hybrid_subspace_kmeans_bench_cpp',
-    sources=hybrid_subspace_kmeans_bench_sources,
     include_dirs=[str(HERE / 'include')] + CUDA_INCLUDE_DIRS + TORCH_INCLUDE,
     library_dirs=CUDA_LIB_DIRS,
     extra_compile_args={
@@ -378,11 +318,8 @@ setup(
     ext_modules=[
         gpu_cluster_manager_ext,
         ultra_layer_pipeline_ext,
-        adpimi_index_ext,
         copy_ext,
-        gemm_softmax_ext,
         hybrid_8way_builder_ext,
-        hybrid_subspace_kmeans_bench_ext,
     ],
     cmdclass={
         'build_ext': BuildExtension,

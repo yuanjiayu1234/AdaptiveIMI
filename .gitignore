@@ -12,6 +12,12 @@
 
 /outputs/
 *.so
+
+# Local third-party dependency checkouts. Install these as environment
+# dependencies instead of committing their full source trees here.
+/Block-Sparse-Attention/
+/flash-attention-weighted/
+
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 /throughput_eval/

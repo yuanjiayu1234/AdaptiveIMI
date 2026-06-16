@@ -1,4 +1,3 @@
-import os
 import time
 
 import torch
@@ -69,8 +68,6 @@ class PrefillMixin:
         chunk_start,
         chunk_end,
         layer,
-        layer_idx,
-        start_bdx,
         key_states,
         value_states,
     ):
@@ -99,23 +96,19 @@ class PrefillMixin:
         key_states[:, chunk_start:chunk_end, :, :].copy_(key_chunk)
         value_states[:, chunk_start:chunk_end, :, :].copy_(value_chunk)
 
-        return hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk
+        return hidden_chunk, query_chunk
     def _streaming_finish_chunk(
         self,
         layer,
         layer_idx,
         hidden_chunk,
-        temp_hidden_states,
         query_chunk,
-        key_chunk,
-        value_chunk,
         key_states,
         value_states,
         valid_start,
         chunk_start,
         chunk_end,
         output_cpu,
-        debug_align,
     ):
         bsz = hidden_chunk.shape[0]
 
@@ -140,19 +133,6 @@ class PrefillMixin:
                 layer_idx,
             )
 
-            if debug_align and layer_idx == 0:
-                q_len = int(q_sub.shape[1])
-                k_len = int(k_prefix.shape[1])
-                q_offset = int(q_valid_start - valid_start)
-                print(
-                    "[IMI PREFILL ALIGN]"
-                    f" layer={layer_idx} valid_start={valid_start}"
-                    f" chunk=[{chunk_start},{chunk_end})"
-                    f" q_valid_start={q_valid_start}"
-                    f" q_len={q_len} k_len={k_len} q_offset={q_offset}",
-                    flush=True,
-                )
-
             hidden_chunk[:, q_local_start:, :] += self.wo(
                 attn_chunk,
                 layer,
@@ -171,13 +151,12 @@ class PrefillMixin:
         hidden_chunk = hidden_chunk + mlp_out
 
         output_cpu[:, chunk_start:chunk_end, :].copy_(hidden_chunk, non_blocking=True)
-        del hidden_chunk, hidden_states_norm, mlp_out, temp_hidden_states, query_chunk, key_chunk, value_chunk
+        del hidden_chunk, hidden_states_norm, mlp_out, query_chunk
     def layer_prefill_chunked(self, layer_idx, start_bdx, hidden_cpu, output_cpu, seq_len, chunk_size):
         bsz = hidden_cpu.shape[0]
         layer = self.layers[layer_idx]
         device = layer.device
         kv_cache = getattr(self, "kv_cache", None)
-        debug_align = os.getenv("IMI_DEBUG_PREFILL_ALIGN", "0") == "1"
         num_chunks = (seq_len + chunk_size - 1) // chunk_size
 
         self._log_streaming_progress(
@@ -202,13 +181,11 @@ class PrefillMixin:
             breakdown_enabled = getattr(self, "breakdown_enabled", False)
             chunk_t0 = time.perf_counter() if self._streaming_progress_enabled() else None
             build_t0 = time.perf_counter() if breakdown_enabled else None
-            hidden_chunk, temp_hidden_states, query_chunk, key_chunk, value_chunk = self._streaming_build_kv_chunk(
+            hidden_chunk, query_chunk = self._streaming_build_kv_chunk(
                 hidden_cpu,
                 chunk_start,
                 chunk_end,
                 layer,
-                layer_idx,
-                start_bdx,
                 key_states,
                 value_states,
             )
@@ -235,17 +212,13 @@ class PrefillMixin:
                 layer,
                 layer_idx,
                 hidden_chunk,
-                temp_hidden_states,
                 query_chunk,
-                key_chunk,
-                value_chunk,
                 key_states,
                 value_states,
                 valid_start,
                 chunk_start,
                 chunk_end,
                 output_cpu,
-                debug_align,
             )
             if finish_t0 is not None:
                 self.prefill_layer_compute_wall_ms += (time.perf_counter() - finish_t0) * 1000.0
