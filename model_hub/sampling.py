@@ -1,3 +1,4 @@
+import flashinfer
 import torch
 
 
@@ -6,13 +7,12 @@ class SamplingMixin:
         if not do_sample:
             output_ids = logits.argmax(dim=-1)  # [bsz, 1], torch.int64
         else:
-            logits = logits / temperature
-            probs = torch.softmax(logits, dim=-1, dtype=torch.float32)  # [bsz, 1, vocab_size]
-            probs = probs.squeeze(1) # [bsz, vocab_size]
-            if top_k != 0:
-                output_ids = flashinfer.sampling.top_k_top_p_sampling_from_probs(probs, top_p=top_p, top_k=top_k)
-            else:
-                output_ids = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p=top_p)
+            logits = (logits / temperature).squeeze(1)  # [bsz, vocab_size]
+            output_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                logits,
+                top_k=top_k,
+                top_p=top_p,
+            )
             output_ids = output_ids.unsqueeze(1) # [bsz, 1], torch.int32
 
         return output_ids

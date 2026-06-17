@@ -8,8 +8,10 @@ from weighted_flash_decoding import weighted_flash_decoding
 from library.AdaptiveIMI.imi_adapter import get_imi_kernels
 from library.AdaptiveIMI.cpp_extensions import (
     build_cache_aware_retrieval_plan,
-    gather_copy_and_concat_chunk_parallel,
-    promote_cache_pages_from_list,
+    gather_copy_hit_chunks_profile,
+    gather_copy_miss_chunks_profile,
+    gather_copy_static_chunks_profile,
+    promote_hot_cold_cache_pages_from_execution,
 )
 
 imi_gpu_kernels = get_imi_kernels()
@@ -17,45 +19,26 @@ imi_gpu_kernels = get_imi_kernels()
 
 class AdaptiveIMIRetrievalMixin:
     _GPU_CACHE_PROMOTION_WARMUP_STEPS = 4
-    _GPU_CACHE_PROMOTION_WARMUP_PAGES_PER_GROUP = -1
     _GPU_CACHE_PROMOTION_STEADY_PAGES_PER_GROUP = 64
 
     _CACHE_PROFILE_SUM_KEYS = (
-        "hit_clusters",
-        "miss_clusters",
         "hit_blocks",
         "miss_blocks",
-        "selected_valid_clusters",
-        "considered_blocks",
-        "truncated_groups",
-        "dropped_clusters_after_budget",
-        "admitted_clusters",
         "update_blocks",
         "evicted_clusters",
         "evicted_blocks",
         "free_blocks_before",
         "free_blocks_after",
-        "hot_blocks",
-        "cold_blocks",
-        "hot_promotions",
-        "hot_demotions",
-        "batch_access_us",
-        "batch_update_us",
-        "sync_wait_us",
-        "access_worker_sum_us",
-        "update_worker_sum_us",
         "promotion_submitted",
+        "promotion_completed",
+        "promotion_ms",
         "promotion_skipped_busy",
+        "promotion_skipped_no_buffer",
     )
     _CACHE_PROFILE_MAX_KEYS = (
-        "access_worker_max_us",
-        "update_worker_max_us",
-        "max_group_access_us",
-        "max_group_update_us",
-        "max_group_considered_blocks",
-        "max_group_miss_blocks",
         "max_group_update_blocks",
         "max_group_evicted_blocks",
+        "promotion_ms_max",
     )
 
     def _select_clusters_raw_sum(self, layer_idx: int, query_grouped: torch.Tensor, device: str) -> torch.Tensor:
@@ -91,17 +74,53 @@ class AdaptiveIMIRetrievalMixin:
             "miss_unit_sizes": self.gpu_cache_aware_miss_unit_sizes[layer_idx][slot],
             "miss_unit_sizes_cumsum": self.gpu_cache_aware_miss_unit_sizes_cumsum[layer_idx][slot],
             "miss_num_units": self.gpu_cache_aware_miss_num_units[layer_idx][slot],
+            "miss_copy_unit_idices": self.gpu_cache_aware_miss_copy_unit_idices[layer_idx][slot],
+            "miss_copy_unit_sizes": self.gpu_cache_aware_miss_copy_unit_sizes[layer_idx][slot],
+            "miss_copy_unit_sizes_cumsum": self.gpu_cache_aware_miss_copy_unit_sizes_cumsum[layer_idx][slot],
+            "miss_copy_num_units": self.gpu_cache_aware_miss_copy_num_units[layer_idx][slot],
             "miss_page_keys": self.gpu_cache_aware_miss_page_keys[layer_idx][slot],
+            "admit_unit_starts": self.gpu_cache_aware_admit_unit_starts[layer_idx][slot],
+            "promote_src_offsets": self.gpu_cache_promote_src_offsets[layer_idx][slot],
+            "promote_dst_slots": self.gpu_cache_promote_dst_slots[layer_idx][slot],
+            "promote_sizes": self.gpu_cache_promote_sizes[layer_idx][slot],
+            "promote_hash_positions": self.gpu_cache_promote_hash_positions[layer_idx][slot],
+            "promote_page_keys": self.gpu_cache_promote_page_keys[layer_idx][slot],
+            "promote_counts": self.gpu_cache_promote_counts[layer_idx][slot],
             "hit_unit_idices": self.gpu_cache_aware_hit_unit_idices[layer_idx][slot],
             "hit_unit_sizes": self.gpu_cache_aware_hit_unit_sizes[layer_idx][slot],
             "hit_unit_sizes_cumsum": self.gpu_cache_aware_hit_unit_sizes_cumsum[layer_idx][slot],
             "hit_num_units": self.gpu_cache_aware_hit_num_units[layer_idx][slot],
         }
     def _gpu_cache_promotion_pages_per_group(self) -> int:
+        cache_cfg = self.runtime_config.get("cache") or {}
+        env_pages = os.getenv("IMI_CACHE_PROMOTION_PAGES_PER_GROUP")
+        if env_pages is not None and env_pages != "":
+            return int(env_pages)
+        if cache_cfg.get("promotion_pages_per_group") is not None:
+            return int(cache_cfg["promotion_pages_per_group"])
+
+        hot_ratio = float(cache_cfg.get("hot_ratio", 0.3))
+        hot_ratio = min(max(hot_ratio, 0.05), 0.95)
+        cold_capacity = max(int(self.cache_size) - int(round(int(self.cache_size) * hot_ratio)), 1)
         step = int(getattr(self, "gpu_cache_promotion_decode_step", 0))
         if step <= self._GPU_CACHE_PROMOTION_WARMUP_STEPS:
-            return self._GPU_CACHE_PROMOTION_WARMUP_PAGES_PER_GROUP
-        return self._GPU_CACHE_PROMOTION_STEADY_PAGES_PER_GROUP
+            ratio = float(os.getenv(
+                "IMI_CACHE_PROMOTION_INITIAL_FILL_RATIO",
+                cache_cfg.get("promotion_initial_fill_ratio", 0.25),
+            ))
+            return max(int(cold_capacity * ratio), self._GPU_CACHE_PROMOTION_STEADY_PAGES_PER_GROUP)
+        ratio = float(os.getenv(
+            "IMI_CACHE_PROMOTION_STEADY_FILL_RATIO",
+            cache_cfg.get("promotion_steady_fill_ratio", 0.10),
+        ))
+        return max(int(cold_capacity * ratio), self._GPU_CACHE_PROMOTION_STEADY_PAGES_PER_GROUP)
+    def _gpu_cache_hot_cold_capacities(self) -> tuple[int, int]:
+        cache_cfg = self.runtime_config.get("cache") or {}
+        hot_ratio = float(cache_cfg.get("hot_ratio", 0.3))
+        hot_ratio = min(max(hot_ratio, 0.05), 0.95)
+        hot_capacity = min(max(int(round(int(self.cache_size) * hot_ratio)), 1), max(int(self.cache_size) - 1, 1))
+        cold_capacity = max(int(self.cache_size) - hot_capacity, 1)
+        return hot_capacity, cold_capacity
 
     def _tokens_to_pages(self, token_budget: int) -> int:
         if token_budget <= 0:
@@ -112,8 +131,6 @@ class AdaptiveIMIRetrievalMixin:
     def _empty_cache_profile_stats(self) -> dict:
         stats = {key: 0.0 for key in self._CACHE_PROFILE_SUM_KEYS}
         stats.update({key: 0.0 for key in self._CACHE_PROFILE_MAX_KEYS})
-        stats["max_group_access_id"] = -1
-        stats["max_group_update_id"] = -1
         return stats
     def _merge_cache_profile_stats(self, total: dict, stats: Optional[dict]) -> None:
         if not stats:
@@ -122,10 +139,6 @@ class AdaptiveIMIRetrievalMixin:
             total[key] = float(total.get(key, 0.0)) + float(stats.get(key, 0.0) or 0.0)
         for key in self._CACHE_PROFILE_MAX_KEYS:
             total[key] = max(float(total.get(key, 0.0)), float(stats.get(key, 0.0) or 0.0))
-        if float(stats.get("max_group_access_us", 0.0) or 0.0) >= float(total.get("max_group_access_us", 0.0)):
-            total["max_group_access_id"] = int(stats.get("max_group_access_id", -1))
-        if float(stats.get("max_group_update_us", 0.0) or 0.0) >= float(total.get("max_group_update_us", 0.0)):
-            total["max_group_update_id"] = int(stats.get("max_group_update_id", -1))
     def _new_timing_event(self) -> torch.cuda.Event:
         return torch.cuda.Event(enable_timing=True)
     def _record_timing_event(self) -> torch.cuda.Event:
@@ -134,20 +147,94 @@ class AdaptiveIMIRetrievalMixin:
         return event
     def _elapsed_ms(self, start: torch.cuda.Event, end: torch.cuda.Event) -> float:
         return float(start.elapsed_time(end))
-    def _ensure_execution_buffer(self, device: str) -> None:
+    def _execution_buffer_ring_size(self) -> int:
+        cache_cfg = self.runtime_config.get("cache") or {}
+        raw_size = cache_cfg.get("execution_buffer_ring_size", 2)
+        ring_size = int(raw_size)
+        return min(max(ring_size, 1), 8)
+
+    def _execution_buffer_ring_key(self, device: str, layer_idx: int) -> str:
+        return f"{device}:layer:{int(layer_idx)}"
+
+    def _ensure_execution_buffer_ring(self, device: str, layer_idx: int = 0) -> None:
         shape = (self.batch_groups, self.execution_stride, 1, self.head_dim)
         dev = torch.device(device)
-        keys = self.execution_buffer_keys_dict.get(device)
-        if keys is None or tuple(keys.shape) != shape or keys.dtype != self.dtype or torch.device(keys.device) != dev:
-            self.execution_buffer_keys_dict[device] = torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
-        values = self.execution_buffer_values_dict.get(device)
-        if values is None or tuple(values.shape) != shape or values.dtype != self.dtype or torch.device(values.device) != dev:
-            self.execution_buffer_values_dict[device] = torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
+        ring_size = self._execution_buffer_ring_size()
+        ring_key = self._execution_buffer_ring_key(device, layer_idx)
+
+        def matches(tensor: torch.Tensor) -> bool:
+            return (
+                tensor is not None
+                and tuple(tensor.shape) == shape
+                and tensor.dtype == self.dtype
+                and torch.device(tensor.device) == dev
+            )
+
+        key_ring = self.execution_buffer_key_ring_dict.get(ring_key)
+        value_ring = self.execution_buffer_value_ring_dict.get(ring_key)
+        if (
+            key_ring is None
+            or value_ring is None
+            or len(key_ring) != ring_size
+            or len(value_ring) != ring_size
+            or any(not matches(tensor) for tensor in key_ring)
+            or any(not matches(tensor) for tensor in value_ring)
+        ):
+            self.execution_buffer_key_ring_dict[ring_key] = [
+                torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
+                for _ in range(ring_size)
+            ]
+            self.execution_buffer_value_ring_dict[ring_key] = [
+                torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
+                for _ in range(ring_size)
+            ]
+            self.execution_buffer_ring_events[ring_key] = [None] * ring_size
+            self.execution_buffer_ring_next[ring_key] = 0
+
+        keys = self.execution_buffer_fallback_keys_dict.get(device)
+        if not matches(keys):
+            self.execution_buffer_fallback_keys_dict[device] = torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
+        values = self.execution_buffer_fallback_values_dict.get(device)
+        if not matches(values):
+            self.execution_buffer_fallback_values_dict[device] = torch.empty(shape, dtype=self.dtype, device=dev).contiguous()
+
+        self.execution_buffer_keys_dict[device] = self.execution_buffer_key_ring_dict[ring_key][0]
+        self.execution_buffer_values_dict[device] = self.execution_buffer_value_ring_dict[ring_key][0]
+
+    def _select_execution_buffer(self, layer_idx: int, device: str) -> tuple[torch.Tensor, torch.Tensor, int, bool]:
+        self._ensure_execution_buffer_ring(device, layer_idx)
+        ring_key = self._execution_buffer_ring_key(device, layer_idx)
+        key_ring = self.execution_buffer_key_ring_dict[ring_key]
+        value_ring = self.execution_buffer_value_ring_dict[ring_key]
+        events = self.execution_buffer_ring_events[ring_key]
+        ring_size = len(key_ring)
+        for idx, event in enumerate(events):
+            if event is not None and event.query():
+                events[idx] = None
+        start = int(self.execution_buffer_ring_next.get(ring_key, 0)) % ring_size
+        for offset in range(ring_size):
+            slot = (start + offset) % ring_size
+            event = events[slot]
+            if event is None:
+                self.execution_buffer_ring_next[ring_key] = (slot + 1) % ring_size
+                keys = key_ring[slot]
+                values = value_ring[slot]
+                self.execution_buffer_keys_dict[device] = keys
+                self.execution_buffer_values_dict[device] = values
+                return keys, values, slot, True
+
+        keys = self.execution_buffer_fallback_keys_dict[device]
+        values = self.execution_buffer_fallback_values_dict[device]
+        self.execution_buffer_keys_dict[device] = keys
+        self.execution_buffer_values_dict[device] = values
+        return keys, values, -1, False
     def _run_retrieval_full_gpu_cache_aware(
         self,
         layer_idx: int,
         device: str,
         cluster_ids: torch.Tensor,
+        execution_keys: torch.Tensor,
+        execution_values: torch.Tensor,
         profile_decode: bool = False,
     ) -> Optional[dict]:
         descriptor_slot = self._select_gpu_cache_aware_descriptor_slot(layer_idx)
@@ -166,7 +253,12 @@ class AdaptiveIMIRetrievalMixin:
             desc["miss_unit_sizes"],
             desc["miss_unit_sizes_cumsum"],
             desc["miss_num_units"],
+            desc["miss_copy_unit_idices"],
+            desc["miss_copy_unit_sizes"],
+            desc["miss_copy_unit_sizes_cumsum"],
+            desc["miss_copy_num_units"],
             desc["miss_page_keys"],
+            desc["admit_unit_starts"],
             desc["hit_unit_idices"],
             desc["hit_unit_sizes"],
             desc["hit_unit_sizes_cumsum"],
@@ -185,38 +277,105 @@ class AdaptiveIMIRetrievalMixin:
             lookup_end_event = self._record_timing_event()
             gather_start_event = self._record_timing_event()
 
-        self._ensure_execution_buffer(device)
-        gather_copy_and_concat_chunk_parallel(
-            self.steady_zone_keys[layer_idx],
-            self.list_keys[layer_idx],
-            self.cache_keys[layer_idx],
-            self.execution_buffer_keys_dict[device],
-            self.steady_zone_values[layer_idx],
-            self.list_values[layer_idx],
-            self.cache_values[layer_idx],
-            self.execution_buffer_values_dict[device],
-            desc["miss_unit_idices"],
-            desc["miss_unit_sizes"],
-            desc["miss_unit_sizes_cumsum"],
-            desc["miss_num_units"],
-            desc["hit_unit_idices"],
-            desc["hit_unit_sizes"],
-            desc["hit_unit_sizes_cumsum"],
-            desc["hit_num_units"],
-            self.valid_lengths_dict[device],
-            self.batch_groups,
-            self.static_stride,
-            self.list_capacity,
-            self.cache_size,
-            self.execution_stride,
-            self.buffer_size,
-            self.static_len_tensor_dict[device],
-        )
+        if profile_decode:
+            static_start_event = self._record_timing_event()
+            gather_copy_static_chunks_profile(
+                self.steady_zone_keys[layer_idx],
+                execution_keys,
+                self.steady_zone_values[layer_idx],
+                execution_values,
+                self.valid_lengths_dict[device],
+                self.batch_groups,
+                self.static_stride,
+                self.execution_stride,
+                self.static_len_tensor_dict[device],
+            )
+            static_end_event = self._record_timing_event()
+            gather_copy_miss_chunks_profile(
+                self.list_keys[layer_idx],
+                execution_keys,
+                self.list_values[layer_idx],
+                execution_values,
+                desc["miss_copy_unit_idices"],
+                desc["miss_copy_unit_sizes"],
+                desc["miss_copy_unit_sizes_cumsum"],
+                desc["miss_copy_num_units"],
+                self.batch_groups,
+                self.list_capacity,
+                self.execution_stride,
+                self.buffer_size,
+                self.static_len_tensor_dict[device],
+            )
+            miss_end_event = self._record_timing_event()
+            gather_copy_hit_chunks_profile(
+                self.cache_keys[layer_idx],
+                execution_keys,
+                self.cache_values[layer_idx],
+                execution_values,
+                desc["miss_unit_sizes"],
+                desc["miss_unit_sizes_cumsum"],
+                desc["miss_num_units"],
+                desc["hit_unit_idices"],
+                desc["hit_unit_sizes"],
+                desc["hit_unit_sizes_cumsum"],
+                desc["hit_num_units"],
+                self.batch_groups,
+                self.cache_size,
+                self.execution_stride,
+                self.buffer_size,
+                self.static_len_tensor_dict[device],
+            )
+            hit_end_event = self._record_timing_event()
+        else:
+            gather_copy_static_chunks_profile(
+                self.steady_zone_keys[layer_idx],
+                execution_keys,
+                self.steady_zone_values[layer_idx],
+                execution_values,
+                self.valid_lengths_dict[device],
+                self.batch_groups,
+                self.static_stride,
+                self.execution_stride,
+                self.static_len_tensor_dict[device],
+            )
+            gather_copy_miss_chunks_profile(
+                self.list_keys[layer_idx],
+                execution_keys,
+                self.list_values[layer_idx],
+                execution_values,
+                desc["miss_copy_unit_idices"],
+                desc["miss_copy_unit_sizes"],
+                desc["miss_copy_unit_sizes_cumsum"],
+                desc["miss_copy_num_units"],
+                self.batch_groups,
+                self.list_capacity,
+                self.execution_stride,
+                self.buffer_size,
+                self.static_len_tensor_dict[device],
+            )
+            gather_copy_hit_chunks_profile(
+                self.cache_keys[layer_idx],
+                execution_keys,
+                self.cache_values[layer_idx],
+                execution_values,
+                desc["miss_unit_sizes"],
+                desc["miss_unit_sizes_cumsum"],
+                desc["miss_num_units"],
+                desc["hit_unit_idices"],
+                desc["hit_unit_sizes"],
+                desc["hit_unit_sizes_cumsum"],
+                desc["hit_num_units"],
+                self.batch_groups,
+                self.cache_size,
+                self.execution_stride,
+                self.buffer_size,
+                self.static_len_tensor_dict[device],
+            )
 
         if not profile_decode:
             return None
 
-        gather_end_event = self._record_timing_event()
+        gather_end_event = hit_end_event
         promote_pages_per_group = self._gpu_cache_promotion_pages_per_group()
         if promote_pages_per_group < 0:
             planned_update_blocks = desc["miss_num_units"].sum()
@@ -230,18 +389,35 @@ class AdaptiveIMIRetrievalMixin:
         return {
             "lookup_events": (lookup_start_event, lookup_end_event),
             "gather_events": (gather_start_event, gather_end_event),
+            "copy_events": {
+                "static": (static_start_event, static_end_event),
+                "miss": (static_end_event, miss_end_event),
+                "hit": (miss_end_event, hit_end_event),
+            },
             "h2d_ms": 0.0,
             "cache_sync_ms": 0.0,
             "scatter_ms": 0.0,
             "cache_stats": gpu_cache_stats,
         }
-    def _schedule_gpu_cache_promotion(self, layer_idx: int, device: str, static_len: int) -> dict:
-        del static_len
+    def _schedule_gpu_cache_promotion(
+        self,
+        layer_idx: int,
+        device: str,
+        execution_keys: torch.Tensor,
+        execution_values: torch.Tensor,
+        execution_slot: int,
+        can_admit: bool,
+        static_len: int,
+    ) -> dict:
         descriptor_slot = int(self.gpu_cache_aware_active_slots[layer_idx])
         desc = self._gpu_cache_aware_descriptors(layer_idx, descriptor_slot)
         stats = {
             "promotion_submitted": 0.0,
+            "promotion_completed": 0.0,
+            "promotion_ms": 0.0,
+            "promotion_ms_max": 0.0,
             "promotion_skipped_busy": 0.0,
+            "promotion_skipped_no_buffer": 0.0,
         }
 
         prior_event = self.gpu_cache_promote_events[layer_idx]
@@ -249,7 +425,19 @@ class AdaptiveIMIRetrievalMixin:
             if not prior_event.query():
                 stats["promotion_skipped_busy"] = 1.0
                 return stats
+            start_event = self.gpu_cache_promote_start_events[layer_idx]
+            if start_event is not None:
+                try:
+                    elapsed_ms = float(start_event.elapsed_time(prior_event))
+                    stats["promotion_completed"] = 1.0
+                    stats["promotion_ms"] = elapsed_ms
+                    stats["promotion_ms_max"] = elapsed_ms
+                except RuntimeError:
+                    # Promotion timing is diagnostic only. Do not let a stale or
+                    # non-timing event from a previous run break decode.
+                    stats["promotion_completed"] = 1.0
             self.gpu_cache_promote_events[layer_idx] = None
+            self.gpu_cache_promote_start_events[layer_idx] = None
             self.gpu_cache_promote_slots[layer_idx] = -1
 
         stream = self.gpu_cache_promote_streams.get(device)
@@ -259,34 +447,71 @@ class AdaptiveIMIRetrievalMixin:
 
         current_stream = torch.cuda.current_stream(device)
         ready_event = torch.cuda.Event()
-        done_event = torch.cuda.Event()
+        start_event = torch.cuda.Event(enable_timing=True)
+        done_event = torch.cuda.Event(enable_timing=True)
+        promote_pages_per_group = int(self._gpu_cache_promotion_pages_per_group()) if can_admit else 0
+        if not can_admit:
+            stats["promotion_skipped_no_buffer"] = 1.0
         ready_event.record(current_stream)
         with torch.cuda.stream(stream):
             stream.wait_event(ready_event)
-            promote_cache_pages_from_list(
-                self.list_keys[layer_idx],
+            start_event.record(stream)
+            hot_capacity, cold_capacity = self._gpu_cache_hot_cold_capacities()
+            # Admission reads the already materialized execution buffer. This avoids
+            # a second CPU pinned -> GPU transfer for the same miss pages.
+            promote_hot_cold_cache_pages_from_execution(
+                execution_keys,
                 self.cache_keys[layer_idx],
-                self.list_values[layer_idx],
+                execution_values,
                 self.cache_values[layer_idx],
-                desc["miss_unit_idices"],
+                desc["miss_unit_sizes_cumsum"],
                 desc["miss_unit_sizes"],
                 desc["miss_num_units"],
                 desc["miss_page_keys"],
+                desc["admit_unit_starts"],
+                desc["promote_src_offsets"],
+                desc["promote_dst_slots"],
+                desc["promote_sizes"],
+                desc["promote_hash_positions"],
+                desc["promote_page_keys"],
+                desc["promote_counts"],
+                desc["hit_unit_idices"],
+                desc["hit_num_units"],
+                self.cluster_sizes_gpu[layer_idx],
                 self.gpu_cache_hash_keys[layer_idx],
                 self.gpu_cache_hash_values[layer_idx],
                 self.gpu_cache_slot_keys[layer_idx],
-                self.gpu_cache_next_slots[layer_idx],
+                self.gpu_cache_cluster_state[layer_idx],
+                self.gpu_cache_cluster_prev[layer_idx],
+                self.gpu_cache_cluster_next[layer_idx],
+                self.gpu_cache_hot_head[layer_idx],
+                self.gpu_cache_hot_tail[layer_idx],
+                self.gpu_cache_cold_head[layer_idx],
+                self.gpu_cache_cold_tail[layer_idx],
+                self.gpu_cache_hot_pages[layer_idx],
+                self.gpu_cache_cold_pages[layer_idx],
+                self.gpu_cache_free_slots[layer_idx],
+                self.gpu_cache_free_counts[layer_idx],
+                int(static_len),
                 int(self.batch_groups),
-                int(self.list_capacity),
+                int(self.execution_stride),
                 int(self.cache_size),
                 int(self.gpu_cache_hash_size),
                 int(self.buffer_size),
-                int(self._gpu_cache_promotion_pages_per_group()),
+                int(self.nprobe),
+                int(self.n_centroids),
+                int(self.page_size),
+                int(hot_capacity),
+                int(cold_capacity),
+                promote_pages_per_group,
             )
             done_event.record(stream)
-        self.gpu_cache_promote_desc_events[layer_idx] = None
+        self.gpu_cache_promote_start_events[layer_idx] = start_event
         self.gpu_cache_promote_events[layer_idx] = done_event
         self.gpu_cache_promote_slots[layer_idx] = descriptor_slot
+        if execution_slot >= 0:
+            ring_key = self._execution_buffer_ring_key(device, layer_idx)
+            self.execution_buffer_ring_events[ring_key][execution_slot] = done_event
         stats["promotion_submitted"] = 1.0
         return stats
     def _select_clusters(self, layer_idx, similarities):
@@ -301,11 +526,14 @@ class AdaptiveIMIRetrievalMixin:
         effective_nprobe = min(int(self.nprobe), active_clusters)
         topk = torch.topk(similarities, effective_nprobe, dim=-1, largest=True, sorted=True)
         cluster_sizes = self.cluster_sizes_gpu[layer_idx]
-        sizes = torch.gather(cluster_sizes, 1, topk.indices)
-        valid = sizes > 0
-        cumsum = torch.cumsum(sizes, dim=-1, dtype=torch.int32)
-        keep = valid & ((cumsum - sizes) < self.max_retrieval_tokens)
-        selected = topk.indices.masked_fill(~keep, self.padding_cluster_id)
+        selected_buffer = self.selected_cluster_buffer_dict.get(str(similarities.device))
+        selected = imi_gpu_kernels.apply_budget_after_topk(
+            topk.indices.contiguous(),
+            cluster_sizes,
+            int(self.max_retrieval_tokens),
+            int(self.padding_cluster_id),
+            selected_buffer,
+        )
         if effective_nprobe < int(self.nprobe):
             padded = torch.full(
                 (selected.size(0), int(self.nprobe)),
@@ -360,6 +588,9 @@ class AdaptiveIMIRetrievalMixin:
                 "selection_d2h_ms": 0.0,
                 "cpu_lookup_ms": 0.0,
                 "concat_copy_ms": 0.0,
+                "static_copy_ms": 0.0,
+                "miss_copy_ms": 0.0,
+                "hit_copy_ms": 0.0,
                 "cache_sync_ms": 0.0,
                 "scatter_ms": 0.0,
                 "delta_append_ms": 0.0,
@@ -401,11 +632,14 @@ class AdaptiveIMIRetrievalMixin:
         query_view = queries.view(self.batch_groups, 1, self.group_size, self.head_dim)
 
         self.valid_lengths_dict[device].zero_()
+        execution_keys, execution_values, execution_slot, can_admit_cache = self._select_execution_buffer(layer_idx, device)
 
         retrieval_timing = self._run_retrieval_full_gpu_cache_aware(
             layer_idx,
             device,
             selected,
+            execution_keys,
+            execution_values,
             profile_decode=profile,
         )
 
@@ -430,8 +664,8 @@ class AdaptiveIMIRetrievalMixin:
 
         acc_out = weighted_flash_decoding(
             query_view,
-            self.execution_buffer_keys_dict[device],
-            self.execution_buffer_values_dict[device],
+            execution_keys,
+            execution_values,
             previous_out=None,
             previous_lse=None,
             cache_seqlens=self.valid_lengths_dict[device],
@@ -442,7 +676,15 @@ class AdaptiveIMIRetrievalMixin:
             attn_end_event = self._record_timing_event()
             total_end_event = self._record_timing_event()
 
-        promotion_stats = self._schedule_gpu_cache_promotion(layer_idx, device, int(static_len))
+        promotion_stats = self._schedule_gpu_cache_promotion(
+            layer_idx,
+            device,
+            execution_keys,
+            execution_values,
+            execution_slot,
+            can_admit_cache,
+            int(static_len),
+        )
         if profile:
             self._merge_cache_profile_stats(cache_profile_stats, promotion_stats)
         if self.profile_block_hit_rate and layer_idx == self.layer_num - 1:
@@ -485,8 +727,12 @@ class AdaptiveIMIRetrievalMixin:
                     retrieval_events = event_record.get("retrieval") or {}
                     lookup_events = retrieval_events.get("lookup_events")
                     gather_events = retrieval_events.get("gather_events")
+                    copy_events = retrieval_events.get("copy_events") or {}
                     lookup_ms = self._elapsed_ms(*lookup_events) if lookup_events else 0.0
                     concat_copy_ms = self._elapsed_ms(*gather_events) if gather_events else 0.0
+                    static_copy_ms = self._elapsed_ms(*copy_events["static"]) if "static" in copy_events else 0.0
+                    miss_copy_ms = self._elapsed_ms(*copy_events["miss"]) if "miss" in copy_events else 0.0
+                    hit_copy_ms = self._elapsed_ms(*copy_events["hit"]) if "hit" in copy_events else 0.0
                     gather_ms = concat_copy_ms
                     h2d_ms = float(event_record.get("h2d_ms", 0.0) or 0.0)
                     cache_sync_ms = float(event_record.get("cache_sync_ms", 0.0) or 0.0)
@@ -513,6 +759,9 @@ class AdaptiveIMIRetrievalMixin:
                     self._profile_step_breakdown["selection_d2h_ms"] += float(selection_transfer_ms)
                     self._profile_step_breakdown["cpu_lookup_ms"] += float(lookup_ms)
                     self._profile_step_breakdown["concat_copy_ms"] += float(concat_copy_ms)
+                    self._profile_step_breakdown["static_copy_ms"] += float(static_copy_ms)
+                    self._profile_step_breakdown["miss_copy_ms"] += float(miss_copy_ms)
+                    self._profile_step_breakdown["hit_copy_ms"] += float(hit_copy_ms)
                     self._profile_step_breakdown["cache_sync_ms"] += float(cache_sync_ms)
                     self._profile_step_breakdown["scatter_ms"] += float(scatter_ms)
                     self._profile_step_breakdown["delta_append_ms"] += float(delta_append_ms)
@@ -525,18 +774,6 @@ class AdaptiveIMIRetrievalMixin:
                             self._profile_step_breakdown[key] = max(
                                 float(self._profile_step_breakdown.get(key, 0.0) or 0.0),
                                 float(cache_profile_stats.get(key, 0.0) or 0.0),
-                            )
-                        if float(cache_profile_stats.get("max_group_access_us", 0.0) or 0.0) >= float(
-                            self._profile_step_breakdown.get("max_group_access_us", 0.0) or 0.0
-                        ):
-                            self._profile_step_breakdown["max_group_access_id"] = int(
-                                cache_profile_stats.get("max_group_access_id", -1)
-                            )
-                        if float(cache_profile_stats.get("max_group_update_us", 0.0) or 0.0) >= float(
-                            self._profile_step_breakdown.get("max_group_update_us", 0.0) or 0.0
-                        ):
-                            self._profile_step_breakdown["max_group_update_id"] = int(
-                                cache_profile_stats.get("max_group_update_id", -1)
                             )
 
                 step_breakdown = dict(self._profile_step_breakdown)
@@ -572,12 +809,16 @@ class AdaptiveIMIRetrievalMixin:
                 if os.getenv("IMI_PROFILE_GATHER_DETAIL", "1") == "1":
                     print(
                         "[IMI decode gather] step={} selection_d2h={:.3f}ms cpu_lookup={:.3f}ms "
-                        "concat_copy={:.3f}ms cache_sync={:.3f}ms scatter={:.3f}ms "
+                        "concat_copy={:.3f}ms static_copy={:.3f}ms miss_copy={:.3f}ms hit_copy={:.3f}ms "
+                        "cache_sync={:.3f}ms scatter={:.3f}ms "
                         "delta_append={:.3f}ms".format(
                             self.profile_decode_count,
                             step_breakdown.get("selection_d2h_ms", 0.0),
                             step_breakdown.get("cpu_lookup_ms", 0.0),
                             step_breakdown.get("concat_copy_ms", 0.0),
+                            step_breakdown.get("static_copy_ms", 0.0),
+                            step_breakdown.get("miss_copy_ms", 0.0),
+                            step_breakdown.get("hit_copy_ms", 0.0),
                             step_breakdown.get("cache_sync_ms", 0.0),
                             step_breakdown.get("scatter_ms", 0.0),
                             step_breakdown.get("delta_append_ms", 0.0),
@@ -586,32 +827,22 @@ class AdaptiveIMIRetrievalMixin:
                     if os.getenv("IMI_PROFILE_CACHE_DETAIL", os.getenv("IMI_PROFILE_GATHER_DETAIL", "1")) == "1":
                         print(
                             "[IMI cache stats] step={} hit_blk={} miss_blk={} upd_blk={} evict_blk={} "
-                            "valid_clu={} hit_clu={} miss_clu={} consider_blk={} trunc_grp={} drop_clu={} "
-                            "access_us={} sync_wait_us={} update_us={} max_access_us={} gid={} "
-                            "max_update_us={} gid={} max_upd_blk={} max_evict_blk={} "
-                            "promote_submit={} promote_skip_busy={}".format(
+                            "max_upd_blk={} max_evict_blk={} "
+                            "promote_submit={} promote_done={} promote_ms={:.3f} "
+                            "promote_max={:.3f} promote_skip_busy={} promote_no_buf={}".format(
                                 self.profile_decode_count,
                                 int(step_breakdown.get("hit_blocks", 0.0)),
                                 int(step_breakdown.get("miss_blocks", 0.0)),
                                 int(step_breakdown.get("update_blocks", 0.0)),
                                 int(step_breakdown.get("evicted_blocks", 0.0)),
-                                int(step_breakdown.get("selected_valid_clusters", 0.0)),
-                                int(step_breakdown.get("hit_clusters", 0.0)),
-                                int(step_breakdown.get("miss_clusters", 0.0)),
-                                int(step_breakdown.get("considered_blocks", 0.0)),
-                                int(step_breakdown.get("truncated_groups", 0.0)),
-                                int(step_breakdown.get("dropped_clusters_after_budget", 0.0)),
-                                int(step_breakdown.get("batch_access_us", 0.0)),
-                                int(step_breakdown.get("sync_wait_us", 0.0)),
-                                int(step_breakdown.get("batch_update_us", 0.0)),
-                                int(step_breakdown.get("max_group_access_us", 0.0)),
-                                int(step_breakdown.get("max_group_access_id", -1)),
-                                int(step_breakdown.get("max_group_update_us", 0.0)),
-                                int(step_breakdown.get("max_group_update_id", -1)),
                                 int(step_breakdown.get("max_group_update_blocks", 0.0)),
                                 int(step_breakdown.get("max_group_evicted_blocks", 0.0)),
                                 int(step_breakdown.get("promotion_submitted", 0.0)),
+                                int(step_breakdown.get("promotion_completed", 0.0)),
+                                float(step_breakdown.get("promotion_ms", 0.0)),
+                                float(step_breakdown.get("promotion_ms_max", 0.0)),
                                 int(step_breakdown.get("promotion_skipped_busy", 0.0)),
+                                int(step_breakdown.get("promotion_skipped_no_buffer", 0.0)),
                             )
                         )
 
@@ -630,11 +861,15 @@ class AdaptiveIMIRetrievalMixin:
                     if os.getenv("IMI_PROFILE_GATHER_DETAIL", "1") == "1":
                         print(
                             "[IMI decode gather][avg] selection_d2h={:.3f}ms cpu_lookup={:.3f}ms "
-                            "concat_copy={:.3f}ms cache_sync={:.3f}ms scatter={:.3f}ms "
+                            "concat_copy={:.3f}ms static_copy={:.3f}ms miss_copy={:.3f}ms hit_copy={:.3f}ms "
+                            "cache_sync={:.3f}ms scatter={:.3f}ms "
                             "delta_append={:.3f}ms".format(
                                 avg.get("selection_d2h_ms", 0.0),
                                 avg.get("cpu_lookup_ms", 0.0),
                                 avg.get("concat_copy_ms", 0.0),
+                                avg.get("static_copy_ms", 0.0),
+                                avg.get("miss_copy_ms", 0.0),
+                                avg.get("hit_copy_ms", 0.0),
                                 avg.get("cache_sync_ms", 0.0),
                                 avg.get("scatter_ms", 0.0),
                                 avg.get("delta_append_ms", 0.0),
@@ -643,29 +878,21 @@ class AdaptiveIMIRetrievalMixin:
                     if os.getenv("IMI_PROFILE_CACHE_DETAIL", os.getenv("IMI_PROFILE_GATHER_DETAIL", "1")) == "1":
                         print(
                             "[IMI cache stats][avg] hit_blk={:.1f} miss_blk={:.1f} upd_blk={:.1f} evict_blk={:.1f} "
-                            "valid_clu={:.1f} hit_clu={:.1f} miss_clu={:.1f} consider_blk={:.1f} trunc_grp={:.1f} drop_clu={:.1f} "
-                            "access_us={:.1f} sync_wait_us={:.1f} update_us={:.1f} max_access_us={:.1f} "
-                            "max_update_us={:.1f} max_upd_blk={:.1f} max_evict_blk={:.1f} "
-                            "promote_submit={:.1f} promote_skip_busy={:.1f}".format(
+                            "max_upd_blk={:.1f} max_evict_blk={:.1f} "
+                            "promote_submit={:.1f} promote_done={:.1f} "
+                            "promote_ms={:.3f} promote_max={:.3f} promote_skip_busy={:.1f} promote_no_buf={:.1f}".format(
                                 avg.get("hit_blocks", 0.0),
                                 avg.get("miss_blocks", 0.0),
                                 avg.get("update_blocks", 0.0),
                                 avg.get("evicted_blocks", 0.0),
-                                avg.get("selected_valid_clusters", 0.0),
-                                avg.get("hit_clusters", 0.0),
-                                avg.get("miss_clusters", 0.0),
-                                avg.get("considered_blocks", 0.0),
-                                avg.get("truncated_groups", 0.0),
-                                avg.get("dropped_clusters_after_budget", 0.0),
-                                avg.get("batch_access_us", 0.0),
-                                avg.get("sync_wait_us", 0.0),
-                                avg.get("batch_update_us", 0.0),
-                                avg.get("max_group_access_us", 0.0),
-                                avg.get("max_group_update_us", 0.0),
                                 avg.get("max_group_update_blocks", 0.0),
                                 avg.get("max_group_evicted_blocks", 0.0),
                                 avg.get("promotion_submitted", 0.0),
+                                avg.get("promotion_completed", 0.0),
+                                avg.get("promotion_ms", 0.0),
+                                avg.get("promotion_ms_max", 0.0),
                                 avg.get("promotion_skipped_busy", 0.0),
+                                avg.get("promotion_skipped_no_buffer", 0.0),
                             )
                         )
 

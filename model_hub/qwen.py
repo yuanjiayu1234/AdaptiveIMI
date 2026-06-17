@@ -1,6 +1,3 @@
-import gc
-import os
-import re
 import math
 import torch
 import torch.nn.functional as F
@@ -154,25 +151,6 @@ class QwenModel(LLM):
         self._initialize_layers(hf_qwen.model.layers, QwenLayer)
         self._finalize_model_init()
 
-
-    @staticmethod
-    def _resolve_model_path(model_path: str) -> str:
-        if not model_path or not os.path.isdir(model_path):
-            return model_path
-        snapshots_dir = os.path.join(model_path, "snapshots")
-        if not os.path.isdir(snapshots_dir):
-            return model_path
-        snapshot_dirs = [
-            os.path.join(snapshots_dir, name)
-            for name in os.listdir(snapshots_dir)
-            if os.path.isdir(os.path.join(snapshots_dir, name))
-        ]
-        if not snapshot_dirs:
-            return model_path
-        snapshot_dirs.sort(key=os.path.getmtime, reverse=True)
-        return snapshot_dirs[0]
-
-    
     def init_kv_cache(self, valid_start, attn_config):
         self._build_kv_cache(valid_start, attn_config, support_offload=True, adaptive_prefill_bsz=self.prefill_bsz)
 

@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import re
 import time
 
 import flashinfer
@@ -77,7 +78,7 @@ class LLM(PrefillMixin, SamplingMixin):
         for item in candidates:
             if not item:
                 continue
-            match = __import__('re').search(r"(\d+)\s*[Bb]", str(item))
+            match = re.search(r"(\d+)\s*[Bb]", str(item))
             if match is not None:
                 return int(match.group(1))
 
@@ -715,10 +716,8 @@ class LLM(PrefillMixin, SamplingMixin):
             do_sample, temperature, top_p, top_k, ignore_eos: The sampling parameters.
             prefill_bsz (int): The batch size for prefill.
         """
-        self.attention_type = attention_type
-        self._reset_breakdown_profile()
-
         bs, input_length = inputs_ids.shape
+        self.attention_type = attention_type
         self.batch_size = bs
         self.input_length = input_length
         self.max_new_length = max_new_length
@@ -729,14 +728,8 @@ class LLM(PrefillMixin, SamplingMixin):
         valid_start = attention_masks.shape[1] - torch.sum(attention_masks, dim=-1).detach().cpu().numpy()
         del attention_masks
 
-        self.prefill_bsz = self._select_prefill_bsz(self.attention_type, prefill_bsz, valid_start)
-
         if self.attention_type == "AdaptiveIMI":
             self.apply_prefill_config(attn_config)
-        self.attention_type = attention_type
-        self.batch_size = bs
-        self.input_length = input_length
-        self.max_new_length = max_new_length
         self.prefill_bsz = self._select_prefill_bsz(self.attention_type, prefill_bsz, valid_start)
         self._reset_breakdown_profile()
 

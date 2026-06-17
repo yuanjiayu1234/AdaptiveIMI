@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <algorithm>
 #include <vector>
 #include <cstdint>
 
@@ -17,7 +18,14 @@
 
 constexpr int IMI_HASH_EMPTY = -1;
 constexpr int IMI_HASH_TOMBSTONE = -2;
-constexpr int IMI_HASH_PENDING = -3;
+constexpr int IMI_CLUSTER_NONE = 0;
+constexpr int IMI_CLUSTER_COLD = 1;
+constexpr int IMI_CLUSTER_HOT = 2;
+constexpr int IMI_CLUSTER_PENDING = 3;
+
+__device__ __forceinline__ int imi_pending_slot_code(int slot) {
+    return -4 - slot;
+}
 
 __device__ __forceinline__ uint32_t imi_hash_i64(int64_t key) {
     uint64_t x = static_cast<uint64_t>(key);
@@ -50,11 +58,31 @@ __device__ __forceinline__ int imi_hash_lookup(
     return -1;
 }
 
-__device__ __forceinline__ int imi_hash_claim_pending(
+__device__ __forceinline__ int imi_hash_find_pos(
+    const int64_t* __restrict__ keys,
+    int hash_size,
+    int64_t key
+) {
+    int pos = static_cast<int>(imi_hash_i64(key) & static_cast<uint32_t>(hash_size - 1));
+    for (int i = 0; i < hash_size; ++i) {
+        int64_t cur = keys[pos];
+        if (cur == key) {
+            return pos;
+        }
+        if (cur == IMI_HASH_EMPTY) {
+            return -1;
+        }
+        pos = (pos + 1) & (hash_size - 1);
+    }
+    return -1;
+}
+
+__device__ __forceinline__ int imi_hash_claim_pending_slot(
     int64_t* __restrict__ keys,
     int32_t* __restrict__ values,
     int hash_size,
-    int64_t key
+    int64_t key,
+    int slot
 ) {
     int pos = static_cast<int>(imi_hash_i64(key) & static_cast<uint32_t>(hash_size - 1));
     int first_tombstone = -1;
@@ -75,7 +103,7 @@ __device__ __forceinline__ int imi_hash_claim_pending(
                 static_cast<unsigned long long>(key)
             );
             if (static_cast<int64_t>(old) == expected) {
-                atomicExch(values + dst, IMI_HASH_PENDING);
+                atomicExch(values + dst, imi_pending_slot_code(slot));
                 return dst;
             }
             pos = static_cast<int>(imi_hash_i64(key) & static_cast<uint32_t>(hash_size - 1));
@@ -84,18 +112,126 @@ __device__ __forceinline__ int imi_hash_claim_pending(
         }
         pos = (pos + 1) & (hash_size - 1);
     }
-    if (first_tombstone >= 0) {
-        unsigned long long old = atomicCAS(
-            reinterpret_cast<unsigned long long*>(keys + first_tombstone),
-            static_cast<unsigned long long>(static_cast<int64_t>(IMI_HASH_TOMBSTONE)),
-            static_cast<unsigned long long>(key)
+    return -1;
+}
+
+__device__ __forceinline__ void hc_remove_node(
+    int cluster,
+    int32_t* __restrict__ prev,
+    int32_t* __restrict__ next,
+    int32_t* __restrict__ head,
+    int32_t* __restrict__ tail
+) {
+    int p = prev[cluster];
+    int n = next[cluster];
+    if (p >= 0) {
+        next[p] = n;
+    } else {
+        *head = n;
+    }
+    if (n >= 0) {
+        prev[n] = p;
+    } else {
+        *tail = p;
+    }
+    prev[cluster] = -1;
+    next[cluster] = -1;
+}
+
+__device__ __forceinline__ void hc_push_front(
+    int cluster,
+    int32_t* __restrict__ prev,
+    int32_t* __restrict__ next,
+    int32_t* __restrict__ head,
+    int32_t* __restrict__ tail
+) {
+    int old_head = *head;
+    prev[cluster] = -1;
+    next[cluster] = old_head;
+    if (old_head >= 0) {
+        prev[old_head] = cluster;
+    } else {
+        *tail = cluster;
+    }
+    *head = cluster;
+}
+
+__device__ __forceinline__ int hc_cluster_pages(
+    const int32_t* __restrict__ cluster_sizes,
+    int cluster,
+    int n_clusters,
+    int page_size
+) {
+    if (cluster < 0 || cluster >= n_clusters) {
+        return 0;
+    }
+    int size = cluster_sizes[cluster];
+    return size > 0 ? (size + page_size - 1) / page_size : 0;
+}
+
+__device__ __forceinline__ void hc_release_cluster_pages(
+    int cluster,
+    int pages,
+    int64_t* __restrict__ hash_keys,
+    int32_t* __restrict__ hash_values,
+    int hash_size,
+    int64_t* __restrict__ slot_keys,
+    int32_t* __restrict__ free_slots,
+    int32_t* __restrict__ free_count,
+    int cache_size
+) {
+    for (int page = 0; page < pages; ++page) {
+        int64_t key = (static_cast<int64_t>(cluster) << 32) | static_cast<uint32_t>(page);
+        int pos = imi_hash_find_pos(hash_keys, hash_size, key);
+        if (pos < 0) {
+            continue;
+        }
+        int slot = hash_values[pos];
+        hash_values[pos] = IMI_HASH_EMPTY;
+        atomicExch(
+            reinterpret_cast<unsigned long long*>(hash_keys + pos),
+            static_cast<unsigned long long>(static_cast<int64_t>(IMI_HASH_TOMBSTONE))
         );
-        if (static_cast<int64_t>(old) == static_cast<int64_t>(IMI_HASH_TOMBSTONE)) {
-            atomicExch(values + first_tombstone, IMI_HASH_PENDING);
-            return first_tombstone;
+        if (slot >= 0 && slot < cache_size) {
+            slot_keys[slot] = IMI_HASH_EMPTY;
+            int free_idx = min(*free_count, cache_size - 1);
+            free_slots[free_idx] = slot;
+            *free_count = min(*free_count + 1, cache_size);
         }
     }
-    return -1;
+}
+
+__device__ __forceinline__ bool hc_evict_cold_tail(
+    int32_t* __restrict__ cold_head,
+    int32_t* __restrict__ cold_tail,
+    int32_t* __restrict__ prev,
+    int32_t* __restrict__ next,
+    int8_t* __restrict__ state,
+    int32_t* __restrict__ cold_pages,
+    const int32_t* __restrict__ cluster_sizes,
+    int n_clusters,
+    int page_size,
+    int64_t* __restrict__ hash_keys,
+    int32_t* __restrict__ hash_values,
+    int hash_size,
+    int64_t* __restrict__ slot_keys,
+    int32_t* __restrict__ free_slots,
+    int32_t* __restrict__ free_count,
+    int cache_size
+) {
+    int victim = *cold_tail;
+    if (victim < 0) {
+        return false;
+    }
+    int pages = hc_cluster_pages(cluster_sizes, victim, n_clusters, page_size);
+    hc_remove_node(victim, prev, next, cold_head, cold_tail);
+    state[victim] = IMI_CLUSTER_NONE;
+    *cold_pages = max(0, *cold_pages - pages);
+    hc_release_cluster_pages(
+        victim, pages, hash_keys, hash_values, hash_size, slot_keys,
+        free_slots, free_count, cache_size
+    );
+    return true;
 }
 
 __global__ void build_cache_aware_retrieval_plan_kernel(
@@ -108,7 +244,12 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
     int32_t* __restrict__ miss_sizes,
     int32_t* __restrict__ miss_cumsum,
     int32_t* __restrict__ miss_counts,
+    int32_t* __restrict__ miss_copy_offsets,
+    int32_t* __restrict__ miss_copy_sizes,
+    int32_t* __restrict__ miss_copy_cumsum,
+    int32_t* __restrict__ miss_copy_counts,
     int64_t* __restrict__ miss_page_keys,
+    int32_t* __restrict__ admit_starts,
     int32_t* __restrict__ hit_offsets,
     int32_t* __restrict__ hit_sizes,
     int32_t* __restrict__ hit_cumsum,
@@ -136,22 +277,29 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
     int32_t* row_miss_offsets = miss_offsets + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_miss_sizes = miss_sizes + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_miss_cumsum = miss_cumsum + static_cast<int64_t>(row) * buffer_blocks;
+    int32_t* row_miss_copy_offsets = miss_copy_offsets + static_cast<int64_t>(row) * buffer_blocks;
+    int32_t* row_miss_copy_sizes = miss_copy_sizes + static_cast<int64_t>(row) * buffer_blocks;
+    int32_t* row_miss_copy_cumsum = miss_copy_cumsum + static_cast<int64_t>(row) * buffer_blocks;
     int64_t* row_miss_page_keys = miss_page_keys + static_cast<int64_t>(row) * buffer_blocks;
+    int32_t* row_admit_starts = admit_starts + static_cast<int64_t>(row) * nprobe;
     int32_t* row_hit_offsets = hit_offsets + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_hit_sizes = hit_sizes + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_hit_cumsum = hit_cumsum + static_cast<int64_t>(row) * buffer_blocks;
 
     __shared__ unsigned long long s_miss_state;
+    __shared__ unsigned long long s_miss_copy_state;
     __shared__ unsigned long long s_hit_state;
     __shared__ int s_considered_blocks;
     if (threadIdx.x == 0) {
         s_miss_state = 0;
+        s_miss_copy_state = 0;
         s_hit_state = 0;
         s_considered_blocks = 0;
     }
     __syncthreads();
 
     for (int i = threadIdx.x; i < nprobe; i += blockDim.x) {
+        row_admit_starts[i] = -1;
         int cluster = static_cast<int>(row_selected[i]);
         if (cluster < 0 || cluster >= n_clusters || row_selected[i] == padding_cluster_id) {
             continue;
@@ -175,14 +323,31 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
         int local_hit_blocks = 0;
         int local_miss_tokens = 0;
         int local_hit_tokens = 0;
+        int local_miss_runs = 0;
+        bool prev_miss = false;
+        unsigned long long hit_mask = 0;
+        int cached_slots[16];
+        const bool use_slot_cache = cluster_blocks <= 16;
+        const bool use_page_mask = cluster_blocks <= 64;
         for (int page = 0; page < cluster_blocks; ++page) {
             int size = (page + 1 == cluster_blocks) ? (cluster_size - page * block_size) : block_size;
             int64_t key = (static_cast<int64_t>(cluster) << 32) | static_cast<uint32_t>(page);
             int slot = imi_hash_lookup(row_hash_keys, row_hash_values, hash_size, key);
+            if (use_slot_cache) {
+                cached_slots[page] = slot;
+            }
             if (slot >= 0) {
+                if (use_page_mask) {
+                    hit_mask |= (1ULL << page);
+                }
                 local_hit_blocks++;
                 local_hit_tokens += size;
+                prev_miss = false;
             } else {
+                if (!prev_miss) {
+                    local_miss_runs++;
+                }
+                prev_miss = true;
                 local_miss_blocks++;
                 local_miss_tokens += size;
             }
@@ -194,6 +359,13 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
             unsigned long long inc = (static_cast<unsigned long long>(local_miss_tokens) << 32) |
                                      static_cast<unsigned int>(local_miss_blocks);
             miss_old = atomicAdd(&s_miss_state, inc);
+            row_admit_starts[i] = static_cast<int>(miss_old & 0xffffffffULL);
+        }
+        unsigned long long miss_copy_old = 0;
+        if (local_miss_runs > 0) {
+            unsigned long long inc = (static_cast<unsigned long long>(local_miss_tokens) << 32) |
+                                     static_cast<unsigned int>(local_miss_runs);
+            miss_copy_old = atomicAdd(&s_miss_copy_state, inc);
         }
         if (local_hit_blocks > 0) {
             unsigned long long inc = (static_cast<unsigned long long>(local_hit_tokens) << 32) |
@@ -203,19 +375,38 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
 
         int miss_idx = static_cast<int>(miss_old & 0xffffffffULL);
         int miss_dst = static_cast<int>(miss_old >> 32);
+        int miss_copy_idx = static_cast<int>(miss_copy_old & 0xffffffffULL);
+        int active_copy_idx = -1;
         int hit_idx = static_cast<int>(hit_old & 0xffffffffULL);
         int hit_dst = static_cast<int>(hit_old >> 32);
         for (int page = 0; page < cluster_blocks; ++page) {
             int size = (page + 1 == cluster_blocks) ? (cluster_size - page * block_size) : block_size;
             int64_t key = (static_cast<int64_t>(cluster) << 32) | static_cast<uint32_t>(page);
-            int slot = imi_hash_lookup(row_hash_keys, row_hash_values, hash_size, key);
+            int slot = -1;
+            if (use_slot_cache) {
+                slot = cached_slots[page];
+            } else if (!use_page_mask || ((hit_mask >> page) & 1ULL)) {
+                slot = imi_hash_lookup(row_hash_keys, row_hash_values, hash_size, key);
+            }
             if (slot >= 0) {
                 row_hit_offsets[hit_idx] = slot;
                 row_hit_sizes[hit_idx] = size;
                 row_hit_cumsum[hit_idx] = hit_dst;
                 hit_idx++;
                 hit_dst += size;
+                active_copy_idx = -1;
             } else {
+                if (active_copy_idx < 0) {
+                    active_copy_idx = miss_copy_idx++;
+                    row_miss_copy_offsets[active_copy_idx] = list_start + page * block_size;
+                    row_miss_copy_sizes[active_copy_idx] = 0;
+                    // The foreground run descriptor must write to the same
+                    // execution-buffer layout described by the page-level miss
+                    // descriptor. Cache admission later reads page-level
+                    // offsets from this buffer.
+                    row_miss_copy_cumsum[active_copy_idx] = miss_dst;
+                }
+                row_miss_copy_sizes[active_copy_idx] += size;
                 row_miss_offsets[miss_idx] = list_start + page * block_size;
                 row_miss_sizes[miss_idx] = size;
                 row_miss_cumsum[miss_idx] = miss_dst;
@@ -229,102 +420,384 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
 
     if (threadIdx.x == 0) {
         int miss_blocks = min(static_cast<int>(s_miss_state & 0xffffffffULL), buffer_blocks);
+        int miss_copy_blocks = min(static_cast<int>(s_miss_copy_state & 0xffffffffULL), buffer_blocks);
         int hit_blocks = min(static_cast<int>(s_hit_state & 0xffffffffULL), buffer_blocks);
         miss_counts[row] = miss_blocks;
+        miss_copy_counts[row] = miss_copy_blocks;
         hit_counts[row] = hit_blocks;
         valid_lengths[row] = static_cast<int>(s_miss_state >> 32) + static_cast<int>(s_hit_state >> 32);
     }
 }
 
-template <typename T>
-__global__ void promote_cache_pages_from_list_kernel(
-    T* __restrict__ list_keys,
-    T* __restrict__ cache_keys,
-    T* __restrict__ list_values,
-    T* __restrict__ cache_values,
-    const int32_t* __restrict__ miss_offsets,
+__global__ void plan_hot_cold_cache_promotion_kernel(
+    const int32_t* __restrict__ miss_dst_offsets,
     const int32_t* __restrict__ miss_sizes,
     const int32_t* __restrict__ miss_counts,
     const int64_t* __restrict__ miss_page_keys,
+    const int32_t* __restrict__ admit_starts,
+    int32_t* __restrict__ promote_src_offsets,
+    int32_t* __restrict__ promote_dst_slots,
+    int32_t* __restrict__ promote_sizes,
+    int32_t* __restrict__ promote_hash_positions,
+    int64_t* __restrict__ promote_page_keys,
+    int32_t* __restrict__ promote_counts,
+    const int32_t* __restrict__ hit_offsets,
+    const int32_t* __restrict__ hit_counts,
+    const int32_t* __restrict__ cluster_sizes,
     int64_t* __restrict__ hash_keys,
     int32_t* __restrict__ hash_values,
     int64_t* __restrict__ slot_keys,
-    int32_t* __restrict__ next_slots,
+    int8_t* __restrict__ cluster_state,
+    int32_t* __restrict__ cluster_prev,
+    int32_t* __restrict__ cluster_next,
+    int32_t* __restrict__ hot_head,
+    int32_t* __restrict__ hot_tail,
+    int32_t* __restrict__ cold_head,
+    int32_t* __restrict__ cold_tail,
+    int32_t* __restrict__ hot_pages,
+    int32_t* __restrict__ cold_pages,
+    int32_t* __restrict__ free_slots,
+    int32_t* __restrict__ free_counts,
+    int static_len,
     int groups,
-    int list_capacity,
+    int execution_stride,
     int cache_size,
     int hash_size,
     int buffer_blocks,
+    int nprobe,
+    int n_clusters,
+    int page_size,
+    int hot_capacity_pages,
+    int cold_capacity_pages,
     int max_promote_pages_per_group
 ) {
-    int row = blockIdx.x;
-    if (row >= groups) {
+    const int row = blockIdx.x;
+    if (row >= groups || threadIdx.x != 0) {
         return;
+    }
+
+    const int row_buffer_base = row * buffer_blocks;
+    const int row_probe_base = row * nprobe;
+    const int64_t row_hash_base = static_cast<int64_t>(row) * hash_size;
+    const int64_t row_cache_base = static_cast<int64_t>(row) * cache_size;
+    const int64_t row_cluster_base = static_cast<int64_t>(row) * n_clusters;
+
+    int64_t* row_hash_keys = hash_keys + row_hash_base;
+    int32_t* row_hash_values = hash_values + row_hash_base;
+    int64_t* row_slot_keys = slot_keys + row_cache_base;
+    int8_t* row_state = cluster_state + row_cluster_base;
+    int32_t* row_prev = cluster_prev + row_cluster_base;
+    int32_t* row_next = cluster_next + row_cluster_base;
+    const int32_t* row_cluster_sizes = cluster_sizes + row_cluster_base;
+    int32_t* row_free_slots = free_slots + row_cache_base;
+
+    int32_t* row_hot_head = hot_head + row;
+    int32_t* row_hot_tail = hot_tail + row;
+    int32_t* row_cold_head = cold_head + row;
+    int32_t* row_cold_tail = cold_tail + row;
+    int32_t* row_hot_pages = hot_pages + row;
+    int32_t* row_cold_pages = cold_pages + row;
+    int32_t* row_free_count = free_counts + row;
+
+    promote_counts[row] = 0;
+
+    // Hits only mutate cluster-level LRU metadata. They stay in this metadata
+    // kernel so the page-copy kernel can be purely parallel D2D work.
+    int last_hit_cluster = -1;
+    const int hit_count = hit_counts[row];
+    for (int idx = 0; idx < hit_count; ++idx) {
+        int slot = hit_offsets[row_buffer_base + idx];
+        if (slot < 0 || slot >= cache_size) {
+            continue;
+        }
+        int64_t key = row_slot_keys[slot];
+        int cluster = static_cast<int>(key >> 32);
+        if (cluster == last_hit_cluster || cluster < 0 || cluster >= n_clusters) {
+            continue;
+        }
+        last_hit_cluster = cluster;
+        int pages = hc_cluster_pages(row_cluster_sizes, cluster, n_clusters, page_size);
+        if (pages <= 0) {
+            continue;
+        }
+        if (row_state[cluster] == IMI_CLUSTER_HOT) {
+            hc_remove_node(cluster, row_prev, row_next, row_hot_head, row_hot_tail);
+            hc_push_front(cluster, row_prev, row_next, row_hot_head, row_hot_tail);
+        } else if (row_state[cluster] == IMI_CLUSTER_COLD) {
+            hc_remove_node(cluster, row_prev, row_next, row_cold_head, row_cold_tail);
+            *row_cold_pages = max(0, *row_cold_pages - pages);
+            row_state[cluster] = IMI_CLUSTER_HOT;
+            hc_push_front(cluster, row_prev, row_next, row_hot_head, row_hot_tail);
+            *row_hot_pages += pages;
+        }
+
+        while (*row_hot_pages > hot_capacity_pages && *row_hot_tail >= 0) {
+            int demote = *row_hot_tail;
+            int demote_pages = hc_cluster_pages(row_cluster_sizes, demote, n_clusters, page_size);
+            hc_remove_node(demote, row_prev, row_next, row_hot_head, row_hot_tail);
+            *row_hot_pages = max(0, *row_hot_pages - demote_pages);
+            row_state[demote] = IMI_CLUSTER_COLD;
+            hc_push_front(demote, row_prev, row_next, row_cold_head, row_cold_tail);
+            *row_cold_pages += demote_pages;
+        }
+        while (*row_cold_pages > cold_capacity_pages) {
+            if (!hc_evict_cold_tail(
+                row_cold_head, row_cold_tail, row_prev, row_next, row_state, row_cold_pages,
+                row_cluster_sizes, n_clusters, page_size, row_hash_keys, row_hash_values,
+                hash_size, row_slot_keys, row_free_slots, row_free_count, cache_size
+            )) {
+                break;
+            }
+        }
     }
 
     const int available_misses = miss_counts[row];
-    const int miss_count = max_promote_pages_per_group < 0
-        ? available_misses
-        : min(available_misses, max_promote_pages_per_group);
-    if (miss_count <= 0) {
+    if (available_misses <= 0 || max_promote_pages_per_group == 0) {
         return;
     }
 
-    const int32_t* row_miss_offsets = miss_offsets + static_cast<int64_t>(row) * buffer_blocks;
-    const int32_t* row_miss_sizes = miss_sizes + static_cast<int64_t>(row) * buffer_blocks;
-    const int64_t* row_miss_page_keys = miss_page_keys + static_cast<int64_t>(row) * buffer_blocks;
-    int64_t* row_hash_keys = hash_keys + static_cast<int64_t>(row) * hash_size;
-    int32_t* row_hash_values = hash_values + static_cast<int64_t>(row) * hash_size;
-    int64_t* row_slot_keys = slot_keys + static_cast<int64_t>(row) * cache_size;
-
-    __shared__ int slot_shared;
-    __shared__ int hash_pos_shared;
-    for (int miss_idx = 0; miss_idx < miss_count; ++miss_idx) {
-        if (threadIdx.x == 0) {
-            int64_t key = row_miss_page_keys[miss_idx];
-            int hash_pos = next_slots[row] < cache_size
-                ? imi_hash_claim_pending(row_hash_keys, row_hash_values, hash_size, key)
-                : -1;
-            int slot = -1;
-            if (hash_pos >= 0) {
-                slot = atomicAdd(next_slots + row, 1);
-                if (slot < cache_size) {
-                    row_slot_keys[slot] = key;
-                } else {
-                    atomicExch(row_hash_values + hash_pos, IMI_HASH_EMPTY);
-                    atomicExch(
-                        reinterpret_cast<unsigned long long*>(row_hash_keys + hash_pos),
-                        static_cast<unsigned long long>(static_cast<int64_t>(IMI_HASH_TOMBSTONE))
-                    );
+    int promoted_pages = 0;
+    int probe_idx = 0;
+    int plan_count = 0;
+    while (probe_idx < nprobe) {
+        int selected_miss_idx = -1;
+        int selected_run_end = -1;
+        int selected_cluster = -1;
+        int selected_run_pages = 0;
+        while (probe_idx < nprobe) {
+            int miss_idx = admit_starts[row_probe_base + probe_idx];
+            ++probe_idx;
+            if (miss_idx < 0 || miss_idx >= available_misses) {
+                continue;
+            }
+            int64_t first_key = miss_page_keys[row_buffer_base + miss_idx];
+            int cluster = static_cast<int>(first_key >> 32);
+            int run_end = miss_idx + 1;
+            while (run_end < available_misses) {
+                int64_t key = miss_page_keys[row_buffer_base + run_end];
+                if (static_cast<int>(key >> 32) != cluster) {
+                    break;
+                }
+                ++run_end;
+            }
+            int run_pages = run_end - miss_idx;
+            if (cluster < 0 || cluster >= n_clusters || row_state[cluster] != IMI_CLUSTER_NONE) {
+                continue;
+            }
+            int full_pages = hc_cluster_pages(row_cluster_sizes, cluster, n_clusters, page_size);
+            if (full_pages != run_pages || run_pages <= 0 || run_pages > cache_size) {
+                continue;
+            }
+            if (max_promote_pages_per_group >= 0 && promoted_pages + run_pages > max_promote_pages_per_group) {
+                probe_idx = nprobe;
+                break;
+            }
+            while (*row_free_count < run_pages) {
+                if (!hc_evict_cold_tail(
+                    row_cold_head, row_cold_tail, row_prev, row_next, row_state, row_cold_pages,
+                    row_cluster_sizes, n_clusters, page_size, row_hash_keys, row_hash_values,
+                    hash_size, row_slot_keys, row_free_slots, row_free_count, cache_size
+                )) {
+                    break;
                 }
             }
-            hash_pos_shared = hash_pos;
-            slot_shared = slot;
+            if (*row_free_count >= run_pages && plan_count + run_pages <= buffer_blocks) {
+                selected_miss_idx = miss_idx;
+                selected_run_end = run_end;
+                selected_cluster = cluster;
+                selected_run_pages = run_pages;
+                break;
+            }
         }
-        __syncthreads();
 
-        int slot = slot_shared;
-        int hash_pos = hash_pos_shared;
-        if (slot < 0 || slot >= cache_size || hash_pos < 0) {
-            __syncthreads();
-            continue;
+        int miss_idx = selected_miss_idx;
+        int run_end = selected_run_end;
+        int cluster = selected_cluster;
+        int run_pages = selected_run_pages;
+        if (miss_idx < 0) {
+            break;
         }
-        int size = row_miss_sizes[miss_idx];
-        int src_start = row_miss_offsets[miss_idx];
-        int copy_elems = size * VECTOR_SIZE_CP;
-        int64_t list_base = (static_cast<int64_t>(row) * list_capacity + src_start) * VECTOR_SIZE_CP;
-        int64_t cache_base = (static_cast<int64_t>(row) * cache_size * CHUNK_SIZE + slot * CHUNK_SIZE) * VECTOR_SIZE_CP;
 
-        for (int idx = threadIdx.x; idx < copy_elems; idx += blockDim.x) {
-            cache_keys[cache_base + idx] = list_keys[list_base + idx];
-            cache_values[cache_base + idx] = list_values[list_base + idx];
+        bool cluster_ok = true;
+        int claimed_pages = 0;
+        for (int idx = miss_idx; idx < run_end; ++idx) {
+            int64_t key = miss_page_keys[row_buffer_base + idx];
+            int src_start = static_len + miss_dst_offsets[row_buffer_base + idx];
+            int size = miss_sizes[row_buffer_base + idx];
+            int free_idx = *row_free_count - 1;
+            int slot = free_idx >= 0 ? row_free_slots[free_idx] : -1;
+            int hash_pos = -1;
+            if (slot >= 0) {
+                *row_free_count = free_idx;
+                hash_pos = imi_hash_claim_pending_slot(
+                    row_hash_keys,
+                    row_hash_values,
+                    hash_size,
+                    key,
+                    slot
+                );
+                if (hash_pos < 0) {
+                    row_free_slots[*row_free_count] = slot;
+                    *row_free_count = min(*row_free_count + 1, cache_size);
+                } else {
+                    row_slot_keys[slot] = key;
+                }
+            }
+            if (slot < 0 || hash_pos < 0 || size <= 0) {
+                cluster_ok = false;
+                break;
+            }
+            int out_idx = row_buffer_base + plan_count;
+            promote_src_offsets[out_idx] = src_start;
+            promote_dst_slots[out_idx] = slot;
+            promote_sizes[out_idx] = size;
+            promote_hash_positions[out_idx] = hash_pos;
+            promote_page_keys[out_idx] = key;
+            ++plan_count;
+            ++claimed_pages;
         }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            __threadfence();
-            atomicExch(row_hash_values + hash_pos, slot);
+
+        if (cluster_ok) {
+            row_state[cluster] = IMI_CLUSTER_PENDING;
+            promoted_pages += run_pages;
+            promote_counts[row] = plan_count;
+        } else {
+            plan_count -= claimed_pages;
+            promote_counts[row] = plan_count;
+            row_state[cluster] = IMI_CLUSTER_NONE;
+            hc_release_cluster_pages(
+                cluster, claimed_pages, row_hash_keys, row_hash_values, hash_size,
+                row_slot_keys, row_free_slots, row_free_count, cache_size
+            );
         }
-        __syncthreads();
+    }
+}
+
+template <typename T>
+__global__ void copy_promoted_pages_from_execution_kernel(
+    const T* __restrict__ execution_keys,
+    T* __restrict__ cache_keys,
+    const T* __restrict__ execution_values,
+    T* __restrict__ cache_values,
+    const int32_t* __restrict__ promote_src_offsets,
+    const int32_t* __restrict__ promote_dst_slots,
+    const int32_t* __restrict__ promote_sizes,
+    const int32_t* __restrict__ promote_hash_positions,
+    const int32_t* __restrict__ promote_counts,
+    int32_t* __restrict__ hash_values,
+    int groups,
+    int execution_stride,
+    int cache_size,
+    int hash_size,
+    int buffer_blocks,
+    int page_size
+) {
+    const int page_idx = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= groups || page_idx >= promote_counts[row]) {
+        return;
+    }
+
+    const int row_buffer_base = row * buffer_blocks;
+    const int idx = row_buffer_base + page_idx;
+    const int src_start = promote_src_offsets[idx];
+    const int slot = promote_dst_slots[idx];
+    const int size = promote_sizes[idx];
+    const int hash_pos = promote_hash_positions[idx];
+    if (slot < 0 || slot >= cache_size || size <= 0 || hash_pos < 0 || hash_pos >= hash_size) {
+        return;
+    }
+
+    const int copy_elems = size * VECTOR_SIZE_CP;
+    const int64_t execution_base = (static_cast<int64_t>(row) * execution_stride + src_start) * VECTOR_SIZE_CP;
+    const int64_t cache_base = (static_cast<int64_t>(row) * cache_size * page_size + slot * page_size) * VECTOR_SIZE_CP;
+    for (int elem = threadIdx.x; elem < copy_elems; elem += blockDim.x) {
+        cache_keys[cache_base + elem] = execution_keys[execution_base + elem];
+        cache_values[cache_base + elem] = execution_values[execution_base + elem];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicExch(hash_values + static_cast<int64_t>(row) * hash_size + hash_pos, slot);
+    }
+}
+
+__global__ void finalize_hot_cold_cache_promotion_kernel(
+    const int64_t* __restrict__ promote_page_keys,
+    const int32_t* __restrict__ promote_counts,
+    const int32_t* __restrict__ cluster_sizes,
+    int64_t* __restrict__ hash_keys,
+    int32_t* __restrict__ hash_values,
+    int64_t* __restrict__ slot_keys,
+    int8_t* __restrict__ cluster_state,
+    int32_t* __restrict__ cluster_prev,
+    int32_t* __restrict__ cluster_next,
+    int32_t* __restrict__ cold_head,
+    int32_t* __restrict__ cold_tail,
+    int32_t* __restrict__ cold_pages,
+    int32_t* __restrict__ free_slots,
+    int32_t* __restrict__ free_counts,
+    int groups,
+    int cache_size,
+    int hash_size,
+    int buffer_blocks,
+    int n_clusters,
+    int page_size,
+    int cold_capacity_pages
+) {
+    const int row = blockIdx.x;
+    if (row >= groups || threadIdx.x != 0) {
+        return;
+    }
+
+    const int row_buffer_base = row * buffer_blocks;
+    const int64_t row_hash_base = static_cast<int64_t>(row) * hash_size;
+    const int64_t row_cache_base = static_cast<int64_t>(row) * cache_size;
+    const int64_t row_cluster_base = static_cast<int64_t>(row) * n_clusters;
+
+    int64_t* row_hash_keys = hash_keys + row_hash_base;
+    int32_t* row_hash_values = hash_values + row_hash_base;
+    int64_t* row_slot_keys = slot_keys + row_cache_base;
+    int8_t* row_state = cluster_state + row_cluster_base;
+    int32_t* row_prev = cluster_prev + row_cluster_base;
+    int32_t* row_next = cluster_next + row_cluster_base;
+    const int32_t* row_cluster_sizes = cluster_sizes + row_cluster_base;
+    int32_t* row_free_slots = free_slots + row_cache_base;
+
+    int32_t* row_cold_head = cold_head + row;
+    int32_t* row_cold_tail = cold_tail + row;
+    int32_t* row_cold_pages = cold_pages + row;
+    int32_t* row_free_count = free_counts + row;
+
+    const int count = promote_counts[row];
+    int idx = 0;
+    while (idx < count) {
+        int64_t key = promote_page_keys[row_buffer_base + idx];
+        int cluster = static_cast<int>(key >> 32);
+        int run_end = idx + 1;
+        while (run_end < count) {
+            int64_t next_key = promote_page_keys[row_buffer_base + run_end];
+            if (static_cast<int>(next_key >> 32) != cluster) {
+                break;
+            }
+            ++run_end;
+        }
+        int run_pages = run_end - idx;
+        if (cluster >= 0 && cluster < n_clusters && row_state[cluster] == IMI_CLUSTER_PENDING) {
+            row_state[cluster] = IMI_CLUSTER_COLD;
+            hc_push_front(cluster, row_prev, row_next, row_cold_head, row_cold_tail);
+            *row_cold_pages += run_pages;
+            while (*row_cold_pages > cold_capacity_pages) {
+                if (!hc_evict_cold_tail(
+                    row_cold_head, row_cold_tail, row_prev, row_next, row_state, row_cold_pages,
+                    row_cluster_sizes, n_clusters, page_size, row_hash_keys, row_hash_values,
+                    hash_size, row_slot_keys, row_free_slots, row_free_count, cache_size
+                )) {
+                    break;
+                }
+            }
+        }
+        idx = run_end;
     }
 }
 
@@ -338,7 +811,12 @@ void build_cache_aware_retrieval_plan(
     torch::Tensor& miss_sizes,
     torch::Tensor& miss_cumsum,
     torch::Tensor& miss_counts,
+    torch::Tensor& miss_copy_offsets,
+    torch::Tensor& miss_copy_sizes,
+    torch::Tensor& miss_copy_cumsum,
+    torch::Tensor& miss_copy_counts,
     torch::Tensor& miss_page_keys,
+    torch::Tensor& admit_starts,
     torch::Tensor& hit_offsets,
     torch::Tensor& hit_sizes,
     torch::Tensor& hit_cumsum,
@@ -361,7 +839,12 @@ void build_cache_aware_retrieval_plan(
     TORCH_CHECK(miss_sizes.is_cuda(), "miss_sizes must be CUDA");
     TORCH_CHECK(miss_cumsum.is_cuda(), "miss_cumsum must be CUDA");
     TORCH_CHECK(miss_counts.is_cuda(), "miss_counts must be CUDA");
+    TORCH_CHECK(miss_copy_offsets.is_cuda(), "miss_copy_offsets must be CUDA");
+    TORCH_CHECK(miss_copy_sizes.is_cuda(), "miss_copy_sizes must be CUDA");
+    TORCH_CHECK(miss_copy_cumsum.is_cuda(), "miss_copy_cumsum must be CUDA");
+    TORCH_CHECK(miss_copy_counts.is_cuda(), "miss_copy_counts must be CUDA");
     TORCH_CHECK(miss_page_keys.is_cuda(), "miss_page_keys must be CUDA");
+    TORCH_CHECK(admit_starts.is_cuda(), "admit_starts must be CUDA");
     TORCH_CHECK(hit_offsets.is_cuda(), "hit_offsets must be CUDA");
     TORCH_CHECK(hit_sizes.is_cuda(), "hit_sizes must be CUDA");
     TORCH_CHECK(hit_cumsum.is_cuda(), "hit_cumsum must be CUDA");
@@ -380,7 +863,12 @@ void build_cache_aware_retrieval_plan(
         reinterpret_cast<int32_t*>(miss_sizes.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_cumsum.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(miss_copy_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(miss_copy_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(miss_copy_cumsum.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(miss_copy_counts.data_ptr<int32_t>()),
         reinterpret_cast<int64_t*>(miss_page_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int32_t*>(admit_starts.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(hit_offsets.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(hit_sizes.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(hit_cumsum.data_ptr<int32_t>()),
@@ -397,95 +885,212 @@ void build_cache_aware_retrieval_plan(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void promote_cache_pages_from_list(
-    torch::Tensor& list_keys,
+void promote_hot_cold_cache_pages_from_execution(
+    torch::Tensor& execution_keys,
     torch::Tensor& cache_keys,
-    torch::Tensor& list_values,
+    torch::Tensor& execution_values,
     torch::Tensor& cache_values,
-    torch::Tensor& miss_offsets,
+    torch::Tensor& miss_dst_offsets,
     torch::Tensor& miss_sizes,
     torch::Tensor& miss_counts,
     torch::Tensor& miss_page_keys,
+    torch::Tensor& admit_starts,
+    torch::Tensor& promote_src_offsets,
+    torch::Tensor& promote_dst_slots,
+    torch::Tensor& promote_sizes,
+    torch::Tensor& promote_hash_positions,
+    torch::Tensor& promote_page_keys,
+    torch::Tensor& promote_counts,
+    torch::Tensor& hit_offsets,
+    torch::Tensor& hit_counts,
+    torch::Tensor& cluster_sizes,
     torch::Tensor& cache_hash_keys,
     torch::Tensor& cache_hash_values,
     torch::Tensor& cache_slot_keys,
-    torch::Tensor& cache_next_slots,
+    torch::Tensor& cluster_state,
+    torch::Tensor& cluster_prev,
+    torch::Tensor& cluster_next,
+    torch::Tensor& hot_head,
+    torch::Tensor& hot_tail,
+    torch::Tensor& cold_head,
+    torch::Tensor& cold_tail,
+    torch::Tensor& hot_pages,
+    torch::Tensor& cold_pages,
+    torch::Tensor& free_slots,
+    torch::Tensor& free_counts,
+    int static_len,
     int groups,
-    int list_capacity,
+    int execution_stride,
     int cache_size,
     int hash_size,
     int buffer_blocks,
+    int nprobe,
+    int n_clusters,
+    int page_size,
+    int hot_capacity_pages,
+    int cold_capacity_pages,
     int max_promote_pages_per_group
 ) {
-    TORCH_CHECK(list_keys.is_pinned() || list_keys.is_cuda(), "list_keys must be pinned CPU or CUDA");
-    TORCH_CHECK(list_values.is_pinned() || list_values.is_cuda(), "list_values must be pinned CPU or CUDA");
+    TORCH_CHECK(execution_keys.is_cuda(), "execution_keys must be CUDA");
+    TORCH_CHECK(execution_values.is_cuda(), "execution_values must be CUDA");
     TORCH_CHECK(cache_keys.is_cuda(), "cache_keys must be CUDA");
     TORCH_CHECK(cache_values.is_cuda(), "cache_values must be CUDA");
-    TORCH_CHECK(miss_offsets.is_cuda(), "miss_offsets must be CUDA");
+    TORCH_CHECK(miss_dst_offsets.is_cuda(), "miss_dst_offsets must be CUDA");
     TORCH_CHECK(miss_sizes.is_cuda(), "miss_sizes must be CUDA");
     TORCH_CHECK(miss_counts.is_cuda(), "miss_counts must be CUDA");
     TORCH_CHECK(miss_page_keys.is_cuda(), "miss_page_keys must be CUDA");
+    TORCH_CHECK(admit_starts.is_cuda(), "admit_starts must be CUDA");
+    TORCH_CHECK(promote_src_offsets.is_cuda(), "promote_src_offsets must be CUDA");
+    TORCH_CHECK(promote_dst_slots.is_cuda(), "promote_dst_slots must be CUDA");
+    TORCH_CHECK(promote_sizes.is_cuda(), "promote_sizes must be CUDA");
+    TORCH_CHECK(promote_hash_positions.is_cuda(), "promote_hash_positions must be CUDA");
+    TORCH_CHECK(promote_page_keys.is_cuda(), "promote_page_keys must be CUDA");
+    TORCH_CHECK(promote_counts.is_cuda(), "promote_counts must be CUDA");
+    TORCH_CHECK(hit_offsets.is_cuda(), "hit_offsets must be CUDA");
+    TORCH_CHECK(hit_counts.is_cuda(), "hit_counts must be CUDA");
+    TORCH_CHECK(cluster_sizes.is_cuda(), "cluster_sizes must be CUDA");
     TORCH_CHECK(cache_hash_keys.is_cuda(), "cache_hash_keys must be CUDA");
     TORCH_CHECK(cache_hash_values.is_cuda(), "cache_hash_values must be CUDA");
     TORCH_CHECK(cache_slot_keys.is_cuda(), "cache_slot_keys must be CUDA");
-    TORCH_CHECK(cache_next_slots.is_cuda(), "cache_next_slots must be CUDA");
+    TORCH_CHECK(cluster_state.is_cuda(), "cluster_state must be CUDA");
+    TORCH_CHECK(cluster_prev.is_cuda(), "cluster_prev must be CUDA");
+    TORCH_CHECK(cluster_next.is_cuda(), "cluster_next must be CUDA");
+    TORCH_CHECK(hot_head.is_cuda(), "hot_head must be CUDA");
+    TORCH_CHECK(hot_tail.is_cuda(), "hot_tail must be CUDA");
+    TORCH_CHECK(cold_head.is_cuda(), "cold_head must be CUDA");
+    TORCH_CHECK(cold_tail.is_cuda(), "cold_tail must be CUDA");
+    TORCH_CHECK(hot_pages.is_cuda(), "hot_pages must be CUDA");
+    TORCH_CHECK(cold_pages.is_cuda(), "cold_pages must be CUDA");
+    TORCH_CHECK(free_slots.is_cuda(), "free_slots must be CUDA");
+    TORCH_CHECK(free_counts.is_cuda(), "free_counts must be CUDA");
     TORCH_CHECK((hash_size & (hash_size - 1)) == 0, "hash_size must be a power of two");
 
     const int blockSize = BLOCK_SIZE_CP;
     const auto stream = at::cuda::getCurrentCUDAStream();
+    plan_hot_cold_cache_promotion_kernel<<<groups, 1, 0, stream>>>(
+        reinterpret_cast<int32_t*>(miss_dst_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(miss_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(miss_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int64_t*>(miss_page_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int32_t*>(admit_starts.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(promote_src_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(promote_dst_slots.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(promote_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(promote_hash_positions.data_ptr<int32_t>()),
+        reinterpret_cast<int64_t*>(promote_page_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int32_t*>(promote_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(hit_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(hit_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int64_t*>(cache_hash_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int32_t*>(cache_hash_values.data_ptr<int32_t>()),
+        reinterpret_cast<int64_t*>(cache_slot_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int8_t*>(cluster_state.data_ptr<int8_t>()),
+        reinterpret_cast<int32_t*>(cluster_prev.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_next.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(hot_head.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(hot_tail.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cold_head.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cold_tail.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(hot_pages.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cold_pages.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(free_slots.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(free_counts.data_ptr<int32_t>()),
+        static_len,
+        groups,
+        execution_stride,
+        cache_size,
+        hash_size,
+        buffer_blocks,
+        nprobe,
+        n_clusters,
+        page_size,
+        hot_capacity_pages,
+        cold_capacity_pages,
+        max_promote_pages_per_group
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    int copy_blocks = buffer_blocks;
+    if (max_promote_pages_per_group > 0) {
+        copy_blocks = std::min(buffer_blocks, max_promote_pages_per_group);
+    }
+    copy_blocks = std::max(copy_blocks, 1);
+    const dim3 copyGrid(copy_blocks, groups);
 #if DATA_BYTES == 4
-    promote_cache_pages_from_list_kernel<float><<<groups, blockSize, 0, stream>>>(
-        reinterpret_cast<float*>(list_keys.data_ptr<float>()),
+    copy_promoted_pages_from_execution_kernel<float><<<copyGrid, blockSize, 0, stream>>>(
+        reinterpret_cast<float*>(execution_keys.data_ptr<float>()),
         reinterpret_cast<float*>(cache_keys.data_ptr<float>()),
-        reinterpret_cast<float*>(list_values.data_ptr<float>()),
+        reinterpret_cast<float*>(execution_values.data_ptr<float>()),
         reinterpret_cast<float*>(cache_values.data_ptr<float>()),
 #else
-    if (list_keys.dtype() == torch::kFloat16) {
-        promote_cache_pages_from_list_kernel<PTYPE><<<groups, blockSize, 0, stream>>>(
-            reinterpret_cast<PTYPE*>(list_keys.data_ptr<at::Half>()),
+    if (execution_keys.dtype() == torch::kFloat16) {
+        copy_promoted_pages_from_execution_kernel<PTYPE><<<copyGrid, blockSize, 0, stream>>>(
+            reinterpret_cast<PTYPE*>(execution_keys.data_ptr<at::Half>()),
             reinterpret_cast<PTYPE*>(cache_keys.data_ptr<at::Half>()),
-            reinterpret_cast<PTYPE*>(list_values.data_ptr<at::Half>()),
+            reinterpret_cast<PTYPE*>(execution_values.data_ptr<at::Half>()),
             reinterpret_cast<PTYPE*>(cache_values.data_ptr<at::Half>()),
-            reinterpret_cast<int32_t*>(miss_offsets.data_ptr<int32_t>()),
-            reinterpret_cast<int32_t*>(miss_sizes.data_ptr<int32_t>()),
-            reinterpret_cast<int32_t*>(miss_counts.data_ptr<int32_t>()),
-            reinterpret_cast<int64_t*>(miss_page_keys.data_ptr<int64_t>()),
-            reinterpret_cast<int64_t*>(cache_hash_keys.data_ptr<int64_t>()),
+            reinterpret_cast<int32_t*>(promote_src_offsets.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_dst_slots.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_sizes.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_hash_positions.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_counts.data_ptr<int32_t>()),
             reinterpret_cast<int32_t*>(cache_hash_values.data_ptr<int32_t>()),
-            reinterpret_cast<int64_t*>(cache_slot_keys.data_ptr<int64_t>()),
-            reinterpret_cast<int32_t*>(cache_next_slots.data_ptr<int32_t>()),
             groups,
-            list_capacity,
+            execution_stride,
             cache_size,
             hash_size,
             buffer_blocks,
-            max_promote_pages_per_group
+            page_size
         );
     } else {
-        promote_cache_pages_from_list_kernel<PTYPE><<<groups, blockSize, 0, stream>>>(
-            reinterpret_cast<PTYPE*>(list_keys.data_ptr<at::BFloat16>()),
+        copy_promoted_pages_from_execution_kernel<PTYPE><<<copyGrid, blockSize, 0, stream>>>(
+            reinterpret_cast<PTYPE*>(execution_keys.data_ptr<at::BFloat16>()),
             reinterpret_cast<PTYPE*>(cache_keys.data_ptr<at::BFloat16>()),
-            reinterpret_cast<PTYPE*>(list_values.data_ptr<at::BFloat16>()),
+            reinterpret_cast<PTYPE*>(execution_values.data_ptr<at::BFloat16>()),
             reinterpret_cast<PTYPE*>(cache_values.data_ptr<at::BFloat16>()),
 #endif
-            reinterpret_cast<int32_t*>(miss_offsets.data_ptr<int32_t>()),
-            reinterpret_cast<int32_t*>(miss_sizes.data_ptr<int32_t>()),
-            reinterpret_cast<int32_t*>(miss_counts.data_ptr<int32_t>()),
-            reinterpret_cast<int64_t*>(miss_page_keys.data_ptr<int64_t>()),
-            reinterpret_cast<int64_t*>(cache_hash_keys.data_ptr<int64_t>()),
+            reinterpret_cast<int32_t*>(promote_src_offsets.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_dst_slots.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_sizes.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_hash_positions.data_ptr<int32_t>()),
+            reinterpret_cast<int32_t*>(promote_counts.data_ptr<int32_t>()),
             reinterpret_cast<int32_t*>(cache_hash_values.data_ptr<int32_t>()),
-            reinterpret_cast<int64_t*>(cache_slot_keys.data_ptr<int64_t>()),
-            reinterpret_cast<int32_t*>(cache_next_slots.data_ptr<int32_t>()),
             groups,
-            list_capacity,
+            execution_stride,
             cache_size,
             hash_size,
             buffer_blocks,
-            max_promote_pages_per_group
+            page_size
         );
 #if DATA_BYTES != 4
     }
 #endif
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    finalize_hot_cold_cache_promotion_kernel<<<groups, 1, 0, stream>>>(
+        reinterpret_cast<int64_t*>(promote_page_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int32_t*>(promote_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int64_t*>(cache_hash_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int32_t*>(cache_hash_values.data_ptr<int32_t>()),
+        reinterpret_cast<int64_t*>(cache_slot_keys.data_ptr<int64_t>()),
+        reinterpret_cast<int8_t*>(cluster_state.data_ptr<int8_t>()),
+        reinterpret_cast<int32_t*>(cluster_prev.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_next.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cold_head.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cold_tail.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cold_pages.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(free_slots.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(free_counts.data_ptr<int32_t>()),
+        groups,
+        cache_size,
+        hash_size,
+        buffer_blocks,
+        n_clusters,
+        page_size,
+        cold_capacity_pages
+    );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -549,18 +1154,26 @@ __global__ void copy_miss_chunks_kernel(
     int64_t work = static_cast<int64_t>(blockIdx.x);
     int row = static_cast<int>(work / buffer_blocks);
     int chunk = static_cast<int>(work - static_cast<int64_t>(row) * buffer_blocks);
-    if (row >= groups || chunk >= copy_counts[row]) {
+    if (row >= groups) {
         return;
     }
 
-    int descriptor_offset = row * buffer_blocks + chunk;
+    const int count = copy_counts[row];
+    if (chunk >= count) {
+        return;
+    }
+
+    const int row_base = row * buffer_blocks;
+    int descriptor_offset = row_base + chunk;
     int copy_vectors = copy_sizes[descriptor_offset];
     if (copy_vectors <= 0) {
         return;
     }
-    int copy_elems = copy_vectors * VECTOR_SIZE_CP;
+
     int src_vector_start = src_offsets[descriptor_offset];
-    int dst_vector_start = *static_len_ptr + dst_offsets[descriptor_offset];
+    int dst_offset = dst_offsets[descriptor_offset];
+    int copy_elems = copy_vectors * VECTOR_SIZE_CP;
+    int dst_vector_start = *static_len_ptr + dst_offset;
 
     int64_t src_base = (static_cast<int64_t>(row) * src_vectors_per_group + src_vector_start) * VECTOR_SIZE_CP;
     int64_t dst_base = (static_cast<int64_t>(row) * dst_vectors_per_group + dst_vector_start) * VECTOR_SIZE_CP;
@@ -767,6 +1380,146 @@ void gather_copy_and_concat_chunk_parallel(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+void gather_copy_static_chunks_profile(
+    torch::Tensor& key_data,
+    torch::Tensor& key_buffer,
+    torch::Tensor& value_data,
+    torch::Tensor& value_buffer,
+    torch::Tensor& valid_lengths,
+    int groups,
+    int data_length,
+    int buffer_length,
+    torch::Tensor& copy_vectors
+) {
+    const int blockSize = BLOCK_SIZE_CP;
+    TORCH_CHECK(groups >= 0, "groups must be non-negative");
+    TORCH_CHECK(data_length >= 0, "data_length must be non-negative");
+    TORCH_CHECK(buffer_length >= 0, "buffer_length must be non-negative");
+    if (groups <= 0) {
+        return;
+    }
+
+    int static_chunks = (data_length + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (static_chunks <= 0) {
+        return;
+    }
+    int64_t static_work = static_cast<int64_t>(groups) * static_chunks;
+    TORCH_CHECK(static_work <= 2147483647LL, "static chunk-parallel gather grid is too large");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    copy_static_chunks_kernel<PTYPE><<<static_cast<int>(static_work), blockSize, 0, stream>>>(
+        reinterpret_cast<PTYPE*>(key_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(key_buffer.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_buffer.data_ptr()),
+        reinterpret_cast<int*>(valid_lengths.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(copy_vectors.data_ptr<int32_t>()),
+        groups,
+        data_length,
+        buffer_length,
+        static_chunks
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gather_copy_miss_chunks_profile(
+    torch::Tensor& key_data,
+    torch::Tensor& key_buffer,
+    torch::Tensor& value_data,
+    torch::Tensor& value_buffer,
+    torch::Tensor& data_offsets,
+    torch::Tensor& data_copy_sizes,
+    torch::Tensor& buffer_offsets,
+    torch::Tensor& copy_chunks,
+    int groups,
+    int data_length,
+    int buffer_length,
+    int offset_length,
+    torch::Tensor& copy_vectors1
+) {
+    const int blockSize = BLOCK_SIZE_CP;
+    TORCH_CHECK(groups >= 0, "groups must be non-negative");
+    TORCH_CHECK(data_length >= 0, "data_length must be non-negative");
+    TORCH_CHECK(buffer_length >= 0, "buffer_length must be non-negative");
+    TORCH_CHECK(offset_length >= 0, "offset_length must be non-negative");
+    if (groups <= 0 || offset_length <= 0) {
+        return;
+    }
+
+    int64_t retrieval_work = static_cast<int64_t>(groups) * offset_length;
+    TORCH_CHECK(retrieval_work <= 2147483647LL, "retrieval chunk-parallel gather grid is too large");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    copy_miss_chunks_kernel<PTYPE><<<static_cast<int>(retrieval_work), blockSize, 0, stream>>>(
+        reinterpret_cast<PTYPE*>(key_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(key_buffer.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_buffer.data_ptr()),
+        reinterpret_cast<int*>(data_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(data_copy_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(buffer_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(copy_chunks.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(copy_vectors1.data_ptr<int32_t>()),
+        groups,
+        data_length,
+        buffer_length,
+        offset_length
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gather_copy_hit_chunks_profile(
+    torch::Tensor& key_data,
+    torch::Tensor& key_buffer,
+    torch::Tensor& value_data,
+    torch::Tensor& value_buffer,
+    torch::Tensor& miss_sizes,
+    torch::Tensor& miss_offsets,
+    torch::Tensor& miss_counts,
+    torch::Tensor& hit_offsets,
+    torch::Tensor& hit_sizes,
+    torch::Tensor& hit_dst_offsets,
+    torch::Tensor& hit_counts,
+    int groups,
+    int cache_pages_per_group,
+    int buffer_length,
+    int offset_length,
+    torch::Tensor& copy_vectors1
+) {
+    const int blockSize = BLOCK_SIZE_CP;
+    TORCH_CHECK(groups >= 0, "groups must be non-negative");
+    TORCH_CHECK(cache_pages_per_group >= 0, "cache_pages_per_group must be non-negative");
+    TORCH_CHECK(buffer_length >= 0, "buffer_length must be non-negative");
+    TORCH_CHECK(offset_length >= 0, "offset_length must be non-negative");
+    if (groups <= 0 || offset_length <= 0) {
+        return;
+    }
+
+    int64_t retrieval_work = static_cast<int64_t>(groups) * offset_length;
+    TORCH_CHECK(retrieval_work <= 2147483647LL, "retrieval chunk-parallel gather grid is too large");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    copy_hit_chunks_kernel<PTYPE><<<static_cast<int>(retrieval_work), blockSize, 0, stream>>>(
+        reinterpret_cast<PTYPE*>(key_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(key_buffer.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_buffer.data_ptr()),
+        reinterpret_cast<int*>(miss_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(miss_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(miss_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(hit_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(hit_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(hit_dst_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(hit_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(copy_vectors1.data_ptr<int32_t>()),
+        groups,
+        cache_pages_per_group,
+        buffer_length,
+        offset_length
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -778,19 +1531,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::arg("valid_lengths"), py::arg("groups"), py::arg("data_length1"), py::arg("data_length2"), py::arg("data_length3"),
     py::arg("buffer_length"), py::arg("offset_length"), py::arg("copy_vectors1")),
 
+    m.def("gather_copy_static_chunks_profile", &gather_copy_static_chunks_profile, "Profile-only static chunk copy (CUDA)",
+    py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),
+    py::arg("valid_lengths"), py::arg("groups"), py::arg("data_length"), py::arg("buffer_length"),
+    py::arg("copy_vectors")),
+
+    m.def("gather_copy_miss_chunks_profile", &gather_copy_miss_chunks_profile, "Profile-only miss chunk copy (CUDA)",
+    py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),
+    py::arg("data_offsets"), py::arg("data_copy_sizes"), py::arg("buffer_offsets"), py::arg("copy_chunks"),
+    py::arg("groups"), py::arg("data_length"), py::arg("buffer_length"), py::arg("offset_length"),
+    py::arg("copy_vectors1")),
+
+    m.def("gather_copy_hit_chunks_profile", &gather_copy_hit_chunks_profile, "Profile-only hit chunk copy (CUDA)",
+    py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),
+    py::arg("miss_sizes"), py::arg("miss_offsets"), py::arg("miss_counts"),
+    py::arg("hit_offsets"), py::arg("hit_sizes"), py::arg("hit_dst_offsets"), py::arg("hit_counts"),
+    py::arg("groups"), py::arg("cache_pages_per_group"), py::arg("buffer_length"), py::arg("offset_length"),
+    py::arg("copy_vectors1")),
+
     m.def("build_cache_aware_retrieval_plan", &build_cache_aware_retrieval_plan, "Build GPU cache-aware retrieval descriptors (CUDA)",
     py::arg("selected_clusters"), py::arg("cluster_offsets"), py::arg("cluster_sizes"),
     py::arg("cache_hash_keys"), py::arg("cache_hash_values"),
     py::arg("miss_offsets"), py::arg("miss_sizes"), py::arg("miss_cumsum"), py::arg("miss_counts"),
-    py::arg("miss_page_keys"), py::arg("hit_offsets"), py::arg("hit_sizes"), py::arg("hit_cumsum"), py::arg("hit_counts"),
+    py::arg("miss_copy_offsets"), py::arg("miss_copy_sizes"), py::arg("miss_copy_cumsum"), py::arg("miss_copy_counts"),
+    py::arg("miss_page_keys"), py::arg("admit_starts"), py::arg("hit_offsets"), py::arg("hit_sizes"), py::arg("hit_cumsum"), py::arg("hit_counts"),
     py::arg("valid_lengths"), py::arg("groups"), py::arg("nprobe"), py::arg("n_clusters"),
     py::arg("buffer_blocks"), py::arg("block_size"), py::arg("hash_size"), py::arg("padding_cluster_id")),
 
-    m.def("promote_cache_pages_from_list", &promote_cache_pages_from_list, "Promote missed retrieval pages from list KV into GPU cache (CUDA)",
-    py::arg("list_keys"), py::arg("cache_keys"), py::arg("list_values"), py::arg("cache_values"),
-    py::arg("miss_offsets"), py::arg("miss_sizes"), py::arg("miss_counts"), py::arg("miss_page_keys"),
-    py::arg("cache_hash_keys"), py::arg("cache_hash_values"), py::arg("cache_slot_keys"), py::arg("cache_next_slots"),
-    py::arg("groups"), py::arg("list_capacity"), py::arg("cache_size"), py::arg("hash_size"),
-    py::arg("buffer_blocks"), py::arg("max_promote_pages_per_group"));
+    m.def("promote_hot_cold_cache_pages_from_execution", &promote_hot_cold_cache_pages_from_execution,
+    "Admit missed execution-buffer pages using the AdaptiveIMI Hot-Cold GPU cache policy (CUDA)",
+    py::arg("execution_keys"), py::arg("cache_keys"), py::arg("execution_values"), py::arg("cache_values"),
+    py::arg("miss_dst_offsets"), py::arg("miss_sizes"), py::arg("miss_counts"), py::arg("miss_page_keys"),
+    py::arg("admit_starts"),
+    py::arg("promote_src_offsets"), py::arg("promote_dst_slots"), py::arg("promote_sizes"),
+    py::arg("promote_hash_positions"), py::arg("promote_page_keys"), py::arg("promote_counts"),
+    py::arg("hit_offsets"), py::arg("hit_counts"), py::arg("cluster_sizes"),
+    py::arg("cache_hash_keys"), py::arg("cache_hash_values"), py::arg("cache_slot_keys"),
+    py::arg("cluster_state"), py::arg("cluster_prev"), py::arg("cluster_next"),
+    py::arg("hot_head"), py::arg("hot_tail"), py::arg("cold_head"), py::arg("cold_tail"),
+    py::arg("hot_pages"), py::arg("cold_pages"), py::arg("free_slots"), py::arg("free_counts"),
+    py::arg("static_len"), py::arg("groups"), py::arg("execution_stride"), py::arg("cache_size"), py::arg("hash_size"),
+    py::arg("buffer_blocks"), py::arg("nprobe"), py::arg("n_clusters"), py::arg("page_size"),
+    py::arg("hot_capacity_pages"), py::arg("cold_capacity_pages"), py::arg("max_promote_pages_per_group"));
 
 }

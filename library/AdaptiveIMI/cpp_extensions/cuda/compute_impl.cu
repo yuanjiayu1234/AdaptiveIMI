@@ -121,4 +121,119 @@ void fused_query_group_similarities_fp16(
     );
 }
 
+__device__ __forceinline__ int warp_inclusive_scan_int(int value) {
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int other = __shfl_up_sync(0xffffffff, value, offset);
+        if ((threadIdx.x & 31) >= offset) {
+            value += other;
+        }
+    }
+    return value;
+}
+
+__global__ void apply_budget_after_topk_kernel(
+    const int64_t* __restrict__ topk_indices,      // [rows, nprobe]
+    const int32_t* __restrict__ cluster_sizes,     // [rows, n_centroids]
+    int64_t* __restrict__ selected,                // [rows, nprobe]
+    int64_t selected_stride0,
+    int rows,
+    int nprobe,
+    int n_centroids,
+    int max_retrieval_tokens,
+    int64_t padding_cluster_id
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    __shared__ int warp_prefix_totals[32];
+    __shared__ int tile_base_tokens;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (blockDim.x + 31) >> 5;
+    const int64_t row_topk_offset = static_cast<int64_t>(row) * nprobe;
+    const int64_t row_cluster_offset = static_cast<int64_t>(row) * n_centroids;
+
+    if (tid == 0) {
+        tile_base_tokens = 0;
+    }
+    __syncthreads();
+
+    for (int base = 0; base < nprobe; base += blockDim.x) {
+        const int col = base + tid;
+        int64_t cluster_id = padding_cluster_id;
+        int size = 0;
+        if (col < nprobe) {
+            cluster_id = topk_indices[row_topk_offset + col];
+            if (cluster_id >= 0 && cluster_id < n_centroids) {
+                size = cluster_sizes[row_cluster_offset + cluster_id];
+            }
+        }
+
+        int prefix = warp_inclusive_scan_int(size);
+        if (lane == 31) {
+            warp_prefix_totals[warp] = prefix;
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            int warp_total = (lane < warps_per_block) ? warp_prefix_totals[lane] : 0;
+            warp_total = warp_inclusive_scan_int(warp_total);
+            if (lane < warps_per_block) {
+                warp_prefix_totals[lane] = warp_total;
+            }
+        }
+        __syncthreads();
+
+        if (warp > 0) {
+            prefix += warp_prefix_totals[warp - 1];
+        }
+
+        if (col < nprobe) {
+            const int tokens_before_cluster = tile_base_tokens + prefix - size;
+            const bool keep = (size > 0) && (tokens_before_cluster < max_retrieval_tokens);
+            selected[static_cast<int64_t>(row) * selected_stride0 + col] = keep ? cluster_id : padding_cluster_id;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            tile_base_tokens += warp_prefix_totals[warps_per_block - 1];
+        }
+        __syncthreads();
+    }
+}
+
+void apply_budget_after_topk(
+    const int64_t* topk_indices,
+    const int32_t* cluster_sizes,
+    int64_t* selected,
+    int64_t selected_stride0,
+    int rows,
+    int nprobe,
+    int n_centroids,
+    int max_retrieval_tokens,
+    int64_t padding_cluster_id,
+    cudaStream_t stream
+) {
+    if (rows <= 0 || nprobe <= 0) {
+        return;
+    }
+    constexpr int threads = 256;
+    apply_budget_after_topk_kernel<<<rows, threads, 0, stream>>>(
+        topk_indices,
+        cluster_sizes,
+        selected,
+        selected_stride0,
+        rows,
+        nprobe,
+        n_centroids,
+        max_retrieval_tokens,
+        padding_cluster_id
+    );
+}
+
 } // namespace imi_decode

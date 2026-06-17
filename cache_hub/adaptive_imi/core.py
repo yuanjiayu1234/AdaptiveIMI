@@ -400,22 +400,49 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         self.gpu_cache_aware_miss_unit_sizes = []
         self.gpu_cache_aware_miss_unit_sizes_cumsum = []
         self.gpu_cache_aware_miss_num_units = []
+        self.gpu_cache_aware_miss_copy_unit_idices = []
+        self.gpu_cache_aware_miss_copy_unit_sizes = []
+        self.gpu_cache_aware_miss_copy_unit_sizes_cumsum = []
+        self.gpu_cache_aware_miss_copy_num_units = []
         self.gpu_cache_aware_miss_page_keys = []
+        self.gpu_cache_aware_admit_unit_starts = []
+        self.gpu_cache_promote_src_offsets = []
+        self.gpu_cache_promote_dst_slots = []
+        self.gpu_cache_promote_sizes = []
+        self.gpu_cache_promote_hash_positions = []
+        self.gpu_cache_promote_page_keys = []
+        self.gpu_cache_promote_counts = []
         self.gpu_cache_hash_keys = []
         self.gpu_cache_hash_values = []
         self.gpu_cache_slot_keys = []
-        self.gpu_cache_next_slots = []
+        self.gpu_cache_cluster_state = []
+        self.gpu_cache_cluster_prev = []
+        self.gpu_cache_cluster_next = []
+        self.gpu_cache_hot_head = []
+        self.gpu_cache_hot_tail = []
+        self.gpu_cache_cold_head = []
+        self.gpu_cache_cold_tail = []
+        self.gpu_cache_hot_pages = []
+        self.gpu_cache_cold_pages = []
+        self.gpu_cache_free_slots = []
+        self.gpu_cache_free_counts = []
         self.gpu_cache_hash_size = 0
         self.gpu_cache_aware_ring_size = 2
         self.gpu_cache_aware_active_slots = [-1] * self.layer_num
         self.gpu_cache_promote_slots = [-1] * self.layer_num
         self.gpu_cache_promote_streams: Dict[str, torch.cuda.Stream] = {}
         self.gpu_cache_promote_events = [None] * self.layer_num
-        self.gpu_cache_promote_desc_events = [None] * self.layer_num
+        self.gpu_cache_promote_start_events = [None] * self.layer_num
         self.gpu_cache_promotion_decode_step = 0
 
         self.execution_buffer_keys_dict: Dict[str, torch.Tensor] = {}
         self.execution_buffer_values_dict: Dict[str, torch.Tensor] = {}
+        self.execution_buffer_key_ring_dict: Dict[str, List[torch.Tensor]] = {}
+        self.execution_buffer_value_ring_dict: Dict[str, List[torch.Tensor]] = {}
+        self.execution_buffer_ring_events: Dict[str, List[Optional[torch.cuda.Event]]] = {}
+        self.execution_buffer_ring_next: Dict[str, int] = {}
+        self.execution_buffer_fallback_keys_dict: Dict[str, torch.Tensor] = {}
+        self.execution_buffer_fallback_values_dict: Dict[str, torch.Tensor] = {}
         self.valid_lengths_dict: Dict[str, torch.Tensor] = {}
         self.static_len_tensor_dict: Dict[str, torch.Tensor] = {}
         self.static_lengths_dict: Dict[str, torch.Tensor] = {}
@@ -543,10 +570,17 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         for promote_event in self.gpu_cache_promote_events:
             if promote_event is not None:
                 promote_event.synchronize()
+        for events in self.execution_buffer_ring_events.values():
+            for event in events:
+                if event is not None:
+                    event.synchronize()
         self.gpu_cache_promote_events = [None] * self.layer_num
-        self.gpu_cache_promote_desc_events = [None] * self.layer_num
+        self.gpu_cache_promote_start_events = [None] * self.layer_num
         self.gpu_cache_aware_active_slots = [-1] * self.layer_num
         self.gpu_cache_promote_slots = [-1] * self.layer_num
+        for device in list(self.execution_buffer_ring_events):
+            self.execution_buffer_ring_events[device] = [None] * len(self.execution_buffer_ring_events[device])
+            self.execution_buffer_ring_next[device] = 0
         self.gpu_cache_promotion_decode_step = 0
 
         for layer_idx in range(self.layer_num):
@@ -564,8 +598,35 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
                 self.gpu_cache_hash_values[layer_idx].fill_(-1)
             if layer_idx < len(self.gpu_cache_slot_keys) and self.gpu_cache_slot_keys[layer_idx] is not None:
                 self.gpu_cache_slot_keys[layer_idx].fill_(-1)
-            if layer_idx < len(self.gpu_cache_next_slots) and self.gpu_cache_next_slots[layer_idx] is not None:
-                self.gpu_cache_next_slots[layer_idx].zero_()
+            if layer_idx < len(self.gpu_cache_cluster_state) and self.gpu_cache_cluster_state[layer_idx] is not None:
+                self.gpu_cache_cluster_state[layer_idx].zero_()
+            if layer_idx < len(self.gpu_cache_cluster_prev) and self.gpu_cache_cluster_prev[layer_idx] is not None:
+                self.gpu_cache_cluster_prev[layer_idx].fill_(-1)
+            if layer_idx < len(self.gpu_cache_cluster_next) and self.gpu_cache_cluster_next[layer_idx] is not None:
+                self.gpu_cache_cluster_next[layer_idx].fill_(-1)
+            for queue_tensor in (
+                self.gpu_cache_hot_head,
+                self.gpu_cache_hot_tail,
+                self.gpu_cache_cold_head,
+                self.gpu_cache_cold_tail,
+            ):
+                if layer_idx < len(queue_tensor) and queue_tensor[layer_idx] is not None:
+                    queue_tensor[layer_idx].fill_(-1)
+            for count_tensor in (
+                self.gpu_cache_hot_pages,
+                self.gpu_cache_cold_pages,
+            ):
+                if layer_idx < len(count_tensor) and count_tensor[layer_idx] is not None:
+                    count_tensor[layer_idx].zero_()
+            if layer_idx < len(self.gpu_cache_free_counts) and self.gpu_cache_free_counts[layer_idx] is not None:
+                self.gpu_cache_free_counts[layer_idx].fill_(int(self.cache_size))
+            if layer_idx < len(self.gpu_cache_free_slots) and self.gpu_cache_free_slots[layer_idx] is not None:
+                free_slots = torch.arange(
+                    int(self.cache_size),
+                    dtype=torch.int32,
+                    device=self.gpu_cache_free_slots[layer_idx].device,
+                ).view(1, -1)
+                self.gpu_cache_free_slots[layer_idx].copy_(free_slots.expand(self.batch_groups, -1))
             if self.centroids_cpu[layer_idx] is not None:
                 self.centroids_cpu[layer_idx].zero_()
             if self.centroids_mask_cpu[layer_idx] is not None:
@@ -656,12 +717,15 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
             * self.head_dim
             * bytes_per_elem
         )
+        execution_buffer_copies = int(self._execution_buffer_ring_size()) * int(self.layer_num) + max(len(self.device_list), 1)
+        execution_bytes *= execution_buffer_copies
 
         centroid_bytes = self.layer_num * self.batch_groups * n_centroids * self.head_dim * 4
         mask_bytes = self.layer_num * self.batch_groups * n_centroids
 
         estimated_gb = (cache_bytes + execution_bytes + centroid_bytes + mask_bytes) / (1024 ** 3)
-        self.esitimate_gpu_memory = estimated_gb
+        self.estimated_gpu_memory = estimated_gb
+        self.esitimate_gpu_memory = estimated_gb  # Backward-compatible misspelling.
         return self.free_memory > estimated_gb * 1.5
 # Backward-compatible alias for older imports.
 adpimi_cache = AdaptiveIMICacheBase

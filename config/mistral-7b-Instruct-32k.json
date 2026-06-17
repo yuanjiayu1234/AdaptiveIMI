@@ -10,6 +10,9 @@
       "gpu_only": false,
       "engine": "hybrid_8way_v2",
       "subspace_parts": 8,
+      "cache": {
+        "execution_buffer_ring_size": 2
+      },
       "kmeans": {
         "max_iters": 5,
         "tol": 0.0005,

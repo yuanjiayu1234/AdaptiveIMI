@@ -2,21 +2,6 @@ import torch
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
 
 
-
-def _build_cache_seqlens(query_states, key_states):
-    q_len = query_states.shape[1]
-    k_len = key_states.shape[1]
-    if k_len <= q_len:
-        return None
-    bsz = query_states.shape[0]
-    return torch.full(
-        (bsz,),
-        k_len,
-        device=query_states.device,
-        dtype=torch.int32,
-    )
-
-
 def full_prefill_attn(
     query_states,
     key_states,
