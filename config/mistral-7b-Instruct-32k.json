@@ -1,9 +1,11 @@
 {
+    "model_path": "../models/models--mistralai--Mistral-7B-Instruct-v0.2",
     "AdaptiveIMI": {
       "static_pattern_start": 4,
       "static_pattern_end": 64,
       "retrieval_budget": 0.1,
       "buffer_cluster_num": 32,
+      "partition_path": "outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/mistral_partition.json",
       "cache": {
         "execution_buffer_ring_size": 2,
         "cluster_uva_warmup_steps": 3,

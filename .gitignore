@@ -432,3 +432,5 @@ experiments/imi_partition/gpucache_ratio/hit_rate_logs_prefetch_focus_long_outpu
 
 !benchmark/reasoning/data/**/*.jsonl
 !asserts/*.png
+
+/experiments/data/

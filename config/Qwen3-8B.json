@@ -1,12 +1,12 @@
 {
-    "model_path": "/root/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+    "model_path": "../models/Qwen3-8B",
     "AdaptiveIMI": {
         "static_pattern_start": 4,
         "static_pattern_end": 64,
         "retrieval_budget": 0.1,
         "buffer_cluster_num": 32,
         "cache_ratio": 0.1,
-        "partition_path": "outputs/imi_partition/qwen3_partition.json",
+        "partition_path": "outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/qwen3_partition.json",
         "hybrid_index": {
             "policy": "alternate",
             "start": "cpu",

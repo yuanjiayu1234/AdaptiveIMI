@@ -27,8 +27,28 @@ TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export CUDA_VISIBLE_DEVICES HF_HUB_OFFLINE TRANSFORMERS_OFFLINE PYTORCH_CUDA_ALLOC_CONF
 
-LLAMA3_MODEL="${LLAMA3_MODEL:-/root/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
-QWEN3_MODEL="${QWEN3_MODEL:-/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218}"
+config_model_path() {
+  local config_path="$1"
+  "$PYTHON" - "$config_path" <<'PY'
+import json
+import os
+import sys
+
+config_path = sys.argv[1]
+with open(config_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+model_path = payload.get("model_path")
+if not model_path:
+    raise SystemExit(f"missing model_path in {config_path}")
+if not os.path.isabs(str(model_path)):
+    model_path = os.path.abspath(os.path.join(os.getcwd(), str(model_path)))
+print(model_path)
+PY
+}
+
+LLAMA3_MODEL="${LLAMA3_MODEL:-$(config_model_path config/Llama-3.1-8B-Instruct.json)}"
+QWEN3_MODEL="${QWEN3_MODEL:-$(config_model_path config/Qwen3-8B.json)}"
+MISTRAL_MODEL="${MISTRAL_MODEL:-$(config_model_path config/mistral-7b-Instruct-32k.json)}"
 MODELS="${MODELS:-llama3,qwen3}"
 MODEL_TAGS=()
 MODEL_PATHS=()
@@ -42,9 +62,13 @@ for model_name in ${MODELS//,/ }; do
       MODEL_TAGS+=(qwen3)
       MODEL_PATHS+=("$QWEN3_MODEL")
       ;;
+    mistral)
+      MODEL_TAGS+=(mistral)
+      MODEL_PATHS+=("$MISTRAL_MODEL")
+      ;;
     *)
       echo "[error] unknown model in MODELS=${MODELS}: ${model_name}" >&2
-      echo "[hint] use MODELS=llama3,qwen3 or MODELS=llama3 or MODELS=qwen3" >&2
+      echo "[hint] use MODELS=llama3,qwen3,mistral or MODELS=llama3 or MODELS=qwen3" >&2
       exit 1
       ;;
   esac

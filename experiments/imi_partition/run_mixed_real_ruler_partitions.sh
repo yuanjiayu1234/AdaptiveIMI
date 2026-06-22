@@ -3,12 +3,33 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-PYTHON="${PYTHON:-/home/vipuser/miniconda3/envs/adaptiveimi/bin/python}"
-TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-/root/AdaptiveIMI/outputs/train_data}"
-REAL_JSONL="${REAL_JSONL:-/root/AdaptiveIMI/outputs/imi_partition/calib_booksum_nolima_babilong.jsonl}"
-RULER_ROOT="${RULER_ROOT:-/root/RULER}"
-LLAMA3_MODEL="${LLAMA3_MODEL:-/root/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
-QWEN3_MODEL="${QWEN3_MODEL:-/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218}"
+PYTHON="${PYTHON:-/data/yjy/miniconda3/envs/imi/bin/python}"
+TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-outputs/train_data}"
+REAL_JSONL="${REAL_JSONL:-outputs/imi_partition/calib_booksum_nolima_babilong.jsonl}"
+RULER_ROOT="${RULER_ROOT:-/data/yjy/AdaptiveIMI-main/data/RULER}"
+
+config_model_path() {
+  local config_path="$1"
+  "$PYTHON" - "$config_path" <<'PY'
+import json
+import os
+import sys
+
+config_path = sys.argv[1]
+with open(config_path, "r", encoding="utf-8") as f:
+    payload = json.load(f)
+model_path = payload.get("model_path")
+if not model_path:
+    raise SystemExit(f"missing model_path in {config_path}")
+if not os.path.isabs(str(model_path)):
+    model_path = os.path.abspath(os.path.join(os.getcwd(), str(model_path)))
+print(model_path)
+PY
+}
+
+LLAMA3_MODEL="${LLAMA3_MODEL:-$(config_model_path config/Llama-3.1-8B-Instruct.json)}"
+QWEN3_MODEL="${QWEN3_MODEL:-$(config_model_path config/Qwen3-8B.json)}"
+MISTRAL_MODEL="${MISTRAL_MODEL:-$(config_model_path config/mistral-7b-Instruct-32k.json)}"
 MIX_NAME="${MIX_NAME:-real100_ruler100_mixed_128k_heavy}"
 MIXED_CALIB_JSONL="${MIXED_CALIB_JSONL:-${TRAIN_DATA_DIR}/calib_${MIX_NAME}.jsonl}"
 OUT_DIR="${OUT_DIR:-${TRAIN_DATA_DIR}/partitions/${MIX_NAME}}"
@@ -55,10 +76,12 @@ echo "[mixed-run] training models: $MODELS"
 echo "[mixed-run] output dir: $OUT_DIR"
 echo "[mixed-run] llama3 model: $LLAMA3_MODEL"
 echo "[mixed-run] qwen3 model: $QWEN3_MODEL"
+echo "[mixed-run] mistral model: $MISTRAL_MODEL"
 
 PYTHON="$PYTHON" \
 LLAMA3_MODEL="$LLAMA3_MODEL" \
 QWEN3_MODEL="$QWEN3_MODEL" \
+MISTRAL_MODEL="$MISTRAL_MODEL" \
 CALIB_JSONLS="$MIXED_CALIB_JSONL" \
 MERGED_CALIB_NAME="$MIX_NAME" \
 OUT_DIR="$OUT_DIR" \
