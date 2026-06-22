@@ -25,7 +25,6 @@
 /build/
 /models/
 /data/
-/experiments/
 /ruler_eval_result/
 /longbench_eval_result/
 # Mono auto generated files
@@ -422,6 +421,14 @@ benchmark/longbench/results/
 benchmark/ruler/data/synthetic/json/*.json
 benchmark/ruler/ruler_eval_result/
 benchmark/reasoning/outputs
+
+# Experiment source code should be tracked; ignore generated experiment outputs.
+__pycache__/
+*.py[cod]
+experiments/imi_partition/gpucache_ratio/*.csv
+experiments/imi_partition/gpucache_ratio/*.pdf
+experiments/imi_partition/gpucache_ratio/*.png
+experiments/imi_partition/gpucache_ratio/hit_rate_logs_prefetch_focus_long_outputs/
 
 !benchmark/reasoning/data/**/*.jsonl
 !asserts/*.png

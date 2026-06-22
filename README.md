@@ -28,13 +28,21 @@ pip install -r requirements.txt
 pip install flash-attn==2.7.3 --no-build-isolation
 git clone --depth 1 --branch v3.4.1 https://github.com/NVIDIA/cutlass.git library/cutlass
 
+# AdaptiveIMI imports weighted_flash_decoding during sparse decoding.
+# Keep this local checkout so the CUDA extension can be rebuilt when needed.
 aria2c -c -x 4 -s 4 --dir=/tmp --out=flash-attention-weighted.tar.gz \
   "https://codeload.github.com/Starmys/flash-attention/tar.gz/refs/heads/weighted"
-rm -rf /tmp/flash-attention-weighted
-tar -xzf /tmp/flash-attention-weighted.tar.gz -C /tmp
-rmdir /tmp/flash-attention-weighted/csrc/cutlass
-ln -s /root/AdaptiveIMI/library/cutlass /tmp/flash-attention-weighted/csrc/cutlass
-pip install /tmp/flash-attention-weighted --no-build-isolation
+rm -rf flash-attention-weighted
+mkdir -p flash-attention-weighted
+tar -xzf /tmp/flash-attention-weighted.tar.gz -C flash-attention-weighted --strip-components=1
+rm -rf flash-attention-weighted/csrc/cutlass
+ln -s /root/AdaptiveIMI/library/cutlass flash-attention-weighted/csrc/cutlass
+pip install ./flash-attention-weighted --no-build-isolation
+
+python - <<'PY'
+from weighted_flash_decoding import weighted_flash_decoding
+print("weighted_flash_decoding import ok")
+PY
 
 cd /root/AdaptiveIMI/library/AdaptiveIMI/cpp_extensions
 python setup.py build_ext --inplace
