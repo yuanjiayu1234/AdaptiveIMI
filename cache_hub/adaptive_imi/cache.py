@@ -186,9 +186,9 @@ class Hybrid8WayIMICache(HybridGpuPrefillMixin, HybridCpuPrefillMixin, HybridMet
         if os.getenv("IMI_DEBUG_PIPELINE_STATS", "0") == "1":
             print(json.dumps(payload, ensure_ascii=False), flush=True)
 
-    def prepare_cache(self, skip_prefetch: bool = False):
+    def prepare_cache(self):
         self._wait_for_hybrid_background_finishes()
-        return super().prepare_cache(skip_prefetch=True)
+        return super().prepare_cache()
 
     def ensure_layer_ready(self, layer_idx):
         layer_idx = int(layer_idx)

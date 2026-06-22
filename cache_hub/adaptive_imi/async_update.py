@@ -1,79 +1,88 @@
-import os
-
 import torch
 
 
 class AdaptiveIMIAsyncUpdateMixin:
     def _apply_async_centroid_updates(self, layer_idx: int, device: str) -> None:
+        return
+
+    def current_static_len(self, layer_idx: int) -> int:
         if not self.async_update_enabled:
+            return int(self.static_pattern_total)
+        return int(self.static_layer_lengths[layer_idx])
+
+    def _flush_delta_chunk(self, layer_idx: int) -> None:
+        active = int(self.delta_active_chunks[layer_idx])
+        max_chunks = int(self.async_update_max_delta_chunks)
+        interval = int(self.async_update_interval)
+        recent_count = int(self.generated_recent_counts[layer_idx])
+        if max_chunks <= 0 or active >= max_chunks or recent_count < interval:
             return
-        buffer = self.async_update_buffers[layer_idx]
-        shadow = self.centroids_shadow[layer_idx]
-        if buffer is None or shadow is None:
-            return
-        event = buffer.get("event")
-        if event is None or not event.query():
-            return
-        stream = torch.cuda.current_stream(device)
-        stream.wait_event(event)
-        self.centroids[layer_idx].copy_(shadow)
+
+        base = int(self.base_static_pattern_total)
+        key_rows = self.steady_zone_keys[layer_idx].view(self.batch_groups, self.static_capacity, self.head_dim)
+        value_rows = self.steady_zone_values[layer_idx].view(self.batch_groups, self.static_capacity, self.head_dim)
+        chunk_keys = key_rows[:, base : base + interval, :]
+        chunk_values = value_rows[:, base : base + interval, :]
+
+        self.delta_mini_keys[layer_idx][:, active, :, :].copy_(chunk_keys)
+        self.delta_mini_values[layer_idx][:, active, :, :].copy_(chunk_values)
+        self.delta_mini_centroids[layer_idx][:, active, :].copy_(chunk_keys.float().mean(dim=1))
+        self.delta_active_chunks[layer_idx] = active + 1
+
+        remaining = recent_count - interval
+        if remaining > 0:
+            remaining_keys = key_rows[:, base + interval : base + recent_count, :].clone()
+            remaining_values = value_rows[:, base + interval : base + recent_count, :].clone()
+            key_rows[:, base : base + remaining, :].copy_(remaining_keys)
+            value_rows[:, base : base + remaining, :].copy_(remaining_values)
+        self.generated_recent_counts[layer_idx] = remaining
+        self.static_layer_lengths[layer_idx] = base + remaining
+
     def _append_delta_to_execution(
         self,
         layer_idx: int,
         device: str,
-        selected: torch.Tensor,
-    ) -> None:
-        if not self.async_update_enabled:
-            return
-        buffer = self.async_update_buffers[layer_idx]
-        delta_keys = self.delta_keys[layer_idx]
-        delta_values = self.delta_values[layer_idx]
-        delta_cluster_ids = self.delta_cluster_ids[layer_idx]
-        delta_counts = self.delta_counts_gpu[layer_idx]
-        if (
-            buffer is None
-            or delta_keys is None
-            or delta_values is None
-            or delta_cluster_ids is None
-            or delta_counts is None
-        ):
-            return
-        if int(delta_counts.max().item()) <= 0:
-            return
-        delta_event = buffer.get("delta_event")
-        if delta_event is not None and not delta_event.query():
-            torch.cuda.current_stream(device).wait_event(delta_event)
+        query_grouped: torch.Tensor,
+        execution_keys: torch.Tensor,
+        execution_values: torch.Tensor,
+    ) -> int:
+        active = int(self.delta_active_chunks[layer_idx]) if self.async_update_enabled else 0
+        if active <= 0:
+            return 0
+        delta_nprobe = min(int(self.async_update_delta_nprobe), active)
+        if delta_nprobe <= 0:
+            return 0
 
-        selected_gpu = selected.to(device=device, non_blocking=True)
-        capacity = delta_keys.size(1)
-        positions = torch.arange(capacity, device=device).unsqueeze(0)
-        valid_mask = positions < delta_counts.unsqueeze(1)
-        match_mask = (delta_cluster_ids.unsqueeze(-1) == selected_gpu.unsqueeze(1)).any(dim=-1)
-        match_mask = match_mask & valid_mask
+        centroids = self.delta_mini_centroids[layer_idx][:, :active, :]
+        scores = torch.bmm(query_grouped.float(), centroids.transpose(1, 2)).sum(dim=1)
+        selected = torch.topk(scores, delta_nprobe, dim=-1, largest=True, sorted=False).indices
 
-        exec_keys = self.execution_buffer_keys_dict[device]
-        exec_values = self.execution_buffer_values_dict[device]
+        interval = int(self.async_update_interval)
+        dim = int(self.head_dim)
+        gather_index = selected.view(self.batch_groups, delta_nprobe, 1, 1).expand(-1, -1, interval, dim)
+        gathered_keys = torch.gather(
+            self.delta_mini_keys[layer_idx][:, :active, :, :],
+            1,
+            gather_index,
+        ).reshape(self.batch_groups, delta_nprobe * interval, dim)
+        gathered_values = torch.gather(
+            self.delta_mini_values[layer_idx][:, :active, :, :],
+            1,
+            gather_index,
+        ).reshape(self.batch_groups, delta_nprobe * interval, dim)
+
         valid_lengths = self.valid_lengths_dict[device]
-        max_len = int(exec_keys.size(1))
+        append_tokens = delta_nprobe * interval
+        dst_positions = (
+            valid_lengths.to(torch.int64).view(self.batch_groups, 1)
+            + torch.arange(append_tokens, device=device, dtype=torch.int64).view(1, append_tokens)
+        )
+        dst_index = dst_positions.unsqueeze(-1).expand(-1, -1, dim)
+        execution_keys.view(self.batch_groups, self.execution_stride, dim).scatter_(1, dst_index, gathered_keys)
+        execution_values.view(self.batch_groups, self.execution_stride, dim).scatter_(1, dst_index, gathered_values)
+        valid_lengths.add_(append_tokens)
+        return append_tokens
 
-        for group_idx in range(self.batch_groups):
-            if not torch.any(match_mask[group_idx]):
-                continue
-            delta_k = delta_keys[group_idx, match_mask[group_idx], :]
-            delta_v = delta_values[group_idx, match_mask[group_idx], :]
-            if delta_k.numel() == 0:
-                continue
-            start = int(valid_lengths[group_idx].item())
-            if start >= max_len:
-                continue
-            available = max_len - start
-            if delta_k.size(0) > available:
-                delta_k = delta_k[:available]
-                delta_v = delta_v[:available]
-            end = start + delta_k.size(0)
-            exec_keys[group_idx, start:end, 0, :].copy_(delta_k)
-            exec_values[group_idx, start:end, 0, :].copy_(delta_v)
-            valid_lengths[group_idx] = end
     def _schedule_async_update(
         self,
         layer_idx: int,
@@ -82,81 +91,22 @@ class AdaptiveIMIAsyncUpdateMixin:
     ) -> None:
         if not self.async_update_enabled:
             return
-        buffer = self.async_update_buffers[layer_idx]
-        shadow = self.centroids_shadow[layer_idx]
-        delta_counts = self.delta_counts[layer_idx]
-        delta_sums = self.delta_sums[layer_idx]
-        centroid_counts = self.centroid_counts[layer_idx]
-        delta_keys = self.delta_keys[layer_idx]
-        delta_values = self.delta_values[layer_idx]
-        delta_cluster_ids = self.delta_cluster_ids[layer_idx]
-        delta_counts_gpu = self.delta_counts_gpu[layer_idx]
+        base = int(self.base_static_pattern_total)
+        recent_count = int(self.generated_recent_counts[layer_idx])
+        if recent_count >= int(self.async_update_recent_capacity):
+            self._flush_delta_chunk(layer_idx)
+            recent_count = int(self.generated_recent_counts[layer_idx])
+
+        write_pos = base + recent_count
+        self.steady_zone_keys[layer_idx][:, :, write_pos, :].copy_(key_states[:, 0, :, :])
+        self.steady_zone_values[layer_idx][:, :, write_pos, :].copy_(value_states[:, 0, :, :])
+        recent_count += 1
+        self.generated_recent_counts[layer_idx] = recent_count
+        self.static_layer_lengths[layer_idx] = base + recent_count
+
+        generated_index = int(self.generated_tokens_total) + 1
         if (
-            buffer is None
-            or shadow is None
-            or delta_counts is None
-            or delta_sums is None
-            or centroid_counts is None
-            or delta_keys is None
-            or delta_values is None
-            or delta_cluster_ids is None
-            or delta_counts_gpu is None
+            generated_index > int(self.async_update_start_after_tokens)
+            and (generated_index - int(self.async_update_start_after_tokens)) % int(self.async_update_interval) == 0
         ):
-            return
-        event = buffer.get("event")
-        if event is not None and buffer["count"] == 0 and not event.query():
-            return
-        device = self.layer_mapping[str(layer_idx)]
-        keys_view = key_states[:, 0, :, :].reshape(self.batch_groups, self.head_dim)
-        values_view = value_states[:, 0, :, :].reshape(self.batch_groups, self.head_dim)
-        slot = int(buffer["count"])
-        buffer["keys"][:, slot, :].copy_(keys_view, non_blocking=True)
-        buffer["values"][:, slot, :].copy_(values_view, non_blocking=True)
-        buffer["count"] = slot + 1
-        if buffer["count"] < self.async_update_batch:
-            return
-
-        count = int(buffer["count"])
-        update_stream = self.async_update_streams[device]
-        update_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(update_stream):
-            keys_batch = buffer["keys"][:, :count, :].clone()
-            values_batch = buffer["values"][:, :count, :].clone()
-            keys_fp32 = keys_batch.float()
-            similarities = torch.bmm(keys_fp32, shadow.transpose(1, 2))
-            cluster_ids = torch.argmax(similarities, dim=-1)
-            ones = torch.ones_like(cluster_ids, dtype=torch.int32)
-            delta_counts.scatter_add_(1, cluster_ids, ones)
-            delta_sums.scatter_add_(
-                1,
-                cluster_ids.unsqueeze(-1).expand(-1, -1, self.head_dim),
-                keys_fp32,
-            )
-            update_mask = delta_counts >= self.async_update_threshold
-            new_counts = centroid_counts + delta_counts
-            new_centroids = (
-                shadow * centroid_counts.unsqueeze(-1) + delta_sums
-            ) / torch.clamp(new_counts, min=1).unsqueeze(-1)
-            shadow.copy_(torch.where(update_mask.unsqueeze(-1), new_centroids, shadow))
-            centroid_counts.copy_(torch.where(update_mask, new_counts, centroid_counts))
-            delta_counts.masked_fill_(update_mask, 0)
-            delta_sums.masked_fill_(update_mask.unsqueeze(-1), 0.0)
-            buffer["event"].record(update_stream)
-
-            delta_event = buffer.get("delta_event")
-            delta_write_pos = buffer.get("delta_write_pos")
-            if delta_event is not None and delta_write_pos is not None:
-                capacity = delta_keys.size(1)
-                positions = (
-                    delta_write_pos.unsqueeze(1)
-                    + torch.arange(count, device=device).unsqueeze(0)
-                ) % capacity
-                for group_idx in range(self.batch_groups):
-                    pos = positions[group_idx]
-                    delta_keys[group_idx, pos, :].copy_(keys_batch[group_idx])
-                    delta_values[group_idx, pos, :].copy_(values_batch[group_idx])
-                    delta_cluster_ids[group_idx, pos].copy_(cluster_ids[group_idx])
-                delta_write_pos.copy_((delta_write_pos + count) % capacity)
-                delta_counts_gpu.copy_(torch.clamp(delta_counts_gpu + count, max=capacity))
-                delta_event.record(update_stream)
-        buffer["count"] = 0
+            self._flush_delta_chunk(layer_idx)

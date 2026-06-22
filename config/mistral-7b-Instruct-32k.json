@@ -2,16 +2,12 @@
     "AdaptiveIMI": {
       "static_pattern_start": 4,
       "static_pattern_end": 64,
-      "core": 22,
-      "pages_per_cluster": 2,
       "retrieval_budget": 0.1,
       "buffer_cluster_num": 32,
-      "use_cuda_graph": false,
-      "gpu_only": false,
-      "engine": "hybrid_8way_v2",
-      "subspace_parts": 8,
       "cache": {
-        "execution_buffer_ring_size": 2
+        "execution_buffer_ring_size": 2,
+        "cluster_uva_warmup_steps": 3,
+        "promotion_warmup_steps": 4
       },
       "kmeans": {
         "max_iters": 5,
@@ -27,6 +23,12 @@
         "hidden_device": "auto",
         "hidden_gpu_limit_gb": 8.0,
         "hidden_pinned_limit_gb": 8.0
+      },
+      "async_update": {
+        "enabled": true,
+        "recent_generated_tokens": 512,
+        "interval": 16,
+        "delta_nprobe": 8
       }
     }
 }

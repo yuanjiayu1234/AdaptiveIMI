@@ -215,14 +215,8 @@ class LLM(PrefillMixin, SamplingMixin):
         if imi_config is None:
             raise ValueError("AdaptiveIMI config is missing for this model.")
 
-        imi_engine = str(imi_config.get("engine", "hybrid_8way_v2") or "hybrid_8way_v2").lower()
-        if imi_engine != "hybrid_8way_v2":
-            raise ValueError(
-                "AdaptiveIMI now supports only engine='hybrid_8way_v2'. "
-                "Set IMI_ENGINE=hybrid_8way_v2 and provide partition_path."
-            )
         if not imi_config.get("partition_path"):
-            raise ValueError("AdaptiveIMI hybrid_8way_v2 requires partition_path.")
+            raise ValueError("AdaptiveIMI requires partition_path.")
 
         from cache_hub.adaptive_imi.cache import Hybrid8WayIMICache as imi_cache_cls
 
@@ -289,8 +283,8 @@ class LLM(PrefillMixin, SamplingMixin):
             runtime_config={
                 "cpu_threads": imi_config.get("cpu_threads"),
                 "pipeline": imi_config.get("pipeline", {}),
+                "cache": imi_config.get("cache", {}),
                 "kmeans": imi_config.get("kmeans", {}),
-                "prefetch": imi_config.get("prefetch", {}),
                 "prefill": imi_config.get("prefill", {}),
                 "streaming": imi_config.get("streaming", {}),
                 "async_update": imi_config.get("async_update", {}),

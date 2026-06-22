@@ -144,8 +144,6 @@ def add_config_args(parser):
     )
     parser.add_argument("--retrieval_budget", type=float, default=None, help="Retrieval budget override")
     parser.add_argument("--cache_ratio", type=float, default=None, help="Cache ratio override for AdaptiveIMI")
-    parser.add_argument("--gpu_only", action='store_true', default=None, help="Override AdaptiveIMI to GPU-only mode")
-    parser.add_argument("--subspace_parts", type=int, default=None, help="AdaptiveIMI subspace override")
     return parser
 
 
@@ -216,11 +214,31 @@ def _existing_hf_cache_snapshot(model_name: str) -> str | None:
     return resolved if resolved and os.path.exists(resolved) else None
 
 
+def _load_model_config(model_name: str) -> dict:
+    config_name = resolve_config_name(model_name)
+    config_path = os.path.join(PROJECT_ROOT, "config", config_name)
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+
+def _model_path_from_config(model_name: str) -> str | None:
+    model_config = _load_model_config(model_name)
+    model_path = model_config.get("model_path")
+    if not model_path:
+        return None
+    resolved = _resolve_snapshot_path(_resolve_project_relative_model_path(str(model_path)))
+    return resolved if resolved and os.path.exists(resolved) else str(model_path)
+
 
 def resolve_model_path(model_name: str) -> str:
     direct_path = _existing_local_model_path(model_name)
     if direct_path is not None:
         return direct_path
+    config_path = _model_path_from_config(model_name)
+    if config_path is not None:
+        return config_path
     hf_cache_path = _existing_hf_cache_snapshot(model_name)
     if hf_cache_path is not None:
         return hf_cache_path
@@ -290,43 +308,10 @@ def _clone_attn_config_section(section):
     return copy.deepcopy(section) if section is not None else {}
 
 
-def _apply_hybrid_index_env_overrides(base_config):
-    hybrid_index = copy.deepcopy(base_config.get("hybrid_index") or {})
-
-    policy = os.getenv("IMI_HYBRID_INDEX_POLICY")
-    if policy:
-        hybrid_index["policy"] = policy.strip().lower()
-
-    start = os.getenv("IMI_HYBRID_INDEX_START")
-    if start:
-        hybrid_index["start"] = start.strip().lower()
-
-    int_overrides = {
-        "IMI_CPU_BUILD_CONCURRENCY": "cpu_build_concurrency",
-        "IMI_MAX_GPU_RAW_SLOTS": "max_gpu_raw_slots",
-    }
-    for env_name, key in int_overrides.items():
-        value = os.getenv(env_name)
-        if value is not None and value != "":
-            hybrid_index[key] = int(value)
-
-    if hybrid_index:
-        base_config["hybrid_index"] = hybrid_index
-
-    k_values = os.getenv("IMI_K_VALUES")
-    if k_values:
-        values = [int(part.strip()) for part in k_values.split(",") if part.strip()]
-        if values:
-            kmeans = copy.deepcopy(base_config.get("kmeans") or {})
-            kmeans["k_values"] = values
-            base_config["kmeans"] = kmeans
-
-
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=None, cache_ratio=None,
-    gpu_only=None, subspace_parts=None,
-    imi_engine=None, partition_path=None, hybrid_index=None
+    partition_path=None, hybrid_index=None
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     model_config_name = resolve_config_name(model_name)
@@ -342,41 +327,27 @@ def generate_config(
         if partition_path and not os.path.isabs(str(partition_path)):
             partition_path = os.path.join(PROJECT_ROOT, str(partition_path))
 
-        imi_engine = str(imi_engine or base_config.get("engine") or "hybrid_8way_v2").lower()
-        if imi_engine != "hybrid_8way_v2":
-            raise ValueError("AdaptiveIMI now supports only engine='hybrid_8way_v2'")
-        if subspace_parts is None:
-            subspace_parts = base_config.get("subspace_parts", 8)
-        subspace_parts = int(subspace_parts)
-        if subspace_parts != 8:
-            raise ValueError("hybrid_8way_v2 requires subspace_parts=8")
         if not partition_path:
-            raise ValueError("hybrid_8way_v2 requires partition_path")
+            raise ValueError("AdaptiveIMI requires partition_path")
 
         if retrieval_budget is None:
             retrieval_budget = base_config.get("retrieval_budget", 0.018)
         if cache_ratio is None:
             cache_ratio = base_config.get("cache_ratio", 0.0)
-        if gpu_only is None:
-            gpu_only = base_config.get("gpu_only", False)
 
         base_config["core"] = get_numa_node_core_count(0)
         base_config["pages_per_cluster"] = round(16 / 8)
         base_config["retrieval_budget"] = retrieval_budget
         base_config["cache_ratio"] = cache_ratio
-        base_config["subspace_parts"] = subspace_parts
-        base_config["gpu_only"] = gpu_only
-        base_config["engine"] = imi_engine
         if partition_path:
             base_config["partition_path"] = partition_path
         if hybrid_index is not None:
             base_config["hybrid_index"] = hybrid_index
         elif "hybrid_index" not in base_config:
             base_config["hybrid_index"] = {
-                "policy": "gpu_only" if gpu_only else "alternate",
+                "policy": "alternate",
                 "start": "cpu",
             }
-        _apply_hybrid_index_env_overrides(base_config)
         if context_len <= 4096:
             base_config["buffer_cluster_num"] = 150
         _config["AdaptiveIMI"] = base_config

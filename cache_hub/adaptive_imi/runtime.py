@@ -10,7 +10,7 @@ from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
 class AdaptiveIMIRuntimeMixin:
     def capture_cuda_graph(self):
         return None
-    def prepare_cache(self, skip_prefetch: bool = False):
+    def prepare_cache(self):
         if not self.build_index_when_prefilling:
             return
         if self.cache_prepared:
@@ -117,7 +117,12 @@ class AdaptiveIMIRuntimeMixin:
         self.buffer_size = self._resolve_budget_pages(requested_buffer_pages)
         self.buffer_budget_pages = self.buffer_size
 
-        self.execution_stride = self.buffer_size * self.page_size + self.static_capacity
+        delta_execution_tokens = (
+            int(self.async_update_delta_nprobe) * int(self.async_update_interval)
+            if self.async_update_enabled
+            else 0
+        )
+        self.execution_stride = self.buffer_size * self.page_size + self.static_capacity + delta_execution_tokens
         self.retrieval_execution_stride = self.buffer_size * self.page_size
 
         if profile_prepare:
@@ -136,66 +141,26 @@ class AdaptiveIMIRuntimeMixin:
                 f"retrieval_tokens={self.max_retrieval_tokens} retrieval_pages={self.max_retrieval_pages}"
             )
 
-        if self.async_update_enabled and not self.allocated:
-            self.async_update_enabled = False
-
         if self.async_update_enabled:
-            for device in self.device_list:
-                if device not in self.async_update_streams:
-                    self.async_update_streams[device] = torch.cuda.Stream(device)
             for ldx in range(self.layer_num):
                 device = self.layer_mapping[str(ldx)]
-                if self.centroids[ldx] is None or self.cluster_sizes_gpu[ldx] is None:
-                    continue
-                self.centroids_shadow[ldx] = self.centroids[ldx].clone()
-                self.centroid_counts[ldx] = self.cluster_sizes_gpu[ldx].to(torch.int32).clone()
-                self.delta_counts[ldx] = torch.zeros_like(self.centroid_counts[ldx])
-                self.delta_sums[ldx] = torch.zeros(
-                    (self.batch_groups, self.n_centroids, self.head_dim),
+                chunk_capacity = max(int(self.async_update_max_delta_chunks), 1)
+                self.delta_mini_keys[ldx] = torch.empty(
+                    (self.batch_groups, chunk_capacity, self.async_update_interval, self.head_dim),
+                    dtype=self.dtype,
+                    device=device,
+                ).contiguous()
+                self.delta_mini_values[ldx] = torch.empty(
+                    (self.batch_groups, chunk_capacity, self.async_update_interval, self.head_dim),
+                    dtype=self.dtype,
+                    device=device,
+                ).contiguous()
+                self.delta_mini_centroids[ldx] = torch.zeros(
+                    (self.batch_groups, chunk_capacity, self.head_dim),
                     dtype=torch.float32,
                     device=device,
-                )
-                self.delta_keys[ldx] = torch.zeros(
-                    (self.batch_groups, self.async_update_delta_tokens, self.head_dim),
-                    dtype=self.dtype,
-                    device=device,
-                )
-                self.delta_values[ldx] = torch.zeros(
-                    (self.batch_groups, self.async_update_delta_tokens, self.head_dim),
-                    dtype=self.dtype,
-                    device=device,
-                )
-                self.delta_cluster_ids[ldx] = torch.full(
-                    (self.batch_groups, self.async_update_delta_tokens),
-                    self.padding_cluster_id,
-                    dtype=torch.int64,
-                    device=device,
-                )
-                self.delta_counts_gpu[ldx] = torch.zeros(
-                    (self.batch_groups),
-                    dtype=torch.int32,
-                    device=device,
-                )
-                self.async_update_buffers[ldx] = {
-                    "keys": torch.empty(
-                        (self.batch_groups, self.async_update_batch, self.head_dim),
-                        dtype=self.dtype,
-                        device=device,
-                    ),
-                    "values": torch.empty(
-                        (self.batch_groups, self.async_update_batch, self.head_dim),
-                        dtype=self.dtype,
-                        device=device,
-                    ),
-                    "count": 0,
-                    "event": torch.cuda.Event(),
-                    "delta_event": torch.cuda.Event(),
-                    "delta_write_pos": torch.zeros(
-                        (self.batch_groups),
-                        dtype=torch.int64,
-                        device=device,
-                    ),
-                }
+                ).contiguous()
+                self.delta_active_chunks[ldx] = 0
 
         if profile_prepare:
             log_step("async_update")
@@ -218,11 +183,16 @@ class AdaptiveIMIRuntimeMixin:
             ensure_list_tensor(self.gpu_cache_aware_miss_unit_idices, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_unit_sizes, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_unit_sizes_cumsum, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_miss_cluster_unit_sizes_cumsum, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_num_units, ldx, ring_count_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_copy_unit_idices, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_copy_unit_sizes, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_copy_unit_sizes_cumsum, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_copy_num_units, ldx, ring_count_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_cluster_copy_unit_idices, ldx, ring_probe_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_cluster_copy_unit_sizes, ldx, ring_probe_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_cluster_copy_unit_sizes_cumsum, ldx, ring_probe_shape, torch.int32, device=device, zero_new=False)
+            ensure_list_tensor(self.gpu_cache_aware_cluster_copy_num_units, ldx, ring_count_shape, torch.int32, device=device, zero_new=False)
             ensure_list_tensor(self.gpu_cache_aware_miss_page_keys, ldx, ring_buffer_shape, torch.int64, device=device, zero_new=False)
             admit_starts = ensure_list_tensor(self.gpu_cache_aware_admit_unit_starts, ldx, ring_probe_shape, torch.int32, device=device, zero_new=False)
             promote_src = ensure_list_tensor(self.gpu_cache_promote_src_offsets, ldx, ring_buffer_shape, torch.int32, device=device, zero_new=False)
@@ -410,18 +380,22 @@ class AdaptiveIMIRuntimeMixin:
             total_ms = (time.perf_counter() - start_ts) * 1000.0
             print(f"[IMI prepare_cache] total={total_ms:.2f} ms", flush=True)
     def decode_update_kv_cache(self, key_states, value_states, layer_idx):
-        self.steady_zone_keys[layer_idx][:, :, self.static_pattern_total, :] = key_states[:, 0, :, :]
-        self.steady_zone_values[layer_idx][:, :, self.static_pattern_total, :] = value_states[:, 0, :, :]
+        if self.async_update_enabled:
+            self._schedule_async_update(layer_idx, key_states, value_states)
+        else:
+            self.steady_zone_keys[layer_idx][:, :, self.static_pattern_total, :] = key_states[:, 0, :, :]
+            self.steady_zone_values[layer_idx][:, :, self.static_pattern_total, :] = value_states[:, 0, :, :]
 
         if layer_idx == 0:
             self.decode_debug_step += 1
 
-        if self.async_update_enabled:
-            self._schedule_async_update(layer_idx, key_states, value_states)
-
         if layer_idx == self.layer_num - 1:
             self.context += 1
-            self.static_pattern_total += 1
+            if self.async_update_enabled:
+                self.generated_tokens_total += 1
+                self.static_pattern_total = self.current_static_len(layer_idx)
+            else:
+                self.static_pattern_total += 1
 
         return None, None
     def dense_attention(self, queries, layer_idx, static_len):

@@ -243,11 +243,16 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
     int32_t* __restrict__ miss_offsets,
     int32_t* __restrict__ miss_sizes,
     int32_t* __restrict__ miss_cumsum,
+    int32_t* __restrict__ miss_cluster_cumsum,
     int32_t* __restrict__ miss_counts,
     int32_t* __restrict__ miss_copy_offsets,
     int32_t* __restrict__ miss_copy_sizes,
     int32_t* __restrict__ miss_copy_cumsum,
     int32_t* __restrict__ miss_copy_counts,
+    int32_t* __restrict__ cluster_copy_offsets,
+    int32_t* __restrict__ cluster_copy_sizes,
+    int32_t* __restrict__ cluster_copy_cumsum,
+    int32_t* __restrict__ cluster_copy_counts,
     int64_t* __restrict__ miss_page_keys,
     int32_t* __restrict__ admit_starts,
     int32_t* __restrict__ hit_offsets,
@@ -277,9 +282,13 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
     int32_t* row_miss_offsets = miss_offsets + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_miss_sizes = miss_sizes + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_miss_cumsum = miss_cumsum + static_cast<int64_t>(row) * buffer_blocks;
+    int32_t* row_miss_cluster_cumsum = miss_cluster_cumsum + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_miss_copy_offsets = miss_copy_offsets + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_miss_copy_sizes = miss_copy_sizes + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_miss_copy_cumsum = miss_copy_cumsum + static_cast<int64_t>(row) * buffer_blocks;
+    int32_t* row_cluster_copy_offsets = cluster_copy_offsets + static_cast<int64_t>(row) * nprobe;
+    int32_t* row_cluster_copy_sizes = cluster_copy_sizes + static_cast<int64_t>(row) * nprobe;
+    int32_t* row_cluster_copy_cumsum = cluster_copy_cumsum + static_cast<int64_t>(row) * nprobe;
     int64_t* row_miss_page_keys = miss_page_keys + static_cast<int64_t>(row) * buffer_blocks;
     int32_t* row_admit_starts = admit_starts + static_cast<int64_t>(row) * nprobe;
     int32_t* row_hit_offsets = hit_offsets + static_cast<int64_t>(row) * buffer_blocks;
@@ -288,11 +297,13 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
 
     __shared__ unsigned long long s_miss_state;
     __shared__ unsigned long long s_miss_copy_state;
+    __shared__ unsigned long long s_cluster_copy_state;
     __shared__ unsigned long long s_hit_state;
     __shared__ int s_considered_blocks;
     if (threadIdx.x == 0) {
         s_miss_state = 0;
         s_miss_copy_state = 0;
+        s_cluster_copy_state = 0;
         s_hit_state = 0;
         s_considered_blocks = 0;
     }
@@ -319,6 +330,15 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
         }
 
         int list_start = row_offsets[cluster];
+        unsigned long long cluster_copy_inc = (static_cast<unsigned long long>(cluster_size) << 32) | 1U;
+        unsigned long long cluster_copy_old = atomicAdd(&s_cluster_copy_state, cluster_copy_inc);
+        int cluster_copy_idx = static_cast<int>(cluster_copy_old & 0xffffffffULL);
+        int cluster_copy_dst = static_cast<int>(cluster_copy_old >> 32);
+        if (cluster_copy_idx < nprobe) {
+            row_cluster_copy_offsets[cluster_copy_idx] = list_start;
+            row_cluster_copy_sizes[cluster_copy_idx] = cluster_size;
+            row_cluster_copy_cumsum[cluster_copy_idx] = cluster_copy_dst;
+        }
         int local_miss_blocks = 0;
         int local_hit_blocks = 0;
         int local_miss_tokens = 0;
@@ -410,6 +430,7 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
                 row_miss_offsets[miss_idx] = list_start + page * block_size;
                 row_miss_sizes[miss_idx] = size;
                 row_miss_cumsum[miss_idx] = miss_dst;
+                row_miss_cluster_cumsum[miss_idx] = cluster_copy_dst + page * block_size;
                 row_miss_page_keys[miss_idx] = key;
                 miss_idx++;
                 miss_dst += size;
@@ -424,6 +445,7 @@ __global__ void build_cache_aware_retrieval_plan_kernel(
         int hit_blocks = min(static_cast<int>(s_hit_state & 0xffffffffULL), buffer_blocks);
         miss_counts[row] = miss_blocks;
         miss_copy_counts[row] = miss_copy_blocks;
+        cluster_copy_counts[row] = min(static_cast<int>(s_cluster_copy_state & 0xffffffffULL), nprobe);
         hit_counts[row] = hit_blocks;
         valid_lengths[row] = static_cast<int>(s_miss_state >> 32) + static_cast<int>(s_hit_state >> 32);
     }
@@ -810,11 +832,16 @@ void build_cache_aware_retrieval_plan(
     torch::Tensor& miss_offsets,
     torch::Tensor& miss_sizes,
     torch::Tensor& miss_cumsum,
+    torch::Tensor& miss_cluster_cumsum,
     torch::Tensor& miss_counts,
     torch::Tensor& miss_copy_offsets,
     torch::Tensor& miss_copy_sizes,
     torch::Tensor& miss_copy_cumsum,
     torch::Tensor& miss_copy_counts,
+    torch::Tensor& cluster_copy_offsets,
+    torch::Tensor& cluster_copy_sizes,
+    torch::Tensor& cluster_copy_cumsum,
+    torch::Tensor& cluster_copy_counts,
     torch::Tensor& miss_page_keys,
     torch::Tensor& admit_starts,
     torch::Tensor& hit_offsets,
@@ -838,11 +865,16 @@ void build_cache_aware_retrieval_plan(
     TORCH_CHECK(miss_offsets.is_cuda(), "miss_offsets must be CUDA");
     TORCH_CHECK(miss_sizes.is_cuda(), "miss_sizes must be CUDA");
     TORCH_CHECK(miss_cumsum.is_cuda(), "miss_cumsum must be CUDA");
+    TORCH_CHECK(miss_cluster_cumsum.is_cuda(), "miss_cluster_cumsum must be CUDA");
     TORCH_CHECK(miss_counts.is_cuda(), "miss_counts must be CUDA");
     TORCH_CHECK(miss_copy_offsets.is_cuda(), "miss_copy_offsets must be CUDA");
     TORCH_CHECK(miss_copy_sizes.is_cuda(), "miss_copy_sizes must be CUDA");
     TORCH_CHECK(miss_copy_cumsum.is_cuda(), "miss_copy_cumsum must be CUDA");
     TORCH_CHECK(miss_copy_counts.is_cuda(), "miss_copy_counts must be CUDA");
+    TORCH_CHECK(cluster_copy_offsets.is_cuda(), "cluster_copy_offsets must be CUDA");
+    TORCH_CHECK(cluster_copy_sizes.is_cuda(), "cluster_copy_sizes must be CUDA");
+    TORCH_CHECK(cluster_copy_cumsum.is_cuda(), "cluster_copy_cumsum must be CUDA");
+    TORCH_CHECK(cluster_copy_counts.is_cuda(), "cluster_copy_counts must be CUDA");
     TORCH_CHECK(miss_page_keys.is_cuda(), "miss_page_keys must be CUDA");
     TORCH_CHECK(admit_starts.is_cuda(), "admit_starts must be CUDA");
     TORCH_CHECK(hit_offsets.is_cuda(), "hit_offsets must be CUDA");
@@ -862,11 +894,16 @@ void build_cache_aware_retrieval_plan(
         reinterpret_cast<int32_t*>(miss_offsets.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_sizes.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_cumsum.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(miss_cluster_cumsum.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_counts.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_copy_offsets.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_copy_sizes.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_copy_cumsum.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(miss_copy_counts.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_copy_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_copy_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_copy_cumsum.data_ptr<int32_t>()),
+        reinterpret_cast<int32_t*>(cluster_copy_counts.data_ptr<int32_t>()),
         reinterpret_cast<int64_t*>(miss_page_keys.data_ptr<int64_t>()),
         reinterpret_cast<int32_t*>(admit_starts.data_ptr<int32_t>()),
         reinterpret_cast<int32_t*>(hit_offsets.data_ptr<int32_t>()),
@@ -1234,153 +1271,6 @@ __global__ void copy_hit_chunks_kernel(
     }
 }
 
-void gather_copy_and_concat_chunk_parallel(
-    torch::Tensor& key_data1,    // input, shape (groups, num_vectors1, dim)
-    torch::Tensor& key_data2,    // input, shape (groups, num_vectors2, dim)
-    torch::Tensor& key_data3,    // input, shape (groups, num_units3, unit_size, dim)
-    torch::Tensor& key_buffer,   // output, shape (groups, buffer_num_vectors, dim)
-    torch::Tensor& value_data1,  // input, shape (groups, num_vectors1, dim)
-    torch::Tensor& value_data2,  // input, shape (groups, num_vectors2, dim)
-    torch::Tensor& value_data3,  // input, shape (groups, num_units3, unit_size, dim)
-    torch::Tensor& value_buffer, // output, shape (groups, buffer_num_vectors, dim)
-
-    torch::Tensor& data_offsets2,       // input, shape (groups, offset_length)
-    torch::Tensor& data_copy_sizes2,    // input, shape (groups, offset_length)
-    torch::Tensor& buffer_offsets2,     // input, shape (groups, offset_length)
-    torch::Tensor& copy_chunks2,        // input, shape (groups,)
-    torch::Tensor& data_offsets3,       // input, shape (groups, offset_length)
-    torch::Tensor& data_copy_sizes3,    // input, shape (groups, offset_length)
-    torch::Tensor& buffer_offsets3,     // input, shape (groups, offset_length)
-    torch::Tensor& copy_chunks3,        // input, shape (groups,)
-
-    torch::Tensor& valid_lengths,       // inout, shape (groups,)
-
-    int groups,
-    int data_length1,           // num_vectors1
-    int data_length2,           // num_vectors2
-    int data_length3,           // num_units3
-    int buffer_length,          // buffer_num_vectors
-    int offset_length,
-    torch::Tensor& copy_vectors1 // number of vectors need to copy from data1
-) {
-    const int blockSize = BLOCK_SIZE_CP;
-    TORCH_CHECK(groups >= 0, "groups must be non-negative");
-    TORCH_CHECK(data_length1 >= 0, "data_length1 must be non-negative");
-    TORCH_CHECK(buffer_length >= 0, "buffer_length must be non-negative");
-    TORCH_CHECK(offset_length >= 0, "offset_length must be non-negative");
-
-    PTYPE* key_data_ptr1;
-    PTYPE* key_data_ptr2;
-    PTYPE* key_data_ptr3;
-    PTYPE* key_buffer_ptr;
-    PTYPE* value_data_ptr1;
-    PTYPE* value_data_ptr2;
-    PTYPE* value_data_ptr3;
-    PTYPE* value_buffer_ptr;
-
-#if DATA_BYTES == 4
-    key_data_ptr1 = reinterpret_cast<PTYPE*>(key_data1.data_ptr<float>());
-    key_data_ptr2 = reinterpret_cast<PTYPE*>(key_data2.data_ptr<float>());
-    key_data_ptr3 = reinterpret_cast<PTYPE*>(key_data3.data_ptr<float>());
-    key_buffer_ptr = reinterpret_cast<PTYPE*>(key_buffer.data_ptr<float>());
-    value_data_ptr1 = reinterpret_cast<PTYPE*>(value_data1.data_ptr<float>());
-    value_data_ptr2 = reinterpret_cast<PTYPE*>(value_data2.data_ptr<float>());
-    value_data_ptr3 = reinterpret_cast<PTYPE*>(value_data3.data_ptr<float>());
-    value_buffer_ptr = reinterpret_cast<PTYPE*>(value_buffer.data_ptr<float>());
-#else
-    if (key_data1.dtype() == torch::kFloat16) {
-        key_data_ptr1 = reinterpret_cast<PTYPE*>(key_data1.data_ptr<at::Half>());
-        key_data_ptr2 = reinterpret_cast<PTYPE*>(key_data2.data_ptr<at::Half>());
-        key_data_ptr3 = reinterpret_cast<PTYPE*>(key_data3.data_ptr<at::Half>());
-        key_buffer_ptr = reinterpret_cast<PTYPE*>(key_buffer.data_ptr<at::Half>());
-        value_data_ptr1 = reinterpret_cast<PTYPE*>(value_data1.data_ptr<at::Half>());
-        value_data_ptr2 = reinterpret_cast<PTYPE*>(value_data2.data_ptr<at::Half>());
-        value_data_ptr3 = reinterpret_cast<PTYPE*>(value_data3.data_ptr<at::Half>());
-        value_buffer_ptr = reinterpret_cast<PTYPE*>(value_buffer.data_ptr<at::Half>());
-    } else {
-        key_data_ptr1 = reinterpret_cast<PTYPE*>(key_data1.data_ptr<at::BFloat16>());
-        key_data_ptr2 = reinterpret_cast<PTYPE*>(key_data2.data_ptr<at::BFloat16>());
-        key_data_ptr3 = reinterpret_cast<PTYPE*>(key_data3.data_ptr<at::BFloat16>());
-        key_buffer_ptr = reinterpret_cast<PTYPE*>(key_buffer.data_ptr<at::BFloat16>());
-        value_data_ptr1 = reinterpret_cast<PTYPE*>(value_data1.data_ptr<at::BFloat16>());
-        value_data_ptr2 = reinterpret_cast<PTYPE*>(value_data2.data_ptr<at::BFloat16>());
-        value_data_ptr3 = reinterpret_cast<PTYPE*>(value_data3.data_ptr<at::BFloat16>());
-        value_buffer_ptr = reinterpret_cast<PTYPE*>(value_buffer.data_ptr<at::BFloat16>());
-    }
-#endif
-
-    int* data_offsets_ptr2 = reinterpret_cast<int*>(data_offsets2.data_ptr<int32_t>());
-    int* data_copy_sizes_ptr2 = reinterpret_cast<int*>(data_copy_sizes2.data_ptr<int32_t>());
-    int* buffer_offsets_ptr2 = reinterpret_cast<int*>(buffer_offsets2.data_ptr<int32_t>());
-    int* copy_chunks_ptr2 = reinterpret_cast<int*>(copy_chunks2.data_ptr<int32_t>());
-    int* data_offsets_ptr3 = reinterpret_cast<int*>(data_offsets3.data_ptr<int32_t>());
-    int* data_copy_sizes_ptr3 = reinterpret_cast<int*>(data_copy_sizes3.data_ptr<int32_t>());
-    int* buffer_offsets_ptr3 = reinterpret_cast<int*>(buffer_offsets3.data_ptr<int32_t>());
-    int* copy_chunks_ptr3 = reinterpret_cast<int*>(copy_chunks3.data_ptr<int32_t>());
-    int* valid_lengths_ptr = reinterpret_cast<int*>(valid_lengths.data_ptr<int32_t>());
-    int* copy_vectors1_ptr = reinterpret_cast<int*>(copy_vectors1.data_ptr<int32_t>());
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (groups > 0) {
-        int static_chunks = (data_length1 + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (static_chunks > 0) {
-            int64_t static_work = static_cast<int64_t>(groups) * static_chunks;
-            TORCH_CHECK(static_work <= 2147483647LL, "static chunk-parallel gather grid is too large");
-            copy_static_chunks_kernel<PTYPE><<<static_cast<int>(static_work), blockSize, 0, stream>>>(
-                key_data_ptr1,
-                value_data_ptr1,
-                key_buffer_ptr,
-                value_buffer_ptr,
-                valid_lengths_ptr,
-                copy_vectors1_ptr,
-                groups,
-                data_length1,
-                buffer_length,
-                static_chunks
-            );
-        }
-
-        if (offset_length > 0) {
-            int64_t retrieval_work = static_cast<int64_t>(groups) * offset_length;
-            TORCH_CHECK(retrieval_work <= 2147483647LL, "retrieval chunk-parallel gather grid is too large");
-            copy_miss_chunks_kernel<PTYPE><<<static_cast<int>(retrieval_work), blockSize, 0, stream>>>(
-                key_data_ptr2,
-                value_data_ptr2,
-                key_buffer_ptr,
-                value_buffer_ptr,
-                data_offsets_ptr2,
-                data_copy_sizes_ptr2,
-                buffer_offsets_ptr2,
-                copy_chunks_ptr2,
-                copy_vectors1_ptr,
-                groups,
-                data_length2,
-                buffer_length,
-                offset_length
-            );
-            copy_hit_chunks_kernel<PTYPE><<<static_cast<int>(retrieval_work), blockSize, 0, stream>>>(
-                key_data_ptr3,
-                value_data_ptr3,
-                key_buffer_ptr,
-                value_buffer_ptr,
-                data_copy_sizes_ptr2,
-                buffer_offsets_ptr2,
-                copy_chunks_ptr2,
-                data_offsets_ptr3,
-                data_copy_sizes_ptr3,
-                buffer_offsets_ptr3,
-                copy_chunks_ptr3,
-                copy_vectors1_ptr,
-                groups,
-                data_length3,
-                buffer_length,
-                offset_length
-            );
-        }
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 void gather_copy_static_chunks_profile(
     torch::Tensor& key_data,
     torch::Tensor& key_buffer,
@@ -1469,6 +1359,52 @@ void gather_copy_miss_chunks_profile(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void gather_copy_selected_clusters_profile(
+    torch::Tensor& key_data,
+    torch::Tensor& key_buffer,
+    torch::Tensor& value_data,
+    torch::Tensor& value_buffer,
+    torch::Tensor& data_offsets,
+    torch::Tensor& data_copy_sizes,
+    torch::Tensor& buffer_offsets,
+    torch::Tensor& copy_chunks,
+    int groups,
+    int data_length,
+    int buffer_length,
+    int offset_length,
+    torch::Tensor& copy_vectors1
+) {
+    const int blockSize = BLOCK_SIZE_CP;
+    TORCH_CHECK(groups >= 0, "groups must be non-negative");
+    TORCH_CHECK(data_length >= 0, "data_length must be non-negative");
+    TORCH_CHECK(buffer_length >= 0, "buffer_length must be non-negative");
+    TORCH_CHECK(offset_length >= 0, "offset_length must be non-negative");
+    if (groups <= 0 || offset_length <= 0) {
+        return;
+    }
+
+    int64_t retrieval_work = static_cast<int64_t>(groups) * offset_length;
+    TORCH_CHECK(retrieval_work <= 2147483647LL, "selected-cluster copy grid is too large");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    copy_miss_chunks_kernel<PTYPE><<<static_cast<int>(retrieval_work), blockSize, 0, stream>>>(
+        reinterpret_cast<PTYPE*>(key_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_data.data_ptr()),
+        reinterpret_cast<PTYPE*>(key_buffer.data_ptr()),
+        reinterpret_cast<PTYPE*>(value_buffer.data_ptr()),
+        reinterpret_cast<int*>(data_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(data_copy_sizes.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(buffer_offsets.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(copy_chunks.data_ptr<int32_t>()),
+        reinterpret_cast<int*>(copy_vectors1.data_ptr<int32_t>()),
+        groups,
+        data_length,
+        buffer_length,
+        offset_length
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void gather_copy_hit_chunks_profile(
     torch::Tensor& key_data,
     torch::Tensor& key_buffer,
@@ -1523,20 +1459,18 @@ void gather_copy_hit_chunks_profile(
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gather_copy_and_concat_chunk_parallel", &gather_copy_and_concat_chunk_parallel, "Chunk-parallel gather copy and concat from different sources (CUDA)",
-    py::arg("key_data1"), py::arg("key_data2"), py::arg("key_data3"), py::arg("key_buffer"),
-    py::arg("value_data1"), py::arg("value_data2"), py::arg("value_data3"), py::arg("value_buffer"),
-    py::arg("data_offsets2"), py::arg("data_copy_sizes2"), py::arg("buffer_offsets2"), py::arg("copy_chunks2"),
-    py::arg("data_offsets3"), py::arg("data_copy_sizes3"), py::arg("buffer_offsets3"), py::arg("copy_chunks3"),
-    py::arg("valid_lengths"), py::arg("groups"), py::arg("data_length1"), py::arg("data_length2"), py::arg("data_length3"),
-    py::arg("buffer_length"), py::arg("offset_length"), py::arg("copy_vectors1")),
-
     m.def("gather_copy_static_chunks_profile", &gather_copy_static_chunks_profile, "Profile-only static chunk copy (CUDA)",
     py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),
     py::arg("valid_lengths"), py::arg("groups"), py::arg("data_length"), py::arg("buffer_length"),
     py::arg("copy_vectors")),
 
     m.def("gather_copy_miss_chunks_profile", &gather_copy_miss_chunks_profile, "Profile-only miss chunk copy (CUDA)",
+    py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),
+    py::arg("data_offsets"), py::arg("data_copy_sizes"), py::arg("buffer_offsets"), py::arg("copy_chunks"),
+    py::arg("groups"), py::arg("data_length"), py::arg("buffer_length"), py::arg("offset_length"),
+    py::arg("copy_vectors1")),
+
+    m.def("gather_copy_selected_clusters_profile", &gather_copy_selected_clusters_profile, "Selected-cluster contiguous UVA copy (CUDA)",
     py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),
     py::arg("data_offsets"), py::arg("data_copy_sizes"), py::arg("buffer_offsets"), py::arg("copy_chunks"),
     py::arg("groups"), py::arg("data_length"), py::arg("buffer_length"), py::arg("offset_length"),
@@ -1552,8 +1486,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("build_cache_aware_retrieval_plan", &build_cache_aware_retrieval_plan, "Build GPU cache-aware retrieval descriptors (CUDA)",
     py::arg("selected_clusters"), py::arg("cluster_offsets"), py::arg("cluster_sizes"),
     py::arg("cache_hash_keys"), py::arg("cache_hash_values"),
-    py::arg("miss_offsets"), py::arg("miss_sizes"), py::arg("miss_cumsum"), py::arg("miss_counts"),
+    py::arg("miss_offsets"), py::arg("miss_sizes"), py::arg("miss_cumsum"), py::arg("miss_cluster_cumsum"), py::arg("miss_counts"),
     py::arg("miss_copy_offsets"), py::arg("miss_copy_sizes"), py::arg("miss_copy_cumsum"), py::arg("miss_copy_counts"),
+    py::arg("cluster_copy_offsets"), py::arg("cluster_copy_sizes"), py::arg("cluster_copy_cumsum"), py::arg("cluster_copy_counts"),
     py::arg("miss_page_keys"), py::arg("admit_starts"), py::arg("hit_offsets"), py::arg("hit_sizes"), py::arg("hit_cumsum"), py::arg("hit_counts"),
     py::arg("valid_lengths"), py::arg("groups"), py::arg("nprobe"), py::arg("n_clusters"),
     py::arg("buffer_blocks"), py::arg("block_size"), py::arg("hash_size"), py::arg("padding_cluster_id")),

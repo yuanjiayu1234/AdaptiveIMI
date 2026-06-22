@@ -16,18 +16,18 @@ def _import_required(module_name: str, symbol_names: list[str]):
 
 
 [
-    gather_copy_and_concat_chunk_parallel,
     gather_copy_static_chunks_profile,
     gather_copy_miss_chunks_profile,
+    gather_copy_selected_clusters_profile,
     gather_copy_hit_chunks_profile,
     build_cache_aware_retrieval_plan,
     promote_hot_cold_cache_pages_from_execution,
 ] = _import_required(
     "Copy",
     [
-        "gather_copy_and_concat_chunk_parallel",
         "gather_copy_static_chunks_profile",
         "gather_copy_miss_chunks_profile",
+        "gather_copy_selected_clusters_profile",
         "gather_copy_hit_chunks_profile",
         "build_cache_aware_retrieval_plan",
         "promote_hot_cold_cache_pages_from_execution",
@@ -35,9 +35,9 @@ def _import_required(module_name: str, symbol_names: list[str]):
 )
 
 __all__ = [
-    "gather_copy_and_concat_chunk_parallel",
     "gather_copy_static_chunks_profile",
     "gather_copy_miss_chunks_profile",
+    "gather_copy_selected_clusters_profile",
     "gather_copy_hit_chunks_profile",
     "build_cache_aware_retrieval_plan",
     "promote_hot_cold_cache_pages_from_execution",

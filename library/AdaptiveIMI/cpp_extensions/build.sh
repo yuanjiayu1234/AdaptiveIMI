@@ -122,10 +122,11 @@ if [ "$BUILD_SUCCESS" = true ]; then
     python -c "
 from library.AdaptiveIMI.cpp_extensions import gpu_cluster_manager_cpp as gmc
 from library.AdaptiveIMI.cpp_extensions import ultra_layer_pipeline_cpp as ulp
-from library.AdaptiveIMI.cpp_extensions import gather_copy_and_concat_chunk_parallel
+from library.AdaptiveIMI.cpp_extensions import build_cache_aware_retrieval_plan, gather_copy_selected_clusters_profile
 print('  gpu_cluster_manager_cpp:', dir(gmc)[:3], '...')
 print('  ultra_layer_pipeline_cpp:', dir(ulp)[:3], '...')
-print('  gather_copy_and_concat_chunk_parallel:', gather_copy_and_concat_chunk_parallel)
+print('  build_cache_aware_retrieval_plan:', build_cache_aware_retrieval_plan)
+print('  gather_copy_selected_clusters_profile:', gather_copy_selected_clusters_profile)
 print('✅ All imports successful!')
 "
 else

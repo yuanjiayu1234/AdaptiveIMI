@@ -41,11 +41,12 @@ non_sparse_model   ~19 ms
 - `cache_hub/adaptive_imi/retrieval.py`
   - `_run_retrieval_full_gpu_cache_aware()`
   - `_schedule_gpu_cache_promotion()`
-  - `_retrieve_kv_cache()`
 - `library/AdaptiveIMI/cpp_extensions/cuda/gather_copy.cu`
   - `build_cache_aware_retrieval_plan_kernel`
-  - `promote_cache_pages_from_list_kernel`
-  - `gather_copy_and_concat`
+  - `promote_hot_cold_cache_pages_from_execution`
+  - `gather_copy_static_chunks_profile`
+  - `gather_copy_miss_chunks_profile`
+  - `gather_copy_hit_chunks_profile`
 - `library/AdaptiveIMI/cpp_extensions/__init__.py`
   - Python extension export
 
@@ -94,7 +95,7 @@ gather_copy_and_scatter() current path
    -> sparse attention output
 
 5. cache promotion for future tokens
-   miss descriptors + list KV source
+   miss descriptors + execution_buffer
    -> GPU cache KV + GPU hash table
    runs on promotion CUDA stream
 ```
@@ -138,21 +139,23 @@ valid_lengths
 
 这点不能删。否则 `gather_copy_and_concat` 会用错误的最后 descriptor 推导 miss/hit 总长度，导致 execution buffer 拼接错位。
 
-### 2. Promotion 不再读取 execution_buffer
+### 2. Promotion 当前读取 execution_buffer
 
-早期错误方向是 attention 后从 `execution_buffer` promotion 到 cache。问题是：
-
-- `execution_buffer` 是跨 layer/step 复用的临时 buffer。
-- 如果 promotion stream 还在读，下一层/下一步可能覆盖它。
-- 为了避免竞态，必须等 promotion 完成，最终把等待算进当前或后续 token latency。
-
-当前实现新增：
+当前实现会在 attention 后从 `execution_buffer` promotion 到 cache：
 
 ```text
-promote_cache_pages_from_list()
+promote_hot_cold_cache_pages_from_execution()
 ```
 
-promotion 从 `list_keys/list_values` 的 miss source 直接写 GPU cache，不再读 `execution_buffer`。这样 execution_buffer 生命周期和 promotion 解耦。
+这避免了第二次从 CPU pinned `list_keys/list_values` 读取相同 miss pages，但也让 `execution_buffer`
+生命周期和 promotion stream 绑定。当前代码用 execution-buffer ring event 避免覆盖仍在被
+promotion 读取的 slot；如果 ring slot 都忙，会退回到 fallback buffer 并跳过本轮 cache admission。
+
+需要继续关注的问题：
+
+- retrieval 会读取同一套 GPU cache hash/queue metadata。
+- promotion 在后台 stream 更新这些 metadata。
+- 目前还没有 committed metadata view 或版本隔离。
 
 ### 3. GPU cache hit 已经生效
 
