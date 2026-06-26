@@ -9,8 +9,7 @@
         "partition_path": "outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/llama3_partition.json",
         "hybrid_index": {
             "policy": "gpu_only",
-            "start": "gpu",
-            "max_gpu_raw_slots": 4
+            "start": "gpu"
         },
         "cache": {
             "execution_buffer_ring_size": 2,

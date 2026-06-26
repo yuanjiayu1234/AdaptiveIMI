@@ -139,7 +139,7 @@ class HuggingFaceModel:
         device,
         synthetic_len,
         budget_ratio=None,
-        subspace_parts=2,
+        subspace_parts=None,
         imi_engine=None,
         partition_path=None,
         decode_search_mode=None,
@@ -225,7 +225,7 @@ def get_llm(
     synthetic_len,
     budget_ratio=None,
     model_path=None,
-    subspace_parts=2,
+    subspace_parts=None,
     imi_engine=None,
     partition_path=None,
     decode_search_mode=None,
@@ -330,7 +330,7 @@ def get_pred(
     budget_ratio: float | None,
     synthetic_len: int,
     answer_prefix: str = "",
-    subspace_parts: int = 2,
+    subspace_parts: int | None = None,
     imi_engine: str | None = None,
     partition_path: str | None = None,
     decode_search_mode: str | None = None,
@@ -579,7 +579,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--synthetic_len", type=int, required=True)
     parser.add_argument("--budget_ratio", type=float, default=None, help="Retrieval budget override for AdaptiveIMI")
-    parser.add_argument("--subspace_parts", type=int, default=2, help="IMI subspace parts (0, 2 or 4)")
+    parser.add_argument("--subspace_parts", type=int, default=None, help="IMI subspace parts override")
     parser.add_argument("--imi_engine", type=str, default=None, choices=[None, "hybrid_8way_v2"])
     parser.add_argument("--partition_path", type=str, default=None, help="Learned partition JSON for AdaptiveIMI hybrid v2")
     parser.add_argument(

@@ -8,10 +8,8 @@
         "cache_ratio": 0.1,
         "partition_path": "outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/qwen3_partition.json",
         "hybrid_index": {
-            "policy": "alternate",
-            "start": "cpu",
-            "cpu_build_concurrency": 2,
-            "max_gpu_raw_slots": 1
+            "policy": "gpu_only",
+            "start": "gpu"
         },
         "cache": {
             "execution_buffer_ring_size": 2,
