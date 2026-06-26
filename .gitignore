@@ -434,3 +434,32 @@ experiments/imi_partition/gpucache_ratio/hit_rate_logs_prefetch_focus_long_outpu
 !asserts/*.png
 
 /experiments/data/
+
+# Small runtime files required for the cleaned RULER entrypoint.
+!/benchmark/
+!/benchmark/ruler/
+!/benchmark/ruler/**
+benchmark/ruler/**/__pycache__/
+benchmark/ruler/**/*.py[cod]
+benchmark/ruler/data/synthetic/json/*.json
+benchmark/ruler/ruler_eval_result/
+
+# Keep third-party vendored runtime assets narrow. Do not commit full
+# dependency checkouts here.
+third_party/*
+!third_party/weighted_flash_attention/
+!third_party/weighted_flash_attention/**
+third_party/weighted_flash_attention/**/__pycache__/
+third_party/weighted_flash_attention/**/*.py[cod]
+
+# Keep outputs ignored except the small learned partition needed by the
+# checked-in llama3 RULER config.
+!/outputs/
+/outputs/*
+!/outputs/train_data/
+/outputs/train_data/*
+!/outputs/train_data/partitions/
+/outputs/train_data/partitions/*
+!/outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/
+/outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/*
+!/outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/llama3_partition.json

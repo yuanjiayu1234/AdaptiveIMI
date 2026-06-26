@@ -72,6 +72,11 @@ MODEL_PATH_ALIASES = {
         "remote": "meta-llama/Llama-3.1-8B-Instruct",
         "config": "Llama-3.1-8B-Instruct.json",
     },
+    "llama3-8b": {
+        "local": os.path.join("models", "Llama-3.1-8B-Instruct"),
+        "remote": "meta-llama/Llama-3.1-8B-Instruct",
+        "config": "Llama-3.1-8B-Instruct.json",
+    },
     "meta-llama/llama-3.1-8b-instruct": {
         "local": os.path.join("models", "Llama-3.1-8B-Instruct"),
         "remote": "meta-llama/Llama-3.1-8B-Instruct",
@@ -311,7 +316,8 @@ def _clone_attn_config_section(section):
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=None, cache_ratio=None,
-    partition_path=None, hybrid_index=None
+    partition_path=None, hybrid_index=None,
+    subspace_parts=None, imi_engine=None, decode_search=None,
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     model_config_name = resolve_config_name(model_name)
@@ -348,6 +354,12 @@ def generate_config(
                 "policy": "alternate",
                 "start": "cpu",
             }
+        if subspace_parts is not None:
+            base_config["subspace_parts"] = int(subspace_parts)
+        if imi_engine is not None:
+            base_config["imi_engine"] = imi_engine
+        if decode_search is not None:
+            base_config["decode_search"] = decode_search
         if context_len <= 4096:
             base_config["buffer_cluster_num"] = 150
         _config["AdaptiveIMI"] = base_config
