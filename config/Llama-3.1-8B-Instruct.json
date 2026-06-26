@@ -8,9 +8,8 @@
         "buffer_cluster_num": 32,
         "partition_path": "outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/llama3_partition.json",
         "hybrid_index": {
-            "policy": "alternate",
-            "start": "cpu",
-            "cpu_build_concurrency": 1,
+            "policy": "gpu_only",
+            "start": "gpu",
             "max_gpu_raw_slots": 4
         },
         "cache": {

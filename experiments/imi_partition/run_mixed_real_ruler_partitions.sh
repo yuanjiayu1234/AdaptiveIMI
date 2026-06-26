@@ -3,10 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-PYTHON="${PYTHON:-/data/yjy/miniconda3/envs/imi/bin/python}"
+PYTHON="${PYTHON:-python}"
 TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-outputs/train_data}"
 REAL_JSONL="${REAL_JSONL:-outputs/imi_partition/calib_booksum_nolima_babilong.jsonl}"
-RULER_ROOT="${RULER_ROOT:-/data/yjy/AdaptiveIMI-main/data/RULER}"
+RULER_ROOT="${RULER_ROOT:-data/RULER}"
 
 config_model_path() {
   local config_path="$1"

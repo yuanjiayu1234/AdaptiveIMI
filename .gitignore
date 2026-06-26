@@ -21,7 +21,6 @@
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 /throughput_eval/
-/benchmark/
 /build/
 /models/
 /data/
@@ -418,6 +417,7 @@ dist/
 library/cutlass
 library/Block-Sparse-Attention
 benchmark/longbench/results/
+benchmark/**/results/
 benchmark/ruler/data/synthetic/json/*.json
 benchmark/ruler/ruler_eval_result/
 benchmark/reasoning/outputs
@@ -435,12 +435,10 @@ experiments/imi_partition/gpucache_ratio/hit_rate_logs_prefetch_focus_long_outpu
 
 /experiments/data/
 
-# Small runtime files required for the cleaned RULER entrypoint.
-!/benchmark/
-!/benchmark/ruler/
-!/benchmark/ruler/**
-benchmark/ruler/**/__pycache__/
-benchmark/ruler/**/*.py[cod]
+# Benchmark source should be tracked; keep generated benchmark artifacts out.
+benchmark/**/__pycache__/
+benchmark/**/*.py[cod]
+benchmark/**/results/
 benchmark/ruler/data/synthetic/json/*.json
 benchmark/ruler/ruler_eval_result/
 
