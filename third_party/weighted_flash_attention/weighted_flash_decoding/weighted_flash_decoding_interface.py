@@ -1,4 +1,5 @@
 # Copyright (c) 2023, Tri Dao.
+# SPDX-License-Identifier: BSD-3-Clause
 
 from typing import Optional, Sequence, Tuple, Union
 

@@ -19,7 +19,7 @@ def parse_args(args=None):
     parser.add_argument('--model', type=str, default=None, 
                         choices=["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
     parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",
-                        choices=["Full_Flash_Attn", "Full_Flash_Attn_Offload", "AdaptiveIMI", "RetroInfer"],
+                        choices=["Full_Flash_Attn", "Full_Flash_Attn_Offload", "AdaptiveIMI", "ExternalBaseline"],
                         help="Attention method")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")

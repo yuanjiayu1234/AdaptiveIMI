@@ -22,8 +22,8 @@ class Hybrid8WayIMICache(HybridGpuPrefillMixin, HybridCpuPrefillMixin, HybridMet
     """Hybrid layer-level 8-way learned IMI cache.
 
     CPU and GPU layers share the same batch-aware metadata schema. GPU-only
-    prefill follows RetroInfer's bounded ordering: current-layer GPU metadata
-    build is synchronous, raw KV D2H is asynchronous until sync(), and CPU list
+    prefill uses bounded ordering: current-layer GPU metadata build is
+    synchronous, raw KV D2H is asynchronous until sync(), and CPU list
     organization is allowed to overlap only with the next layer.
     """
 

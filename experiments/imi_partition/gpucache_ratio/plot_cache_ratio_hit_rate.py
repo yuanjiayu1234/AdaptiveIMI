@@ -53,15 +53,15 @@ TASK_ORDER = [
 ]
 LINESTYLES = {
     "AdaptiveIMI": "-",
-    "RetroInfer": "--",
+    "ExternalBaseline": "--",
 }
 METHOD_LABELS = {
     "AdaptiveIMI": "AdaptiveIMI",
-    "RetroInfer": "RetroInfer",
+    "ExternalBaseline": "External Baseline",
 }
 METHOD_LEGEND_LABELS = {
     "AdaptiveIMI": "AdpIMI",
-    "RetroInfer": "Retro",
+    "ExternalBaseline": "Baseline",
 }
 HITRATE_RE = re.compile(r"\[IMI hitrate\] step=(\d+) total_hit_rate=([0-9.]+)")
 PREFETCH_LOG_RE = re.compile(
@@ -353,14 +353,14 @@ def _draw_method_key(ax):
     y0, y1 = 0.19, 0.12
     ax.plot([x0, x1], [y0, y0], transform=ax.transAxes, color=PALETTE["ink"], lw=2.4, linestyle=LINESTYLES["AdaptiveIMI"], clip_on=False)
     ax.text(x1 + 0.02, y0, METHOD_LABELS["AdaptiveIMI"], transform=ax.transAxes, fontsize=BASE_FONT_SIZE, color=PALETTE["ink"], va="center", ha="left")
-    ax.plot([x0, x1], [y1, y1], transform=ax.transAxes, color=PALETTE["ink"], lw=2.4, linestyle=LINESTYLES["RetroInfer"], clip_on=False)
-    ax.text(x1 + 0.02, y1, METHOD_LABELS["RetroInfer"], transform=ax.transAxes, fontsize=BASE_FONT_SIZE, color=PALETTE["ink"], va="center", ha="left")
+    ax.plot([x0, x1], [y1, y1], transform=ax.transAxes, color=PALETTE["ink"], lw=2.4, linestyle=LINESTYLES["ExternalBaseline"], clip_on=False)
+    ax.text(x1 + 0.02, y1, METHOD_LABELS["ExternalBaseline"], transform=ax.transAxes, fontsize=BASE_FONT_SIZE, color=PALETTE["ink"], va="center", ha="left")
 
 def _plot_cache_ratio_panel(ax, legend_ax, df, tasks, task_colors, args, panel_label: str | None = None, title_below: bool = False):
     for task_name in tasks:
         task_df = df[df["task_name"] == task_name]
         color = task_colors[task_name]
-        for attn_type in ["AdaptiveIMI", "RetroInfer"]:
+        for attn_type in ["AdaptiveIMI", "ExternalBaseline"]:
             sub_df = task_df[task_df["attn_type"] == attn_type].copy()
             if sub_df.empty:
                 continue
@@ -397,7 +397,7 @@ def _plot_cache_ratio_panel(ax, legend_ax, df, tasks, task_colors, args, panel_l
             linestyle=LINESTYLES[method],
             label=METHOD_LEGEND_LABELS[method],
         )
-        for method in ("AdaptiveIMI", "RetroInfer")
+        for method in ("AdaptiveIMI", "ExternalBaseline")
     ]
     legend = ax.legend(
         handles=dataset_handles + method_handles,
