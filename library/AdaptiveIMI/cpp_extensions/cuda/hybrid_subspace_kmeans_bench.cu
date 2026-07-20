@@ -9,6 +9,14 @@
 #include <limits>
 #include <vector>
 
+// Benchmark-only CUDA kernels for measuring learned subspace k-means variants.
+//
+// This file is intentionally not the production AdaptiveIMI index builder.
+// It stops after subspace k-means and returns centroids / labels / counts so
+// different subspace partition strategies and initialization choices can be
+// timed in isolation. The production GPU builder is hybrid_8way_builder.cu,
+// which additionally packs 8-way product codes, sorts tokens by cluster, builds
+// compact cluster metadata, and computes full-head centroids for decode.
 namespace imi_hybrid_bench {
 
 namespace {
@@ -653,6 +661,11 @@ std::vector<torch::Tensor> run_subspace_kmeans_only_cuda(
     int64_t max_k_arg,
     bool use_kmeanspp
 ) {
+    // Benchmark entry point: run only subspace k-means.
+    //
+    // Returned tensors are useful for timing and inspecting subspace partition
+    // quality, but they are not sufficient for AdaptiveIMI decode. Decode needs
+    // the compact cluster metadata produced by hybrid_8way_builder.cu.
     check_cuda(keys, "keys");
     check_cuda(row_token_counts, "row_token_counts");
     check_cuda(subspace_dim_ids, "subspace_dim_ids");

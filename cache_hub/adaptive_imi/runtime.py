@@ -5,6 +5,7 @@ import time
 import torch
 
 from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
+from .attention_backend import compact_decode_attention
 
 
 class AdaptiveIMIRuntimeMixin:
@@ -399,13 +400,10 @@ class AdaptiveIMIRuntimeMixin:
 
         return None, None
     def dense_attention(self, queries, layer_idx, static_len):
-        attn_out = weighted_flash_decoding(
+        attn_out = compact_decode_attention(
             queries.view(self.batch_groups, 1, self.group_size, self.head_dim),
             self.steady_zone_keys[layer_idx].view(self.batch_groups, -1, 1, self.head_dim),
             self.steady_zone_values[layer_idx].view(self.batch_groups, -1, 1, self.head_dim),
-            previous_out=None,
-            previous_lse=None,
-            cache_seqlens=static_len,
-            return_softmax_lse=False,
+            static_len,
         )
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)

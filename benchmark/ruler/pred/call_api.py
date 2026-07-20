@@ -137,6 +137,9 @@ class HuggingFaceModel:
         attn_type,
         dtype,
         device,
+        parallel_mode,
+        weight_loading,
+        gpu_memory_utilization,
         synthetic_len,
         budget_ratio=None,
         subspace_parts=None,
@@ -154,20 +157,29 @@ class HuggingFaceModel:
                 max_length=max_len+max_new_len,
                 dtype=dtype,
                 device_map=device,
-                model_path=load_path)
+                model_path=load_path,
+                parallel_mode=parallel_mode,
+                weight_loading=weight_loading,
+                gpu_memory_utilization=gpu_memory_utilization)
         elif 'qwen' in model_name.lower():
             llm = QwenModel(model_name,
                 max_length=max_len+max_new_len,
                 dtype=dtype,
                 device_map=device,
-                model_path=load_path)
+                model_path=load_path,
+                parallel_mode=parallel_mode,
+                weight_loading=weight_loading,
+                gpu_memory_utilization=gpu_memory_utilization)
         elif 'mistral' in model_name.lower():
             from model_hub import MistralModel
             llm = MistralModel(model_name,
                 max_length=max_len+max_new_len,
                 dtype=dtype,
                 device_map=device,
-                model_path=load_path)
+                model_path=load_path,
+                parallel_mode=parallel_mode,
+                weight_loading=weight_loading,
+                gpu_memory_utilization=gpu_memory_utilization)
         else:
             raise ValueError(f"Unsupported model: {model_name}")
 
@@ -223,6 +235,9 @@ def get_llm(
     dtype,
     device,
     synthetic_len,
+    parallel_mode="auto",
+    weight_loading="hf",
+    gpu_memory_utilization=0.90,
     budget_ratio=None,
     model_path=None,
     subspace_parts=None,
@@ -242,6 +257,9 @@ def get_llm(
             attn_type=attn_type,
             dtype=dtype,
             device=device,
+            parallel_mode=parallel_mode,
+            weight_loading=weight_loading,
+            gpu_memory_utilization=gpu_memory_utilization,
             budget_ratio=budget_ratio,
             synthetic_len=synthetic_len,
             subspace_parts=subspace_parts,
@@ -354,11 +372,12 @@ def get_pred(
 
     decode_search = None
     if decode_search_mode:
-        decode_search = {"mode": decode_search_mode}
-        if candidate_clusters is not None:
-            decode_search["candidate_clusters"] = int(candidate_clusters)
-        if token_rerank_budget_ratio is not None:
-            decode_search["token_rerank_budget_ratio"] = float(token_rerank_budget_ratio)
+        if decode_search_mode != "flat":
+            raise ValueError("Online subspace_rerank decode search is not implemented in this runtime")
+        if candidate_clusters is not None or token_rerank_budget_ratio is not None:
+            raise ValueError("candidate_clusters/token_rerank_budget_ratio are not used by flat decode search")
+    elif candidate_clusters is not None or token_rerank_budget_ratio is not None:
+        raise ValueError("candidate_clusters/token_rerank_budget_ratio require an implemented decode_search mode")
 
     attn_config = generate_config(
         model_name,
@@ -473,6 +492,9 @@ def main(args):
         args.attn_type,
         dtype,
         args.device,
+        parallel_mode=args.parallel_mode,
+        weight_loading=args.weight_loading,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         budget_ratio=args.budget_ratio,
         synthetic_len=args.synthetic_len,
         model_path=args.model_path,
@@ -568,6 +590,9 @@ if __name__ == '__main__':
     parser.add_argument("--max_len", type=int, default=128000)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--parallel_mode", "--parallel-mode", type=str, default="auto", choices=["auto", "single", "layer", "tp"])
+    parser.add_argument("--weight_loading", "--weight-loading", type=str, default="hf", choices=["hf", "auto", "accelerate_meta", "streaming_safetensors"])
+    parser.add_argument("--gpu_memory_utilization", "--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--dtype", type=str, default="fp16",choices=["fp16", "bf16"])
 
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -579,7 +604,12 @@ if __name__ == '__main__':
 
     parser.add_argument("--synthetic_len", type=int, required=True)
     parser.add_argument("--budget_ratio", type=float, default=None, help="Retrieval budget override for AdaptiveIMI")
-    parser.add_argument("--subspace_parts", type=int, default=None, help="IMI subspace parts override")
+    parser.add_argument(
+        "--subspace_parts",
+        type=int,
+        default=None,
+        help="Compatibility option; current AdaptiveIMI runtime supports only 8-way learned partitions.",
+    )
     parser.add_argument("--imi_engine", type=str, default=None, choices=[None, "hybrid_8way_v2"])
     parser.add_argument("--partition_path", type=str, default=None, help="Learned partition JSON for AdaptiveIMI hybrid v2")
     parser.add_argument(

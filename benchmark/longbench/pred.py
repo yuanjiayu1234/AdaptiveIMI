@@ -71,11 +71,19 @@ def parse_args(args=None):
     parser.add_argument("--max_len", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--retrieval_budget", type=float, default=0.1)
-    parser.add_argument("--cache_ratio", type=float, default=0.0)
-    parser.add_argument("--gpu_only", action="store_true")
-    parser.add_argument("--subspace_parts", type=int, default=8)
-    parser.add_argument("--imi_engine", type=str, default=None)
+    parser.add_argument("--parallel_mode", "--parallel-mode", type=str, default="auto", choices=["auto", "single", "layer", "tp"])
+    parser.add_argument("--weight_loading", "--weight-loading", type=str, default="hf", choices=["hf", "auto", "accelerate_meta", "streaming_safetensors"])
+    parser.add_argument("--gpu_memory_utilization", "--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--retrieval_budget", type=float, default=None)
+    parser.add_argument("--cache_ratio", type=float, default=None)
+    parser.add_argument("--gpu_only", action="store_true", help="Use GPU-only hybrid index build policy.")
+    parser.add_argument(
+        "--subspace_parts",
+        type=int,
+        default=None,
+        help="Compatibility option; current AdaptiveIMI runtime supports only 8-way learned partitions.",
+    )
+    parser.add_argument("--imi_engine", type=str, default=None, choices=[None, "hybrid_8way_v2"])
     parser.add_argument("--partition_path", type=str, default=None)
     parser.add_argument("--decode_search_mode", type=str, default=None, choices=["flat", "subspace_rerank"])
     parser.add_argument("--candidate_clusters", type=int, default=None)
@@ -125,15 +133,33 @@ def dtype_from_arg(dtype):
     return torch.float16 if dtype == "fp16" else torch.bfloat16
 
 
-def load_model(model_name, model_path, max_len, dtype, device):
+def load_model(model_name, model_path, max_len, dtype, device, parallel_mode="auto", weight_loading="hf", gpu_memory_utilization=0.90):
     from model_hub import LlamaModel, QwenModel
 
     model_path_lower = model_path.lower()
     model_name_lower = model_name.lower()
     if "llama" in model_path_lower or "llama" in model_name_lower:
-        llm = LlamaModel(model_name, max_length=max_len, dtype=dtype, device_map=device, model_path=model_path)
+        llm = LlamaModel(
+            model_name,
+            max_length=max_len,
+            dtype=dtype,
+            device_map=device,
+            model_path=model_path,
+            parallel_mode=parallel_mode,
+            weight_loading=weight_loading,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
     elif "qwen" in model_path_lower or "qwen" in model_name_lower:
-        llm = QwenModel(model_name, max_length=max_len, dtype=dtype, device_map=device, model_path=model_path)
+        llm = QwenModel(
+            model_name,
+            max_length=max_len,
+            dtype=dtype,
+            device_map=device,
+            model_path=model_path,
+            parallel_mode=parallel_mode,
+            weight_loading=weight_loading,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
     else:
         raise ValueError(f"Unsupported model: {model_path}")
 
@@ -194,13 +220,14 @@ def apply_chat_template(tokenizer, prompt):
 
 def build_decode_search_config(args):
     if not args.decode_search_mode:
+        if args.candidate_clusters is not None or args.token_rerank_budget_ratio is not None:
+            raise ValueError("candidate_clusters/token_rerank_budget_ratio require an implemented decode_search mode")
         return None
-    cfg = {"mode": args.decode_search_mode}
-    if args.candidate_clusters is not None:
-        cfg["candidate_clusters"] = int(args.candidate_clusters)
-    if args.token_rerank_budget_ratio is not None:
-        cfg["token_rerank_budget_ratio"] = float(args.token_rerank_budget_ratio)
-    return cfg
+    if args.decode_search_mode != "flat":
+        raise ValueError("Online subspace_rerank decode search is not implemented in this runtime")
+    if args.candidate_clusters is not None or args.token_rerank_budget_ratio is not None:
+        raise ValueError("candidate_clusters/token_rerank_budget_ratio are not used by flat decode search")
+    return None
 
 
 def middle_truncate(input_ids, attention_mask, max_input_tokens):
@@ -284,7 +311,16 @@ if __name__ == "__main__":
     args.model_path = model_path
     args.max_len = max_length
 
-    llm = load_model(config_model_name, model_path, max_length, dtype_from_arg(args.dtype), args.device)
+    llm = load_model(
+        config_model_name,
+        model_path,
+        max_length,
+        dtype_from_arg(args.dtype),
+        args.device,
+        parallel_mode=args.parallel_mode,
+        weight_loading=args.weight_loading,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
     datasets = resolve_tasks(args.task, args.e)
 
     pred_root = Path(args.output_dir) / ("pred_e" if args.e else "pred") / model_name / args.attn_type

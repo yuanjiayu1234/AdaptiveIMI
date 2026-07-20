@@ -56,18 +56,6 @@ RULER_USE_SOURCE_CACHE="${RULER_USE_SOURCE_CACHE:-1}"
 export RULER_DATA_ROOT="${RULER_DATA_ROOT:-${PROJECT_ROOT}/data/RULER}"
 
 export PYTHONPATH="$(dirname "${PROJECT_ROOT}"):${PROJECT_ROOT}:${PYTHONPATH:-}"
-WEIGHTED_FLASH_ATTENTION_ROOT="${WEIGHTED_FLASH_ATTENTION_ROOT:-${PROJECT_ROOT}/third_party/weighted_flash_attention}"
-if [[ -d "${WEIGHTED_FLASH_ATTENTION_ROOT}" ]]; then
-    WEIGHTED_FLASH_ATTENTION_BUILD=""
-    if [[ -d "${WEIGHTED_FLASH_ATTENTION_ROOT}/build" ]]; then
-        WEIGHTED_FLASH_ATTENTION_BUILD=$(find "${WEIGHTED_FLASH_ATTENTION_ROOT}/build" -maxdepth 1 -type d -name 'lib.*' 2>/dev/null | sort | tail -n 1)
-    fi
-    if [[ -n "${WEIGHTED_FLASH_ATTENTION_BUILD}" ]]; then
-        export PYTHONPATH="${WEIGHTED_FLASH_ATTENTION_BUILD}:${WEIGHTED_FLASH_ATTENTION_ROOT}:${PYTHONPATH}"
-    else
-        export PYTHONPATH="${WEIGHTED_FLASH_ATTENTION_ROOT}:${PYTHONPATH}"
-    fi
-fi
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${PROJECT_ROOT}/outputs/flashinfer}"
 mkdir -p "${FLASHINFER_WORKSPACE_BASE}"
 
@@ -169,6 +157,10 @@ if [[ "${RULER_RESUME}" != "1" ]]; then
 fi
 mkdir -p "${DATA_DIR}"
 mkdir -p "${PRED_DIR}"
+ADAPTIVEIMI_PARTITION_ARG=""
+if [[ -n "${ADAPTIVEIMI_PARTITION_PATH:-}" ]]; then
+    ADAPTIVEIMI_PARTITION_ARG="--partition_path ${ADAPTIVEIMI_PARTITION_PATH}"
+fi
 
 REQUESTED_TASK=${TASK_ARG}
 if [ "${REQUESTED_TASK}" = "all" ]; then
@@ -281,7 +273,8 @@ for TASK in "${TASK_LIST[@]}"; do
         --dtype "${DTYPE}" \
         --server_type "${MODEL_FRAMEWORK}" \
         --device "${DEVICE}" \
-        --synthetic_len "${MAX_SEQ_LENGTH}"
+        --synthetic_len "${MAX_SEQ_LENGTH}" \
+        ${ADAPTIVEIMI_PARTITION_ARG:-}
 done
 
 python -u "${SCRIPT_DIR}/eval/evaluate.py" \

@@ -11,6 +11,7 @@ from termcolor import colored
 
 from config import resolve_config_name
 
+from .device_plan import DevicePlan, build_device_plan
 from .prefill import PrefillMixin
 from .sampling import SamplingMixin
 
@@ -21,7 +22,10 @@ class LLM(PrefillMixin, SamplingMixin):
         model_name: str,
         max_length: int,
         dtype: torch.dtype,
-        device_map: str
+        device_map: str,
+        parallel_mode: str = "auto",
+        weight_loading: str = "hf",
+        gpu_memory_utilization: float = 0.90,
     ) -> None:
         """ Initializes the LLM.
         Args:
@@ -34,6 +38,11 @@ class LLM(PrefillMixin, SamplingMixin):
         self.max_length = max_length
         self.dtype = dtype
         self.device_map = device_map
+        self.parallel_mode = parallel_mode
+        self.weight_loading = weight_loading
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.device_plan: DevicePlan | None = None
+        self.device_list = []
         self.prefill_chunk_size = 65536
         self.prefill_attn_chunk_size = self.prefill_chunk_size
         self.streaming_hidden_device = "auto"
@@ -103,20 +112,47 @@ class LLM(PrefillMixin, SamplingMixin):
         self.vocab_size = self.config.vocab_size
 
     def _configure_devices(self) -> str:
-        self.num_gpus = torch.cuda.device_count() if self.device_map == 'auto' else 1
-        if self.device_map == 'auto' and self.num_gpus == 1:
-            self.device_map = 'cuda:0'
+        if self.device_plan is not None:
+            return self.device_plan.root_device
 
-        if self.device_map != 'auto':
-            self.layer_mapping = {str(layer_idx): self.device_map for layer_idx in range(self.num_layers)}
-            return self.device_map
+        self.device_plan = build_device_plan(
+            config=self.config,
+            dtype=self.dtype,
+            requested_device=self.device_map,
+            parallel_mode=self.parallel_mode,
+            weight_loading=self.weight_loading,
+            gpu_memory_utilization=self.gpu_memory_utilization,
+        )
+        self.layer_mapping = dict(self.device_plan.layer_to_device)
+        self.device_list = list(self.device_plan.visible_devices)
+        self.num_gpus = len(self.device_list)
+        if self.device_map == "auto" and self.num_gpus == 1:
+            self.device_map = self.device_plan.root_device
+        if os.getenv("IMI_LOG_DEVICE_PLAN", "1") == "1":
+            self.device_plan.log_summary()
+        return self.device_plan.root_device
 
-        self.gpu_ids = list(range(self.num_gpus))
-        self.layer_interval = (self.num_layers + self.num_gpus - 1) // self.num_gpus
-        self.layer_mapping = {
-            str(layer_idx): f'cuda:{layer_idx // self.layer_interval}' for layer_idx in range(self.num_layers)
+    def _should_use_streaming_weight_loader(self) -> bool:
+        if self.weight_loading == "streaming_safetensors":
+            return True
+        if self.weight_loading in ("hf", "accelerate_meta"):
+            return False
+        if self.weight_loading != "auto":
+            raise ValueError(f"Unsupported weight_loading={self.weight_loading!r}")
+        return self.device_map == "auto" and torch.cuda.device_count() > 1
+
+    def _hf_device_map(self) -> dict[str, str] | None:
+        if self.weight_loading != "accelerate_meta":
+            return None
+        device_map = {
+            "model.embed_tokens": self.device_plan.root_device,
+            "model.norm": self.device_plan.root_device,
+            "lm_head": self.device_plan.root_device,
+            "model.rotary_emb": self.device_plan.root_device,
         }
-        return f'cuda:{self.gpu_ids[0]}'
+        for layer_idx in range(self.num_layers):
+            device_map[f"model.layers.{layer_idx}"] = self.layer_mapping[str(layer_idx)]
+        return device_map
 
     def _initialize_shared_runtime_tensors(self, hf_model, root_device: str) -> None:
         embed_weight = hf_model.model.embed_tokens.weight.detach()
@@ -136,6 +172,59 @@ class LLM(PrefillMixin, SamplingMixin):
         self.attention_scaling = hf_model.model.rotary_emb.attention_scaling
         self.cos_cache, self.sin_cache = self._set_cos_sin_cache()
         self.cos_sin_cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1)
+        self._prepare_runtime_tensors_for_devices(root_device)
+
+    def _initialize_shared_runtime_tensors_from_weights(
+        self,
+        *,
+        embed_weight: torch.Tensor,
+        lm_head_weight: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        norm_variance_epsilon: float,
+        inv_freq: torch.Tensor,
+        attention_scaling: float,
+        root_device: str,
+    ) -> None:
+        self.embed_tokens = embed_weight.to(root_device, dtype=self.dtype, non_blocking=True).contiguous()
+        if lm_head_weight is None:
+            self.lm_head = self.embed_tokens
+        else:
+            self.lm_head = lm_head_weight.to(root_device, dtype=self.dtype, non_blocking=True).contiguous()
+        self.norm_weight = norm_weight.to(root_device, dtype=self.dtype, non_blocking=True).contiguous()
+        self.norm_variance_epsilon = norm_variance_epsilon
+        self.position_ids = torch.arange(0, self.max_length, device=root_device)
+        self.inv_freq = inv_freq.to(root_device, non_blocking=True).contiguous()
+        self.attention_scaling = attention_scaling
+        self.cos_cache, self.sin_cache = self._set_cos_sin_cache()
+        self.cos_sin_cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1).contiguous()
+        self._prepare_runtime_tensors_for_devices(root_device)
+
+    def _prepare_runtime_tensors_for_devices(self, root_device: str) -> None:
+        devices = list(getattr(self, "device_list", None) or sorted(set(self.layer_mapping.values())))
+        self.position_ids_by_device = {}
+        self.cos_sin_cache_by_device = {}
+        for device in devices:
+            if str(device) == str(root_device):
+                self.position_ids_by_device[device] = self.position_ids
+                self.cos_sin_cache_by_device[device] = self.cos_sin_cache
+            else:
+                self.position_ids_by_device[device] = self.position_ids.to(device, non_blocking=True)
+                self.cos_sin_cache_by_device[device] = self.cos_sin_cache.to(device, non_blocking=True)
+        self._activate_device_runtime_tensors(root_device)
+
+    def _activate_device_runtime_tensors(self, device: str) -> None:
+        self.position_ids = self.position_ids_by_device[device]
+        self.cos_sin_cache = self.cos_sin_cache_by_device[device]
+
+    def _assert_layer_device(self, layer_idx: int, *tensors: torch.Tensor) -> None:
+        if os.getenv("IMI_ASSERT_DEVICE", "0") != "1":
+            return
+        expected = torch.device(self.layer_mapping[str(layer_idx)])
+        for tensor in tensors:
+            if tensor is not None and torch.device(tensor.device) != expected:
+                raise RuntimeError(
+                    f"Layer {layer_idx} tensor is on {tensor.device}, expected {expected}"
+                )
 
     def _initialize_layers(self, hf_layers, layer_cls) -> None:
         self.layers = []
@@ -215,7 +304,11 @@ class LLM(PrefillMixin, SamplingMixin):
         if imi_config is None:
             raise ValueError("AdaptiveIMI config is missing for this model.")
 
-        if not imi_config.get("partition_path"):
+        partition_layout = str(imi_config.get("partition_layout", "")).lower()
+        if not imi_config.get("partition_path") and partition_layout not in (
+            "sequential_rope_pairs",
+            "sequential",
+        ):
             raise ValueError("AdaptiveIMI requires partition_path.")
 
         from cache_hub.adaptive_imi.cache import Hybrid8WayIMICache as imi_cache_cls
@@ -465,6 +558,8 @@ class LLM(PrefillMixin, SamplingMixin):
         bsz, seq_len, dim = hidden_states.shape
         # assert seq_len == 1, f"Error: seq_len should be 1 for decoding, but got {seq_len}."
         layer = self.layers[layer_idx]
+        self._activate_device_runtime_tensors(layer.device)
+        self._assert_layer_device(layer_idx, hidden_states)
 
         hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
         

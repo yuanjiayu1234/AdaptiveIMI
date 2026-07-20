@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/Optional.h>
+#include <limits>
 
 namespace imi_decode {
 
@@ -54,6 +55,14 @@ torch::Tensor fused_query_group_similarities(
     TORCH_CHECK(query_grouped.dim() == 3, "query_grouped must be 3D");
     TORCH_CHECK(centroids.dim() == 3, "centroids must be 3D");
     TORCH_CHECK(centroids.scalar_type() == torch::kFloat32, "centroids must be FP32");
+    TORCH_CHECK(query_grouped.is_contiguous(), "query_grouped must be contiguous");
+    TORCH_CHECK(centroids.is_contiguous(), "centroids must be contiguous");
+
+    constexpr int64_t int_max = static_cast<int64_t>(std::numeric_limits<int>::max());
+    TORCH_CHECK(query_grouped.size(0) <= int_max, "query_grouped kv_heads exceeds int range");
+    TORCH_CHECK(query_grouped.size(1) <= int_max, "query_grouped groups exceeds int range");
+    TORCH_CHECK(query_grouped.size(2) <= int_max, "query_grouped dim exceeds int range");
+    TORCH_CHECK(centroids.size(1) <= int_max, "centroids n_clusters exceeds int range");
 
     const int kv_heads = static_cast<int>(query_grouped.size(0));
     const int groups = static_cast<int>(query_grouped.size(1));

@@ -316,8 +316,9 @@ def _clone_attn_config_section(section):
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=None, cache_ratio=None,
-    partition_path=None, hybrid_index=None,
+    partition_path=None, hybrid_index=None, gpu_only=False,
     subspace_parts=None, imi_engine=None, decode_search=None,
+    prefill_chunk_size=None,
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     model_config_name = resolve_config_name(model_name)
@@ -330,11 +331,16 @@ def generate_config(
         config_partition_path = base_config.get("partition_path")
         if partition_path is None:
             partition_path = config_partition_path
+        if isinstance(partition_path, str) and partition_path.strip().lower() in (
+            "",
+            "none",
+            "null",
+            "sequential",
+            "sequential_rope_pairs",
+        ):
+            partition_path = None
         if partition_path and not os.path.isabs(str(partition_path)):
             partition_path = os.path.join(PROJECT_ROOT, str(partition_path))
-
-        if not partition_path:
-            raise ValueError("AdaptiveIMI requires partition_path")
 
         if retrieval_budget is None:
             retrieval_budget = base_config.get("retrieval_budget", 0.018)
@@ -347,6 +353,14 @@ def generate_config(
         base_config["cache_ratio"] = cache_ratio
         if partition_path:
             base_config["partition_path"] = partition_path
+        else:
+            base_config["partition_path"] = None
+            base_config["partition_layout"] = "sequential_rope_pairs"
+        if gpu_only:
+            if hybrid_index is not None and str(hybrid_index.get("policy", "")).lower() != "gpu_only":
+                raise ValueError("gpu_only=True conflicts with an explicit non-gpu_only hybrid_index policy")
+            hybrid_index = {"policy": "gpu_only", "start": "gpu"}
+
         if hybrid_index is not None:
             base_config["hybrid_index"] = hybrid_index
         elif "hybrid_index" not in base_config:
@@ -355,11 +369,28 @@ def generate_config(
                 "start": "cpu",
             }
         if subspace_parts is not None:
-            base_config["subspace_parts"] = int(subspace_parts)
+            if int(subspace_parts) != 8:
+                raise ValueError(
+                    "AdaptiveIMI currently supports only hybrid_8way_v2 learned partitions (subspace_parts=8)"
+                )
         if imi_engine is not None:
-            base_config["imi_engine"] = imi_engine
+            if str(imi_engine) != "hybrid_8way_v2":
+                raise ValueError("AdaptiveIMI currently supports only imi_engine='hybrid_8way_v2'")
         if decode_search is not None:
-            base_config["decode_search"] = decode_search
+            mode = str(decode_search.get("mode", "flat")).lower() if isinstance(decode_search, dict) else str(decode_search).lower()
+            extra_keys = set(decode_search.keys()) - {"mode"} if isinstance(decode_search, dict) else set()
+            if mode != "flat" or extra_keys:
+                raise ValueError(
+                    "Online decode_search rerank is not implemented in the current AdaptiveIMI runtime; "
+                    "use the default flat decode path."
+                )
+        if prefill_chunk_size is not None:
+            prefill_chunk_size = int(prefill_chunk_size)
+            if prefill_chunk_size <= 0:
+                raise ValueError("prefill_chunk_size must be positive")
+            prefill_cfg = dict(base_config.get("prefill") or {})
+            prefill_cfg["prefill_chunk_size"] = prefill_chunk_size
+            base_config["prefill"] = prefill_cfg
         if context_len <= 4096:
             base_config["buffer_cluster_num"] = 150
         _config["AdaptiveIMI"] = base_config

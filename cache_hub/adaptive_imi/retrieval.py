@@ -3,8 +3,6 @@ from typing import Optional
 import os
 import torch
 
-from weighted_flash_decoding import weighted_flash_decoding
-
 from library.AdaptiveIMI.imi_adapter import get_imi_kernels
 from library.AdaptiveIMI.cpp_extensions import (
     build_cache_aware_retrieval_plan,
@@ -14,6 +12,7 @@ from library.AdaptiveIMI.cpp_extensions import (
     gather_copy_static_chunks_profile,
     promote_hot_cold_cache_pages_from_execution,
 )
+from .attention_backend import compact_decode_attention
 
 imi_gpu_kernels = get_imi_kernels()
 
@@ -762,14 +761,11 @@ class AdaptiveIMIRetrievalMixin:
         if profile:
             attn_start_event = self._record_timing_event()
 
-        acc_out = weighted_flash_decoding(
+        acc_out = compact_decode_attention(
             query_view,
             execution_keys,
             execution_values,
-            previous_out=None,
-            previous_lse=None,
-            cache_seqlens=self.valid_lengths_dict[device],
-            return_softmax_lse=False,
+            self.valid_lengths_dict[device],
         )
 
         if profile:

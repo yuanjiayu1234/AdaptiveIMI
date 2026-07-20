@@ -24,8 +24,11 @@
 /build/
 /models/
 /data/
-/ruler_eval_result/
+/docs/
+/ruler_eval_result*/
 /longbench_eval_result/
+/vllm/
+/nano-vllm/
 # Mono auto generated files
 mono_crash.*
 

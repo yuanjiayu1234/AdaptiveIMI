@@ -1,8 +1,10 @@
 import torch
 import torch.nn.functional as F
 import flashinfer
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
 from .base import LLM
+from .weight_loader import SafetensorsWeightSource, cat_tensors_to_device, tensor_to_device
 from attn_hub import full_decode_attn, imi_decode_attn, \
                      full_prefill_attn, full_decode_attn_offload
 
@@ -36,6 +38,34 @@ class LlamaLayer:
 
         del self.wq, self.wk, self.wv, self.gate_proj, self.up_proj
 
+    def init_layer_from_tensors(self, tensors: dict[str, torch.Tensor], dtype: torch.dtype):
+        self.wqkv = cat_tensors_to_device(
+            [tensors["q_proj.weight"], tensors["k_proj.weight"], tensors["v_proj.weight"]],
+            dim=0,
+            device=self.device,
+            dtype=dtype,
+        )
+        self.wo = tensor_to_device(tensors["o_proj.weight"], device=self.device, dtype=dtype)
+        self.gate_up_proj = cat_tensors_to_device(
+            [tensors["gate_proj.weight"], tensors["up_proj.weight"]],
+            dim=0,
+            device=self.device,
+            dtype=dtype,
+        )
+        self.down_proj = tensor_to_device(tensors["down_proj.weight"], device=self.device, dtype=dtype)
+        self.input_layernorm_weight = tensor_to_device(
+            tensors["input_layernorm.weight"],
+            device=self.device,
+            dtype=dtype,
+        )
+        self.input_layernorm_variance_epsilon = tensors["input_layernorm.eps"]
+        self.post_attention_layernorm_weight = tensor_to_device(
+            tensors["post_attention_layernorm.weight"],
+            device=self.device,
+            dtype=dtype,
+        )
+        self.post_attention_layernorm_variance_epsilon = tensors["post_attention_layernorm.eps"]
+
 
 class LlamaModel(LLM):
     """
@@ -52,9 +82,20 @@ class LlamaModel(LLM):
         dtype: torch.dtype,
         device_map: str,
         tokenizer: AutoTokenizer = None,
-        model_path: str = None
+        model_path: str = None,
+        parallel_mode: str = "auto",
+        weight_loading: str = "hf",
+        gpu_memory_utilization: float = 0.90,
     ) -> None:
-        super().__init__(model_name, max_length, dtype, device_map)
+        super().__init__(
+            model_name,
+            max_length,
+            dtype,
+            device_map,
+            parallel_mode=parallel_mode,
+            weight_loading=weight_loading,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
         self.model_path = self._resolve_model_path(model_path if model_path else model_name)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path) if tokenizer is None else tokenizer
@@ -71,10 +112,71 @@ class LlamaModel(LLM):
 
 
     def init_model(self):
-        hf_llama = LlamaForCausalLM.from_pretrained(self.model_path, torch_dtype=self.dtype)
         root_device = self._configure_devices()
+        if self._should_use_streaming_weight_loader():
+            self._init_model_from_safetensors(root_device)
+            return
+        model_kwargs = {"torch_dtype": self.dtype}
+        hf_device_map = self._hf_device_map()
+        if hf_device_map is not None:
+            model_kwargs.update(device_map=hf_device_map, low_cpu_mem_usage=True)
+        hf_llama = LlamaForCausalLM.from_pretrained(self.model_path, **model_kwargs)
         self._initialize_shared_runtime_tensors(hf_llama, root_device)
         self._initialize_layers(hf_llama.model.layers, LlamaLayer)
+        self._finalize_model_init()
+
+    def _init_model_from_safetensors(self, root_device: str):
+        source = SafetensorsWeightSource(self.model_path)
+        base = f"model.layers"
+        rope_scaling = getattr(self.config, "rope_scaling", None)
+        rope_type = "default"
+        if isinstance(rope_scaling, dict):
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+        inv_freq, attention_scaling = rope_init_fn(self.config, device="cpu")
+        shared = source.get_tensors(["model.embed_tokens.weight", "model.norm.weight"])
+        self._initialize_shared_runtime_tensors_from_weights(
+            embed_weight=shared["model.embed_tokens.weight"],
+            lm_head_weight=source.get_optional_tensor("lm_head.weight"),
+            norm_weight=shared["model.norm.weight"],
+            norm_variance_epsilon=float(getattr(self.config, "rms_norm_eps", 1e-6)),
+            inv_freq=inv_freq,
+            attention_scaling=attention_scaling,
+            root_device=root_device,
+        )
+        self.layers = []
+        for layer_idx in range(self.num_layers):
+            prefix = f"{base}.{layer_idx}"
+            names = [
+                f"{prefix}.self_attn.q_proj.weight",
+                f"{prefix}.self_attn.k_proj.weight",
+                f"{prefix}.self_attn.v_proj.weight",
+                f"{prefix}.self_attn.o_proj.weight",
+                f"{prefix}.mlp.gate_proj.weight",
+                f"{prefix}.mlp.up_proj.weight",
+                f"{prefix}.mlp.down_proj.weight",
+                f"{prefix}.input_layernorm.weight",
+                f"{prefix}.post_attention_layernorm.weight",
+            ]
+            tensors = source.get_tensors(names)
+            layer = LlamaLayer(layer_idx, device=self.layer_mapping[str(layer_idx)])
+            layer.init_layer_from_tensors(
+                {
+                    "q_proj.weight": tensors[f"{prefix}.self_attn.q_proj.weight"],
+                    "k_proj.weight": tensors[f"{prefix}.self_attn.k_proj.weight"],
+                    "v_proj.weight": tensors[f"{prefix}.self_attn.v_proj.weight"],
+                    "o_proj.weight": tensors[f"{prefix}.self_attn.o_proj.weight"],
+                    "gate_proj.weight": tensors[f"{prefix}.mlp.gate_proj.weight"],
+                    "up_proj.weight": tensors[f"{prefix}.mlp.up_proj.weight"],
+                    "down_proj.weight": tensors[f"{prefix}.mlp.down_proj.weight"],
+                    "input_layernorm.weight": tensors[f"{prefix}.input_layernorm.weight"],
+                    "input_layernorm.eps": float(getattr(self.config, "rms_norm_eps", 1e-6)),
+                    "post_attention_layernorm.weight": tensors[f"{prefix}.post_attention_layernorm.weight"],
+                    "post_attention_layernorm.eps": float(getattr(self.config, "rms_norm_eps", 1e-6)),
+                },
+                self.dtype,
+            )
+            self.layers.append(layer)
         self._finalize_model_init()
 
 
@@ -136,9 +238,8 @@ class LlamaModel(LLM):
     def parameter_move(self, hidden_states, ldx):
         next_device = self.layer_mapping[str(ldx+1)] if str(ldx+1) in self.layer_mapping else self.layer_mapping[str(0)]
         torch.cuda.set_device(next_device)
-        hidden_states = hidden_states.to(next_device)
-        self.position_ids = self.position_ids.to(next_device)
-        self.cos_sin_cache = self.cos_sin_cache.to(next_device)
+        hidden_states = hidden_states.to(next_device, non_blocking=True)
+        self._activate_device_runtime_tensors(next_device)
         if self.attention_type in ('Full_Flash_Attn', 'Full_Flash_Attn_Offload'):
             if hidden_states.shape[1] == 1:
                 self.kv_cache.batch_indices = self.kv_cache.batch_indices_dict[next_device]

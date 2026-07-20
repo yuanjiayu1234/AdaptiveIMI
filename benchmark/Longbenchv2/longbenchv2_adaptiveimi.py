@@ -19,10 +19,10 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import generate_config  # noqa: E402
+from config import generate_config, resolve_model_path  # noqa: E402
 
 
-DEFAULT_DATA_PATH = "/root/LongBench/data.json"
+DEFAULT_DATA_PATH = "/home/yjy/LongBench/data.json"
 DEFAULT_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_OUT_PATH = PROJECT_ROOT / "benchmark" / "Longbenchv2" / "results" / "llama3_adaptiveimi.jsonl"
 HF_CACHE_ROOT = Path(os.getenv("HF_HOME", "/root/.cache/huggingface")) / "hub"
@@ -54,6 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=-1)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--parallel_mode", "--parallel-mode", type=str, default="auto", choices=("auto", "single", "layer", "tp"))
+    parser.add_argument("--weight_loading", "--weight-loading", type=str, default="hf", choices=("hf", "auto", "accelerate_meta", "streaming_safetensors"))
+    parser.add_argument("--gpu_memory_utilization", "--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--dtype", type=str, default="bf16", choices=("fp16", "bf16"))
     parser.add_argument(
         "--attn_type",
@@ -61,11 +64,16 @@ def parse_args() -> argparse.Namespace:
         default="AdaptiveIMI",
         choices=("AdaptiveIMI", "Full_Flash_Attn", "Full_Flash_Attn_Offload"),
     )
-    parser.add_argument("--retrieval_budget", type=float, default=0.018)
-    parser.add_argument("--cache_ratio", type=float, default=0.0)
-    parser.add_argument("--gpu_only", action="store_true")
-    parser.add_argument("--subspace_parts", type=int, default=2)
-    parser.add_argument("--imi_engine", type=str, default=None)
+    parser.add_argument("--retrieval_budget", type=float, default=None)
+    parser.add_argument("--cache_ratio", type=float, default=None)
+    parser.add_argument("--gpu_only", action="store_true", help="Use GPU-only hybrid index build policy.")
+    parser.add_argument(
+        "--subspace_parts",
+        type=int,
+        default=None,
+        help="Compatibility option; current AdaptiveIMI runtime supports only 8-way learned partitions.",
+    )
+    parser.add_argument("--imi_engine", type=str, default=None, choices=(None, "hybrid_8way_v2"))
     parser.add_argument("--partition_path", type=str, default=os.getenv("IMI_PARTITION_PATH"))
     parser.add_argument("--hybrid_policy", type=str, default=None)
     parser.add_argument("--hybrid_start", type=str, default="cpu")
@@ -74,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate_clusters", type=int, default=None)
     parser.add_argument("--token_rerank_budget_ratio", type=float, default=None)
     parser.add_argument("--prefill_bsz", type=int, default=1)
+    parser.add_argument("--prefill_chunk_size", "--prefill-chunk-size", type=int, default=None)
     parser.add_argument("--chat_template", action="store_true", default=True)
     parser.add_argument("--no_chat_template", action="store_false", dest="chat_template")
     parser.add_argument("--enable_thinking", action="store_true")
@@ -207,13 +216,20 @@ def cleanup_after_sample(llm: Any) -> None:
 
 
 def resolve_local_hf_snapshot(model_name: str) -> str:
+    resolved = resolve_model_path(model_name)
+    if resolved and os.path.exists(resolved):
+        return resolved
     if os.path.exists(model_name) or "/" not in model_name:
         return model_name
 
     org, repo = model_name.split("/", 1)
     cache_dir = HF_CACHE_ROOT / f"models--{org}--{repo}"
     snapshots_dir = cache_dir / "snapshots"
-    if not snapshots_dir.is_dir():
+    try:
+        snapshots_dir_exists = snapshots_dir.is_dir()
+    except PermissionError:
+        return model_name
+    if not snapshots_dir_exists:
         return model_name
 
     snapshots = [path for path in snapshots_dir.iterdir() if path.is_dir()]
@@ -224,6 +240,10 @@ def resolve_local_hf_snapshot(model_name: str) -> str:
 
 
 def build_hybrid_index_config(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.gpu_only:
+        if args.hybrid_policy and args.hybrid_policy != "gpu_only":
+            raise ValueError("--gpu_only conflicts with --hybrid_policy")
+        return {"policy": "gpu_only", "start": "gpu"}
     if not args.hybrid_policy and args.hybrid_gpu_every <= 0:
         return None
     cfg: dict[str, Any] = {
@@ -237,13 +257,14 @@ def build_hybrid_index_config(args: argparse.Namespace) -> dict[str, Any] | None
 
 def build_decode_search_config(args: argparse.Namespace) -> dict[str, Any] | None:
     if not args.decode_search_mode:
+        if args.candidate_clusters is not None or args.token_rerank_budget_ratio is not None:
+            raise ValueError("candidate_clusters/token_rerank_budget_ratio require an implemented decode_search mode")
         return None
-    cfg: dict[str, Any] = {"mode": args.decode_search_mode}
-    if args.candidate_clusters is not None:
-        cfg["candidate_clusters"] = int(args.candidate_clusters)
-    if args.token_rerank_budget_ratio is not None:
-        cfg["token_rerank_budget_ratio"] = float(args.token_rerank_budget_ratio)
-    return cfg
+    if args.decode_search_mode != "flat":
+        raise ValueError("Online subspace_rerank decode search is not implemented in this runtime")
+    if args.candidate_clusters is not None or args.token_rerank_budget_ratio is not None:
+        raise ValueError("candidate_clusters/token_rerank_budget_ratio are not used by flat decode search")
+    return None
 
 
 def main() -> None:
@@ -256,7 +277,16 @@ def main() -> None:
     config_model_name = args.config_model_name or args.model_name
     model_name_or_path = resolve_local_hf_snapshot(args.model_name)
     tokenizer = load_tokenizer(model_name_or_path)
-    llm = load_model(model_name_or_path, args.max_model_len, dtype, args.device, tokenizer)
+    llm = load_model(
+        model_name_or_path,
+        args.max_model_len,
+        dtype,
+        args.device,
+        tokenizer,
+        parallel_mode=args.parallel_mode,
+        weight_loading=args.weight_loading,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
 
     data = load_data(args.data_path)[args.start :]
     if args.max_samples > 0:
@@ -300,6 +330,7 @@ def main() -> None:
                     partition_path=args.partition_path,
                     hybrid_index=build_hybrid_index_config(args),
                     decode_search=build_decode_search_config(args),
+                    prefill_chunk_size=args.prefill_chunk_size,
                 )
 
                 output_ids = llm.generate(

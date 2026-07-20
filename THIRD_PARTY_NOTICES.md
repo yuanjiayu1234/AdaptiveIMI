@@ -15,15 +15,6 @@ code only. Third-party components remain under their own licenses.
   adapt benchmark configuration, data paths, prediction, and evaluation flow
   for AdaptiveIMI experiments.
 
-### FlashAttention / weighted flash attention wrapper
-
-- Paths: `third_party/weighted_flash_attention/**`
-- License: BSD 3-Clause
-- License text: `licenses/BSD-3-Clause-FlashAttention.txt`
-- Notes: this directory contains a Python wrapper and a compiled extension used
-  by sparse decoding. Prefer rebuilding the extension from source for public
-  releases instead of distributing generated binaries.
-
 ## Runtime or Build Dependencies
 
 ### FlashInfer

@@ -32,7 +32,6 @@ LayerPipeline::LayerPipeline(
     int dim,
     int device_id,
     torch::Dtype kv_dtype,
-    void* cache_manager_ptr,
     bool enable_direct_write,
     int subspace_parts,
     LayerPipelineRuntimeConfig runtime_config
@@ -42,7 +41,6 @@ LayerPipeline::LayerPipeline(
     dim_(dim),
     kv_dtype_(kv_dtype),
     device_id_(device_id),
-    cache_manager_ptr_(cache_manager_ptr),
     enable_direct_write_(enable_direct_write),
     subspace_parts_(subspace_parts),
     runtime_config_(runtime_config)
@@ -201,35 +199,38 @@ int determine_worker_threads(const LayerPipelineRuntimeConfig& runtime_config) {
 std::vector<int32_t> calculate_learned_k_values(int seq_len, int target_cluster_size, int subspace_parts) {
     const int M = std::max(subspace_parts, 1);
     const int token_count = std::max(seq_len, 1);
-    if (token_count <= 1) {
-        return std::vector<int32_t>(static_cast<size_t>(M), 1);
-    }
     if (target_cluster_size <= 0) {
         target_cluster_size = 16;
     }
 
-    const double target = std::max(static_cast<double>(token_count) / target_cluster_size, 1.0);
-    const double log_target = std::log(target);
-    int best_num_threes = 0;
-    double best_error = std::numeric_limits<double>::infinity();
-    double best_product = 0.0;
-    for (int num_threes = 0; num_threes <= M; ++num_threes) {
-        const double product = std::pow(3.0, num_threes) * std::pow(2.0, M - num_threes);
-        const double error = std::abs(std::log(product) - log_target);
-        if (error < best_error || (error == best_error && product < best_product)) {
-            best_error = error;
-            best_num_threes = num_threes;
-            best_product = product;
+    const double target = static_cast<double>(token_count) / static_cast<double>(target_cluster_size);
+    int base = std::min(3, token_count);
+    while (true) {
+        double product = std::pow(static_cast<double>(base), M);
+        if (product > target) {
+            return std::vector<int32_t>(static_cast<size_t>(M), base);
         }
-    }
 
-    std::vector<int32_t> values;
-    values.reserve(static_cast<size_t>(M));
-    for (int idx = 0; idx < M; ++idx) {
-        const int value = idx < best_num_threes ? 3 : 2;
-        values.push_back(static_cast<int32_t>(std::min(value, token_count)));
+        const int high = std::min(base + 1, token_count);
+        if (high == base) {
+            return std::vector<int32_t>(static_cast<size_t>(M), base);
+        }
+
+        for (int high_count = 1; high_count <= M; ++high_count) {
+            product = std::pow(static_cast<double>(high), high_count) *
+                std::pow(static_cast<double>(base), M - high_count);
+            if (product > target) {
+                std::vector<int32_t> values;
+                values.reserve(static_cast<size_t>(M));
+                for (int idx = 0; idx < M; ++idx) {
+                    values.push_back(idx < high_count ? high : base);
+                }
+                return values;
+            }
+        }
+
+        base = high;
     }
-    return values;
 }
 
 } // namespace
@@ -364,82 +365,12 @@ bool LayerPipeline::write_cpu_buffers() {
     }
 
     if (direct_write_buffers_ready_) {
-        try {
-            if (!batch_register_from_cpp_cb_) {
-                return true;
-            }
-
-            std::vector<HeadMetadata> all_heads_data;
-            int row_count = row_count_ > 0 ? row_count_ : kv_heads_;
-            all_heads_data.reserve(row_count);
-
-            for (int32_t row = 0; row < row_count; ++row) {
-                const auto& reorg_result = reorganize_results_[row];
-
-                if (reorg_result.cluster_sizes.empty()) {
-                    std::string error_msg =
-                        "❌ Layer " + std::to_string(layer_idx_) + " Row " + std::to_string(row) +
-                        ": cluster_sizes is EMPTY! This indicates reorganize failed or was not executed.";
-                    std::cerr << error_msg << "\n";
-                    mark_failure(error_msg);
-                    throw std::runtime_error(error_msg);
-                }
-
-                bool centroids_missing =
-                    (row >= static_cast<int32_t>(merged_centroids_.size())) ||
-                    !merged_centroids_[row].defined() ||
-                    merged_centroids_[row].numel() == 0;
-                if (centroids_missing) {
-                    int actual_size = (row < static_cast<int32_t>(merged_centroids_.size()) &&
-                                       merged_centroids_[row].defined())
-                                      ? merged_centroids_[row].numel() : -1;
-                    std::string error_msg =
-                        "❌ Layer " + std::to_string(layer_idx_) + " Row " + std::to_string(row) +
-                        ": merged_centroids is MISSING or EMPTY! " +
-                        "(size=" + std::to_string(actual_size) + "). " +
-                        "This indicates global K-means failed.";
-                    std::cerr << error_msg << "\n";
-                    mark_failure(error_msg);
-                    throw std::runtime_error(error_msg);
-                }
-
-                HeadMetadata head_data;
-                head_data.head_idx = row;
-                head_data.cluster_sizes = reorg_result.cluster_sizes;
-                head_data.cluster_offsets = reorg_result.cluster_offsets;
-                head_data.centroids = merged_centroids_[row];
-                all_heads_data.push_back(std::move(head_data));
-            }
-
-            if (static_cast<int32_t>(all_heads_data.size()) != row_count) {
-                std::string error_msg =
-                    "❌ Layer " + std::to_string(layer_idx_) +
-                    ": Expected " + std::to_string(row_count) + " rows, but only collected " +
-                    std::to_string(all_heads_data.size()) + " rows!";
-                std::cerr << error_msg << "\n";
-                mark_failure(error_msg);
-                throw std::runtime_error(error_msg);
-            }
-
-            if (!batch_register_from_cpp_cb_(layer_idx_, all_heads_data)) {
-                std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
-                          << ": Batch register metadata failed\n";
-                return false;
-            }
-
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
-                      << " Stage 4 failed: " << e.what() << "\n";
-            return false;
-        }
+        return true;
     }
 
     std::cerr << "❌ [LayerPipeline] Layer " << layer_idx_
               << ": Direct write buffers not prepared\n";
     return false;
-
-// legacy direct-write path removed
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1562,13 +1493,9 @@ bool LayerPipeline::merge_all_chunks(const MergePayload& payload) {
 
     kmeans_result_ = std::move(kmeans_result);
     if (kmeans_result_) {
-        // Unified outputs for Python API
+        // Unified centroid outputs for Python API.
         kmeans_result_->per_head_centroids.clear();
         kmeans_result_->per_head_centroids.resize(row_count);
-
-        // NOTE: per_head_labels is not currently populated here.
-        // If needed, it should come from the kmeans stage outputs (before reorg),
-        // not reconstructed from the reorganized layout.
 
         for (int32_t head = 0; head < row_count; ++head) {
             if (head >= static_cast<int32_t>(merged_centroids_.size())) {

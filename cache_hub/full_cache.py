@@ -69,11 +69,12 @@ class flash_attn_cache(KV_Cache):
                 ) for _ in range(self.layer_num)
             ]
 
-        self.copystream = torch.cuda.Stream()
+        self.copystream = {}
         self.copyevents = {}
         self.KVreadyevents = {}
         for device_idx in self.device_list:
             with torch.cuda.device(device_idx):
+                self.copystream[device_idx] = torch.cuda.Stream()
                 self.copyevents[device_idx] = torch.cuda.Event()
                 self.KVreadyevents[device_idx] = torch.cuda.Event()
     
@@ -124,13 +125,15 @@ class flash_attn_cache(KV_Cache):
         _valid_start = self.valid_start_list[start_bdx]
         _valid_length = seq_len - _valid_start
 
-        self.KVreadyevents[self.layer_mapping[str(layer_idx)]].record()
+        dev = self.layer_mapping[str(layer_idx)]
 
-        with torch.cuda.stream(self.copystream):
-            self.KVreadyevents[self.layer_mapping[str(layer_idx)]].wait()    # wait for KV ready
-            self.key_cache[layer_idx][start_bdx:start_bdx+bsz, :_valid_length, :, :].copy_(key_states[:, _valid_start:, :, :], non_blocking=True)
-            self.value_cache[layer_idx][start_bdx:start_bdx+bsz, :_valid_length, :, :].copy_(value_states[:, _valid_start:, :, :], non_blocking=True)
-            self.copyevents[self.layer_mapping[str(layer_idx)]].record()
+        with torch.cuda.device(dev):
+            self.KVreadyevents[dev].record()
+            with torch.cuda.stream(self.copystream[dev]):
+                self.KVreadyevents[dev].wait()    # wait for KV ready
+                self.key_cache[layer_idx][start_bdx:start_bdx+bsz, :_valid_length, :, :].copy_(key_states[:, _valid_start:, :, :], non_blocking=True)
+                self.value_cache[layer_idx][start_bdx:start_bdx+bsz, :_valid_length, :, :].copy_(value_states[:, _valid_start:, :, :], non_blocking=True)
+                self.copyevents[dev].record()
         
         if (layer_idx == self.layer_num - 1) and (start_bdx + bsz == self.batch_size):
             self.context += seq_len

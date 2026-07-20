@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/root/AdaptiveIMI"
-DATA_PATH="${DATA_PATH:-/root/LongBench/data.json}"
-OUT_DIR="${1:-${ROOT_DIR}/benchmark/Longbenchv2/results}"
-EXTRA_ARGS=("${@:2}")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+DATA_PATH="${DATA_PATH:-/home/yjy/LongBench/data.json}"
+if [[ $# -gt 0 && "${1}" != -* ]]; then
+  OUT_DIR="${1}"
+  EXTRA_ARGS=("${@:2}")
+else
+  OUT_DIR="${ROOT_DIR}/benchmark/Longbenchv2/results"
+  EXTRA_ARGS=("$@")
+fi
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONPATH="$(dirname "${ROOT_DIR}"):${ROOT_DIR}:${PYTHONPATH:-}"
 
-LLAMA_MODEL="${LLAMA_MODEL:-/root/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659}"
-QWEN_MODEL="${QWEN_MODEL:-/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218}"
-LLAMA_PARTITION_PATH="${LLAMA_PARTITION_PATH:-/root/AdaptiveIMI/outputs/new/llama31_multidomain_recall256_per_layer_partition.json}"
-QWEN_PARTITION_PATH="${QWEN_PARTITION_PATH:-/root/AdaptiveIMI/outputs/imi_partition/qwen3_domains_mean_learned_partition_balanced.json}"
-MODEL_FAMILY="${MODEL_FAMILY:-qwen3}"
-IMI_ENGINE="${IMI_ENGINE:-hybrid_8way_v2}"
+LLAMA_MODEL="${LLAMA_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen3-8B}"
+MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
+IMI_ENGINE="${IMI_ENGINE:-}"
 OPTIONAL_ARGS=()
 
 if [[ -n "${IMI_ENGINE}" ]]; then
@@ -44,15 +49,27 @@ fi
 cd "${ROOT_DIR}"
 mkdir -p "${OUT_DIR}"
 
+add_optional_arg() {
+  local env_name="$1"
+  local flag_name="$2"
+  local value="${!env_name:-}"
+  if [[ -n "${value}" ]]; then
+    OPTIONAL_ARGS+=("${flag_name}" "${value}")
+  fi
+}
+
+add_optional_arg RETRIEVAL_BUDGET --retrieval_budget
+add_optional_arg CACHE_RATIO --cache_ratio
+add_optional_arg SUBSPACE_PARTS --subspace_parts
+
 run_one() {
   local model_name="$1"
   local config_model_name="$2"
   local out_path="$3"
-  local partition_path="$4"
 
   local run_args=("${OPTIONAL_ARGS[@]}")
-  if [[ -n "${partition_path}" ]]; then
-    run_args+=(--partition_path "${partition_path}")
+  if [[ -n "${PARTITION_PATH:-}" ]]; then
+    run_args+=(--partition_path "${PARTITION_PATH}")
   fi
 
   python -u benchmark/Longbenchv2/longbenchv2_adaptiveimi.py \
@@ -63,9 +80,6 @@ run_one() {
     --max_model_len "${MAX_MODEL_LEN:-131072}" \
     --max_new_tokens "${MAX_NEW_TOKENS:-128}" \
     --attn_type "${ATTN_TYPE:-AdaptiveIMI}" \
-    --retrieval_budget "${RETRIEVAL_BUDGET:-0.1}" \
-    --cache_ratio "${CACHE_RATIO:-0.0}" \
-    --subspace_parts "${SUBSPACE_PARTS:-2}" \
     --dtype "${DTYPE:-bf16}" \
     --device "${DEVICE:-auto}" \
     "${run_args[@]}" \
@@ -73,18 +87,18 @@ run_one() {
 }
 
 if [[ -n "${MODEL_NAME:-}" ]]; then
-  run_one "${MODEL_NAME}" "${CONFIG_MODEL_NAME:-${MODEL_NAME}}" "${OUT_PATH:-${OUT_DIR}/adaptiveimi.jsonl}" "${PARTITION_PATH:-}"
+  run_one "${MODEL_NAME}" "${CONFIG_MODEL_NAME:-${MODEL_NAME}}" "${OUT_PATH:-${OUT_DIR}/adaptiveimi.jsonl}"
 else
   case "${MODEL_FAMILY}" in
     llama|llama3|llama3.1)
-      run_one "${LLAMA_MODEL}" "${CONFIG_MODEL_NAME:-meta-llama/Llama-3.1-8B-Instruct}" "${OUT_PATH:-${OUT_DIR}/llama3_adaptiveimi.jsonl}" "${PARTITION_PATH:-${LLAMA_PARTITION_PATH}}"
+      run_one "${LLAMA_MODEL}" "${CONFIG_MODEL_NAME:-meta-llama/Llama-3.1-8B-Instruct}" "${OUT_PATH:-${OUT_DIR}/llama3_adaptiveimi.jsonl}"
       ;;
     qwen|qwen3)
-      run_one "${QWEN_MODEL}" "${CONFIG_MODEL_NAME:-Qwen/Qwen3-8B}" "${OUT_PATH:-${OUT_DIR}/qwen3_adaptiveimi.jsonl}" "${PARTITION_PATH:-${QWEN_PARTITION_PATH}}"
+      run_one "${QWEN_MODEL}" "${CONFIG_MODEL_NAME:-Qwen/Qwen3-8B}" "${OUT_PATH:-${OUT_DIR}/qwen3_adaptiveimi.jsonl}"
       ;;
     both|all)
-      run_one "${LLAMA_MODEL}" "meta-llama/Llama-3.1-8B-Instruct" "${OUT_DIR}/llama3_adaptiveimi.jsonl" "${LLAMA_PARTITION_PATH}"
-      run_one "${QWEN_MODEL}" "Qwen/Qwen3-8B" "${OUT_DIR}/qwen3_adaptiveimi.jsonl" "${QWEN_PARTITION_PATH}"
+      run_one "${LLAMA_MODEL}" "meta-llama/Llama-3.1-8B-Instruct" "${OUT_DIR}/llama3_adaptiveimi.jsonl"
+      run_one "${QWEN_MODEL}" "Qwen/Qwen3-8B" "${OUT_DIR}/qwen3_adaptiveimi.jsonl"
       ;;
     *)
       echo "Unsupported MODEL_FAMILY=${MODEL_FAMILY}. Use llama, qwen, or both."

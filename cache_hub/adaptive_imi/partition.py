@@ -37,6 +37,45 @@ def _validate_head_groups(groups: object, *, head_dim: int, m: int, head_idx: in
     return parsed
 
 
+def build_sequential_hybrid_partition_specs(
+    *,
+    layer_num: int,
+    kv_heads: int,
+    head_dim: int,
+    required_m: int = 8,
+) -> List[Optional[Dict[str, object]]]:
+    if head_dim % 2 != 0:
+        raise ValueError("sequential 8-way partition expects even head_dim")
+
+    half = int(head_dim) // 2
+    if half < int(required_m):
+        raise ValueError("sequential 8-way partition expects at least one RoPE pair per subspace")
+    base = half // int(required_m)
+    remainder = half % int(required_m)
+    groups: List[List[int]] = []
+    start = 0
+    for group_idx in range(int(required_m)):
+        width = base + (1 if group_idx < remainder else 0)
+        end = start + width
+        groups.append(list(range(start, end)))
+        start = end
+
+    heads = {
+        str(head_idx): {
+            "groups": [list(group) for group in groups],
+        }
+        for head_idx in range(int(kv_heads))
+    }
+    spec: Dict[str, object] = {
+        "enabled": True,
+        "layout": "sequential_rope_pairs",
+        "subspace_parts": int(required_m),
+        "M": int(required_m),
+        "heads": heads,
+    }
+    return [spec for _ in range(int(layer_num))]
+
+
 def load_hybrid_partition_specs(
     partition_path: str | Path,
     *,

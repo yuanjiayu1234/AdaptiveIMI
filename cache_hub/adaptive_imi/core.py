@@ -1,5 +1,4 @@
 from typing import Dict, List, Optional, Tuple
-import json
 import os
 import queue
 import threading
@@ -11,6 +10,7 @@ from ..base import KV_Cache
 from .async_update import AdaptiveIMIAsyncUpdateMixin
 from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
 from .indexing import AdaptiveIMIIndexingMixin, _BuildJobScheduler
+from .partition import build_sequential_hybrid_partition_specs, load_hybrid_partition_specs
 from .retrieval import AdaptiveIMIRetrievalMixin
 from .runtime import AdaptiveIMIRuntimeMixin
 
@@ -51,69 +51,20 @@ def _load_learned_partition_specs(
     head_dim: int,
 ) -> List[Optional[Dict[str, object]]]:
     if not partition_path:
-        return [None] * layer_num
+        return build_sequential_hybrid_partition_specs(
+            layer_num=layer_num,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            required_m=8,
+        )
 
-    with open(partition_path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    layer_groups = payload.get("layer_groups") or payload.get("groups")
-    if not isinstance(layer_groups, list):
-        raise ValueError("learned partition file must contain a 'layer_groups' list")
-
-    specs: List[Optional[Dict[str, object]]] = [None] * layer_num
-    for group in layer_groups:
-        if not isinstance(group, dict):
-            raise ValueError("each learned partition layer group must be an object")
-        layer_start = int(group.get("layer_start", group.get("start", 0)))
-        layer_end = int(group.get("layer_end", group.get("end", layer_num)))
-        if bool(group.get("layer_end_inclusive", False)):
-            layer_end += 1
-        layer_start = max(layer_start, 0)
-        layer_end = min(layer_end, layer_num)
-        if layer_start >= layer_end:
-            continue
-
-        heads_obj = group.get("heads")
-        if not isinstance(heads_obj, dict):
-            raise ValueError("learned partition layer group must contain heads as a dict")
-
-        heads: Dict[str, Dict[str, object]] = {}
-        expected_m = int(group.get("M", group.get("subspace_parts", 0)) or 0)
-        for head_idx in range(kv_heads):
-            raw_head = heads_obj.get(str(head_idx), heads_obj.get(head_idx))
-            if raw_head is None:
-                raise ValueError(f"learned partition missing head {head_idx}")
-            if isinstance(raw_head, dict) and raw_head.get("dim_groups") is not None:
-                raise ValueError(
-                    "AdaptiveIMI learned partitions use RoPE pair 'groups'; "
-                    f"head {head_idx} provided dim_groups"
-                )
-            if isinstance(raw_head, dict):
-                groups = raw_head.get("groups")
-            else:
-                groups = raw_head
-            if not isinstance(groups, list) or not groups:
-                raise ValueError(f"learned partition head {head_idx} has no groups")
-            groups = [[int(pair) for pair in subgroup] for subgroup in groups]
-            if expected_m <= 0:
-                expected_m = len(groups)
-            if len(groups) != expected_m:
-                raise ValueError(
-                    f"learned partition head {head_idx} has M={len(groups)}, expected {expected_m}"
-                )
-            heads[str(head_idx)] = {"groups": groups}
-
-        spec = {
-            "enabled": True,
-            "subspace_parts": expected_m,
-            "M": expected_m,
-            "heads": heads,
-        }
-
-        for layer_idx in range(layer_start, layer_end):
-            specs[layer_idx] = spec
-
-    return specs
+    return load_hybrid_partition_specs(
+        partition_path,
+        layer_num=layer_num,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        required_m=8,
+    )
 
 
 class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin, AdaptiveIMIRetrievalMixin, AdaptiveIMIRuntimeMixin, KV_Cache):
@@ -187,6 +138,16 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         self.learned_partition_enabled = any(spec is not None for spec in self.learned_partition_specs)
         if not self.learned_partition_enabled:
             raise ValueError("AdaptiveIMI base now serves hybrid_8way_v2 only; partition_path is required.")
+        self.partition_layout = (
+            "sequential_rope_pairs"
+            if not partition_path
+            else "learned"
+        )
+        if self.partition_layout == "sequential_rope_pairs":
+            print(
+                "[AdaptiveIMI] partition_path is empty; using sequential 8-way RoPE-pair partition.",
+                flush=True,
+            )
         self.subspace_parts = max(
             int(spec.get("subspace_parts", 1))
             for spec in self.learned_partition_specs
@@ -727,9 +688,8 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         bytes_per_elem = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
 
         cache_tokens = cache_pages * self.page_size + self.static_stride
-        cache_bytes = (
+        per_layer_cache_bytes = (
             2
-            * self.layer_num
             * self.batch_size
             * self.kv_head
             * cache_tokens
@@ -737,7 +697,7 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
             * bytes_per_elem
         )
         execution_tokens = buffer_pages * self.page_size + self.static_stride
-        execution_bytes = (
+        per_execution_buffer_bytes = (
             2
             * self.batch_size
             * self.kv_head
@@ -745,15 +705,35 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
             * self.head_dim
             * bytes_per_elem
         )
-        execution_buffer_copies = int(self._execution_buffer_ring_size()) * int(self.layer_num) + max(len(self.device_list), 1)
-        execution_bytes *= execution_buffer_copies
+        per_layer_execution_bytes = per_execution_buffer_bytes * int(self._execution_buffer_ring_size())
+        per_device_fallback_execution_bytes = per_execution_buffer_bytes
+        per_layer_centroid_bytes = self.batch_groups * n_centroids * self.head_dim * 4
+        per_layer_mask_bytes = self.batch_groups * n_centroids
 
-        centroid_bytes = self.layer_num * self.batch_groups * n_centroids * self.head_dim * 4
-        mask_bytes = self.layer_num * self.batch_groups * n_centroids
+        estimated_bytes_by_device = {device: 0 for device in self.device_list}
+        for ldx in range(self.layer_num):
+            device = self.layer_mapping[str(ldx)]
+            estimated_bytes_by_device[device] += (
+                per_layer_cache_bytes
+                + per_layer_execution_bytes
+                + per_layer_centroid_bytes
+                + per_layer_mask_bytes
+            )
+        for device in self.device_list:
+            estimated_bytes_by_device[device] += per_device_fallback_execution_bytes
 
-        estimated_gb = (cache_bytes + execution_bytes + centroid_bytes + mask_bytes) / (1024 ** 3)
+        estimated_gb_by_device = {
+            device: value / (1024 ** 3)
+            for device, value in estimated_bytes_by_device.items()
+        }
+        estimated_gb = sum(estimated_gb_by_device.values())
         self.estimated_gpu_memory = estimated_gb
+        self.estimated_gpu_memory_by_device = estimated_gb_by_device
         self.esitimate_gpu_memory = estimated_gb  # Backward-compatible misspelling.
-        return self.free_memory > estimated_gb * 1.5
+        for device, estimated_bytes in estimated_bytes_by_device.items():
+            free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
+            if free_bytes < int(estimated_bytes * 1.5):
+                return False
+        return True
 # Backward-compatible alias for older imports.
 adpimi_cache = AdaptiveIMICacheBase

@@ -1,7 +1,6 @@
 #include "layer_pipeline.hpp"
 #include <omp.h>
 #include <immintrin.h>  // AVX2
-#include <cmath>
 #include <algorithm>
 #include <limits>
 #include <cstring>
@@ -12,19 +11,11 @@ namespace imi {
 
 struct LloydRuntimeConfig {
     int32_t max_iters = 25;
-    float tol = 5e-4f;
-    int32_t early_stop_min_iter = 5;
-    float early_stop_rel_tol = 5e-4f;
-    int32_t fp32_convert_chunk_elems = 1 << 20;
 };
 
 static LloydRuntimeConfig load_lloyd_runtime_config(const LayerPipelineRuntimeConfig& runtime_config) {
     LloydRuntimeConfig cfg;
     cfg.max_iters = std::max<int32_t>(1, runtime_config.kmeans_max_iters);
-    cfg.tol = std::max(runtime_config.kmeans_tol, 0.0f);
-    cfg.early_stop_min_iter = std::max<int32_t>(1, runtime_config.kmeans_early_stop_min_iter);
-    cfg.early_stop_rel_tol = std::max(runtime_config.kmeans_early_stop_rel_tol, 0.0f);
-    cfg.fp32_convert_chunk_elems = std::max<int32_t>(1, runtime_config.fp32_convert_chunk_elems);
     return cfg;
 }
 
@@ -88,11 +79,6 @@ int sample_token_index_cpu(int token_count, int row, int subspace, int k, int it
         return 0;
     }
     return static_cast<int>(make_seed_cpu(row, subspace, k, iter, salt) % static_cast<uint64_t>(token_count));
-}
-
-double uniform_unit_cpu(int row, int subspace, int k, int iter, uint64_t salt) {
-    const uint64_t bits = make_seed_cpu(row, subspace, k, iter, salt) >> 11;
-    return static_cast<double>(bits) * (1.0 / 9007199254740992.0);
 }
 
 } // namespace
@@ -270,31 +256,6 @@ static inline float distance_dim_ids(
 #endif
 }
 
-static inline float distance_source_dim_ids(
-    const uint16_t* keys_u16,
-    c10::ScalarType dtype,
-    int32_t kv_heads,
-    int32_t n_tokens,
-    int32_t dim,
-    int32_t head,
-    int32_t token,
-    const int32_t* dim_ids,
-    int32_t dim_count,
-    bool sequence_major,
-    const float* centroid
-) {
-    float dist = 0.0f;
-    for (int32_t d = 0; d < dim_count; ++d) {
-        const float value = load_kv16_as_float(
-            keys_u16, dtype, kv_heads, n_tokens, dim,
-            head, token, dim_ids[d], sequence_major
-        );
-        float diff = value - centroid[d];
-        dist += diff * diff;
-    }
-    return dist;
-}
-
 static inline void add_dim_ids_to_sum(
     const float* token_fp32,
     const int32_t* dim_ids,
@@ -435,8 +396,6 @@ public:
         std::vector<float> centroids_flat(static_cast<size_t>(total_tasks) * max_k * max_sub_dim, 0.0f);
         const int32_t available_threads = std::max<int32_t>(1, worker_threads);
         const int32_t init_threads = std::max<int32_t>(1, std::min(available_threads, total_tasks));
-        std::vector<float> min_dists(static_cast<size_t>(total_tasks) * n_tokens);
-
         #pragma omp parallel for num_threads(init_threads) schedule(dynamic, 1)
         for (int32_t task = 0; task < total_tasks; ++task) {
             const int32_t head = task / kStages;
@@ -445,43 +404,11 @@ public:
             const int32_t k = k_values[stage];
             const int32_t* dim_ids = dim_ids_flat.data() + static_cast<size_t>(task) * max_sub_dim;
             float* centroids = centroids_flat.data() + static_cast<size_t>(task) * max_k * max_sub_dim;
-            float* task_min_dists = min_dists.data() + static_cast<size_t>(task) * n_tokens;
-            std::fill(task_min_dists, task_min_dists + n_tokens, std::numeric_limits<float>::max());
 
-            int32_t first_idx = sample_token_index_cpu(n_tokens, head, stage, 0, 0, 42ULL);
-            gather_dim_ids_sample(
-                keys_u16, dtype, kv_heads, n_tokens, dim,
-                head, first_idx, dim_ids, sub_dim, sequence_major, centroids
-            );
-
-            for (int32_t c = 1; c < k; ++c) {
-                double total_weight = 0.0;
-                const float* last_centroid = centroids + static_cast<size_t>(c - 1) * max_sub_dim;
-                for (int32_t token = 0; token < n_tokens; ++token) {
-                    float dist = distance_source_dim_ids(
-                        keys_u16, dtype, kv_heads, n_tokens, dim,
-                        head, token, dim_ids, sub_dim, sequence_major, last_centroid
-                    );
-                    if (dist < task_min_dists[token]) {
-                        task_min_dists[token] = dist;
-                    }
-                    total_weight += task_min_dists[token];
-                }
-                int32_t selected_idx = 0;
-                if (total_weight <= 0.0 || !std::isfinite(total_weight)) {
-                    selected_idx = sample_token_index_cpu(n_tokens, head, stage, c, 0, 4242ULL);
-                } else {
-                    const double target = uniform_unit_cpu(head, stage, c, 0, 424242ULL) * total_weight;
-                    double cumsum = 0.0;
-                    selected_idx = n_tokens - 1;
-                    for (int32_t token = 0; token < n_tokens; ++token) {
-                        cumsum += task_min_dists[token];
-                        if (cumsum >= target) {
-                            selected_idx = token;
-                            break;
-                        }
-                    }
-                }
+            for (int32_t c = 0; c < k; ++c) {
+                const int32_t selected_idx = sample_token_index_cpu(
+                    n_tokens, head, stage, c, 0, 42424242ULL
+                );
                 gather_dim_ids_sample(
                     keys_u16, dtype, kv_heads, n_tokens, dim,
                     head, selected_idx, dim_ids, sub_dim, sequence_major,
@@ -503,14 +430,12 @@ public:
         const int32_t tile_tokens = 32;
         const int32_t tiles_per_head = (n_tokens + tile_tokens - 1) / tile_tokens;
         const int32_t tile_tasks = kv_heads * tiles_per_head;
-        float prev_inertia = std::numeric_limits<float>::max();
 
         for (int32_t iter = 0; iter < runtime_cfg.max_iters; ++iter) {
             std::fill(thread_sums.begin(), thread_sums.end(), 0.0f);
             std::fill(thread_counts.begin(), thread_counts.end(), 0);
-            double inertia = 0.0;
 
-            #pragma omp parallel num_threads(thread_count) reduction(+:inertia)
+            #pragma omp parallel num_threads(thread_count)
             {
                 const int32_t tid = omp_get_thread_num();
                 float* local_sums = thread_sums.data() + static_cast<size_t>(tid) * total_sum_elems;
@@ -553,7 +478,6 @@ public:
                             }
 
                             labels_flat[static_cast<size_t>(task) * n_tokens + token] = best_cluster;
-                            inertia += best_dist;
                             local_counts[static_cast<size_t>(task) * count_stride + best_cluster]++;
                             float* sum = local_sums
                                 + static_cast<size_t>(task) * centroid_stride
@@ -563,15 +487,6 @@ public:
                     }
                 }
             }
-
-            const float inertia_change = std::abs(prev_inertia - static_cast<float>(inertia));
-            const float relative_change = (prev_inertia > 0.0f) ? (inertia_change / prev_inertia) : 0.0f;
-            if (iter + 1 >= std::max<int32_t>(1, runtime_cfg.early_stop_min_iter) &&
-                (relative_change <= std::max(0.0f, runtime_cfg.early_stop_rel_tol) ||
-                 inertia_change <= std::max(0.0f, runtime_cfg.tol))) {
-                break;
-            }
-            prev_inertia = static_cast<float>(inertia);
 
             #pragma omp parallel for num_threads(thread_count) schedule(static)
             for (size_t i = 0; i < total_sum_elems; ++i) {

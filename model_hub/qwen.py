@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import flashinfer
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from .base import LLM
+from .weight_loader import SafetensorsWeightSource, cat_tensors_to_device, tensor_to_device
 from attn_hub import full_decode_attn, imi_decode_attn, \
                      full_prefill_attn, full_decode_attn_offload
 
@@ -53,6 +54,53 @@ class QwenLayer:
 
         del self.wq, self.wk, self.wv, self.bq, self.bk, self.bv, self.gate_proj, self.up_proj
 
+    def init_layer_from_tensors(self, tensors: dict[str, torch.Tensor | float | None], dtype: torch.dtype):
+        q_weight = tensors["q_proj.weight"]
+        k_weight = tensors["k_proj.weight"]
+        v_weight = tensors["v_proj.weight"]
+        self.wqkv = cat_tensors_to_device([q_weight, k_weight, v_weight], dim=0, device=self.device, dtype=dtype)
+        q_bias = tensors.get("q_proj.bias")
+        k_bias = tensors.get("k_proj.bias")
+        v_bias = tensors.get("v_proj.bias")
+        if q_bias is None:
+            q_bias = torch.zeros(q_weight.size(0), dtype=dtype)
+        if k_bias is None:
+            k_bias = torch.zeros(k_weight.size(0), dtype=dtype)
+        if v_bias is None:
+            v_bias = torch.zeros(v_weight.size(0), dtype=dtype)
+        self.bqkv = cat_tensors_to_device([q_bias, k_bias, v_bias], dim=0, device=self.device, dtype=dtype)
+        self.wo = tensor_to_device(tensors["o_proj.weight"], device=self.device, dtype=dtype)
+
+        self.q_norm_weight = None
+        self.k_norm_weight = None
+        self.q_norm_variance_epsilon = None
+        self.k_norm_variance_epsilon = None
+        if tensors.get("q_norm.weight") is not None and tensors.get("k_norm.weight") is not None:
+            self.q_norm_weight = tensor_to_device(tensors["q_norm.weight"], device=self.device, dtype=dtype)
+            self.k_norm_weight = tensor_to_device(tensors["k_norm.weight"], device=self.device, dtype=dtype)
+            self.q_norm_variance_epsilon = float(tensors["q_norm.eps"])
+            self.k_norm_variance_epsilon = float(tensors["k_norm.eps"])
+
+        self.gate_up_proj = cat_tensors_to_device(
+            [tensors["gate_proj.weight"], tensors["up_proj.weight"]],
+            dim=0,
+            device=self.device,
+            dtype=dtype,
+        )
+        self.down_proj = tensor_to_device(tensors["down_proj.weight"], device=self.device, dtype=dtype)
+        self.input_layernorm_weight = tensor_to_device(
+            tensors["input_layernorm.weight"],
+            device=self.device,
+            dtype=dtype,
+        )
+        self.input_layernorm_variance_epsilon = float(tensors["input_layernorm.eps"])
+        self.post_attention_layernorm_weight = tensor_to_device(
+            tensors["post_attention_layernorm.weight"],
+            device=self.device,
+            dtype=dtype,
+        )
+        self.post_attention_layernorm_variance_epsilon = float(tensors["post_attention_layernorm.eps"])
+
 
 class QwenModel(LLM):
     """
@@ -69,9 +117,20 @@ class QwenModel(LLM):
         dtype: torch.dtype,
         device_map: str,
         tokenizer: AutoTokenizer = None,
-        model_path: str = None
+        model_path: str = None,
+        parallel_mode: str = "auto",
+        weight_loading: str = "hf",
+        gpu_memory_utilization: float = 0.90,
     ) -> None:
-        super().__init__(model_name, max_length, dtype, device_map)
+        super().__init__(
+            model_name,
+            max_length,
+            dtype,
+            device_map,
+            parallel_mode=parallel_mode,
+            weight_loading=weight_loading,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
         self.model_path = self._resolve_model_path(model_path if model_path else model_name)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path) if tokenizer is None else tokenizer
@@ -145,10 +204,83 @@ class QwenModel(LLM):
 
 
     def init_model(self):
-        hf_qwen = AutoModelForCausalLM.from_pretrained(self.model_path, torch_dtype=self.dtype)
         root_device = self._configure_devices()
+        if self._should_use_streaming_weight_loader():
+            self._init_model_from_safetensors(root_device)
+            return
+        model_kwargs = {"torch_dtype": self.dtype}
+        hf_device_map = self._hf_device_map()
+        if hf_device_map is not None:
+            model_kwargs.update(device_map=hf_device_map, low_cpu_mem_usage=True)
+        hf_qwen = AutoModelForCausalLM.from_pretrained(self.model_path, **model_kwargs)
         self._initialize_shared_runtime_tensors(hf_qwen, root_device)
         self._initialize_layers(hf_qwen.model.layers, QwenLayer)
+        self._finalize_model_init()
+
+    def _init_model_from_safetensors(self, root_device: str):
+        source = SafetensorsWeightSource(self.model_path)
+        inv_freq = 1.0 / (
+            float(self.base)
+            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
+        norm_eps = float(getattr(self.config, "rms_norm_eps", 1e-6))
+        shared = source.get_tensors(["model.embed_tokens.weight", "model.norm.weight"])
+        self._initialize_shared_runtime_tensors_from_weights(
+            embed_weight=shared["model.embed_tokens.weight"],
+            lm_head_weight=source.get_optional_tensor("lm_head.weight"),
+            norm_weight=shared["model.norm.weight"],
+            norm_variance_epsilon=norm_eps,
+            inv_freq=inv_freq,
+            attention_scaling=1.0,
+            root_device=root_device,
+        )
+        self.layers = []
+        for layer_idx in range(self.num_layers):
+            prefix = f"model.layers.{layer_idx}"
+            required = [
+                f"{prefix}.self_attn.q_proj.weight",
+                f"{prefix}.self_attn.k_proj.weight",
+                f"{prefix}.self_attn.v_proj.weight",
+                f"{prefix}.self_attn.o_proj.weight",
+                f"{prefix}.mlp.gate_proj.weight",
+                f"{prefix}.mlp.up_proj.weight",
+                f"{prefix}.mlp.down_proj.weight",
+                f"{prefix}.input_layernorm.weight",
+                f"{prefix}.post_attention_layernorm.weight",
+            ]
+            optional = [
+                f"{prefix}.self_attn.q_proj.bias",
+                f"{prefix}.self_attn.k_proj.bias",
+                f"{prefix}.self_attn.v_proj.bias",
+                f"{prefix}.self_attn.q_norm.weight",
+                f"{prefix}.self_attn.k_norm.weight",
+            ]
+            tensors = source.get_tensors(required + [name for name in optional if source.has_tensor(name)])
+            layer = QwenLayer(layer_idx, device=self.layer_mapping[str(layer_idx)])
+            layer.init_layer_from_tensors(
+                {
+                    "q_proj.weight": tensors[f"{prefix}.self_attn.q_proj.weight"],
+                    "k_proj.weight": tensors[f"{prefix}.self_attn.k_proj.weight"],
+                    "v_proj.weight": tensors[f"{prefix}.self_attn.v_proj.weight"],
+                    "q_proj.bias": tensors.get(f"{prefix}.self_attn.q_proj.bias"),
+                    "k_proj.bias": tensors.get(f"{prefix}.self_attn.k_proj.bias"),
+                    "v_proj.bias": tensors.get(f"{prefix}.self_attn.v_proj.bias"),
+                    "o_proj.weight": tensors[f"{prefix}.self_attn.o_proj.weight"],
+                    "q_norm.weight": tensors.get(f"{prefix}.self_attn.q_norm.weight"),
+                    "k_norm.weight": tensors.get(f"{prefix}.self_attn.k_norm.weight"),
+                    "q_norm.eps": norm_eps,
+                    "k_norm.eps": norm_eps,
+                    "gate_proj.weight": tensors[f"{prefix}.mlp.gate_proj.weight"],
+                    "up_proj.weight": tensors[f"{prefix}.mlp.up_proj.weight"],
+                    "down_proj.weight": tensors[f"{prefix}.mlp.down_proj.weight"],
+                    "input_layernorm.weight": tensors[f"{prefix}.input_layernorm.weight"],
+                    "input_layernorm.eps": norm_eps,
+                    "post_attention_layernorm.weight": tensors[f"{prefix}.post_attention_layernorm.weight"],
+                    "post_attention_layernorm.eps": norm_eps,
+                },
+                self.dtype,
+            )
+            self.layers.append(layer)
         self._finalize_model_init()
 
     def init_kv_cache(self, valid_start, attn_config):
@@ -229,9 +361,8 @@ class QwenModel(LLM):
     def parameter_move(self, hidden_states, ldx):
         next_device = self.layer_mapping[str(ldx+1)] if str(ldx+1) in self.layer_mapping else self.layer_mapping[str(0)]
         torch.cuda.set_device(next_device)
-        hidden_states = hidden_states.to(next_device)
-        self.position_ids = self.position_ids.to(next_device)
-        self.cos_sin_cache = self.cos_sin_cache.to(next_device)
+        hidden_states = hidden_states.to(next_device, non_blocking=True)
+        self._activate_device_runtime_tensors(next_device)
         if self.attention_type in ('Full_Flash_Attn', 'Full_Flash_Attn_Offload'):
             if hidden_states.shape[1] == 1:
                 self.kv_cache.batch_indices = self.kv_cache.batch_indices_dict[next_device]

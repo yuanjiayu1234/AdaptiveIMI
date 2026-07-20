@@ -41,11 +41,12 @@ __global__ void fused_query_group_similarity_cluster_kernel(
     }
 
     // Fixed flat decode path: sum GQA query groups, then score every cluster centroid.
+    const int64_t query_head_stride = static_cast<int64_t>(num_query_groups) * dim;
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
         float acc = 0.0f;
-        const InputT* head_ptr = query_grouped + head_idx * (num_query_groups * dim) + d;
+        const InputT* head_ptr = query_grouped + static_cast<int64_t>(head_idx) * query_head_stride + d;
         for (int group = 0; group < num_query_groups; ++group) {
-            acc += to_float(head_ptr[group * dim]);
+            acc += to_float(head_ptr[static_cast<int64_t>(group) * dim]);
         }
         shared_query[d] = acc;
     }

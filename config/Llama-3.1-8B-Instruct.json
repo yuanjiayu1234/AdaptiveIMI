@@ -17,11 +17,7 @@
             "promotion_warmup_steps": 4
         },
         "kmeans": {
-            "max_iters": 10,
-            "tol": 0.0005,
-            "early_stop_min_iter": 10,
-            "early_stop_rel_tol": 0.0005,
-            "fp32_convert_chunk_elems": 1048576
+            "max_iters": 10
         },
         "prefill": {
             "prefill_chunk_size": 131072

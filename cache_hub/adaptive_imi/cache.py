@@ -30,19 +30,19 @@ class Hybrid8WayIMICache(HybridGpuPrefillMixin, HybridCpuPrefillMixin, HybridMet
     def __init__(self, *args, **kwargs) -> None:
         runtime_config = dict(kwargs.get("runtime_config") or {})
         partition_path = runtime_config.get("partition_path")
-        if not partition_path:
-            raise ValueError("hybrid_8way_v2 requires AdaptiveIMI.partition_path")
-
-        # Validate partition metadata before the base cache derives learned specs.
-        load_hybrid_partition_specs(
-            partition_path,
-            layer_num=int(kwargs["layer_num"]),
-            kv_heads=int(kwargs["num_key_value_heads"]),
-            head_dim=int(kwargs["head_dim"]),
-            required_m=8,
-        )
-
-        runtime_config["partition_path"] = str(partition_path)
+        if partition_path:
+            # Validate partition metadata before the base cache derives learned specs.
+            load_hybrid_partition_specs(
+                partition_path,
+                layer_num=int(kwargs["layer_num"]),
+                kv_heads=int(kwargs["num_key_value_heads"]),
+                head_dim=int(kwargs["head_dim"]),
+                required_m=8,
+            )
+            runtime_config["partition_path"] = str(partition_path)
+        else:
+            runtime_config["partition_path"] = None
+            runtime_config["partition_layout"] = "sequential_rope_pairs"
         runtime_config["allow_batch_size_gt_one"] = True
         pipeline_cfg = dict(runtime_config.get("pipeline") or {})
         early_hybrid_cfg = dict(runtime_config.get("hybrid_index") or {})

@@ -4,6 +4,54 @@ import torch
 
 
 class PrefillMixin:
+    def _prefill_layer_stages(self):
+        stages = []
+        start = 0
+        while start < self.num_layers:
+            device = self.layer_mapping[str(start)]
+            end = start + 1
+            while end < self.num_layers and self.layer_mapping[str(end)] == device:
+                end += 1
+            stages.append((start, end, device))
+            start = end
+        return stages
+
+    def _format_prefill_stages(self, stages):
+        return ",".join(f"{start}-{end - 1}@{device}" for start, end, device in stages)
+
+    def _stage_hidden_required_bytes(self, bsz: int, seq_len: int) -> int:
+        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        return 2 * int(bsz) * int(seq_len) * int(self.hidden_size) * int(element_size)
+
+    def _should_use_stage_gpu_prefill(self, stages, bsz: int, seq_len: int) -> bool:
+        mode = str(getattr(self, "streaming_hidden_device", "auto")).lower()
+        if mode in ("cpu", "host", "offload"):
+            return False
+        if not all(str(device).startswith("cuda") for _start, _end, device in stages):
+            return False
+
+        required_bytes = self._stage_hidden_required_bytes(bsz, seq_len)
+        if mode in ("gpu", "cuda", "device"):
+            return True
+        if mode != "auto":
+            return False
+
+        max_bytes = int(float(getattr(self, "streaming_hidden_gpu_limit_gb", 8.0)) * (1024 ** 3))
+        if required_bytes > max_bytes:
+            return False
+
+        # Each stage needs source+destination hidden buffers while it is active.
+        # Check every distinct layer device up front; if one is tight, keep the
+        # older CPU-staged path instead of risking a late OOM.
+        for device in sorted({device for _start, _end, device in stages}):
+            try:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(torch.device(device))
+            except Exception:
+                return False
+            if required_bytes > int(free_bytes * 0.5):
+                return False
+        return True
+
     def _prefill_chunked_batch_ranges(self, bsz: int):
         max_bsz = max(1, min(int(getattr(self, "prefill_bsz", bsz) or bsz), int(bsz)))
         kv_cache = getattr(self, "kv_cache", None)
@@ -156,6 +204,7 @@ class PrefillMixin:
         bsz = hidden_cpu.shape[0]
         layer = self.layers[layer_idx]
         device = layer.device
+        self._activate_device_runtime_tensors(device)
         kv_cache = getattr(self, "kv_cache", None)
         num_chunks = (seq_len + chunk_size - 1) // chunk_size
 
@@ -241,46 +290,39 @@ class PrefillMixin:
                     f"[IMI STREAM] layer={layer_idx} phase=finalize_kv elapsed_ms={elapsed_ms:.2f}"
                 )
 
+        # The next layer may read this layer's CPU-staged hidden output from a
+        # different CUDA device. Make the D2H copies explicit before consumers
+        # enqueue H2D work, avoiding cross-device timing races with pinned memory.
+        if output_cpu.device.type == "cpu":
+            torch.cuda.current_stream(torch.device(device)).synchronize()
+
         del key_states, value_states
 
         self._log_streaming_progress(f"[IMI STREAM] layer={layer_idx} phase=done")
-    def prefill_forward_chunked(self, inputs_ids):
+    def _prefill_embed_to_hidden(self, inputs_ids, hidden_states, device: str, chunk_size: int) -> None:
+        for chunk_start in range(0, inputs_ids.shape[1], chunk_size):
+            chunk_end = min(inputs_ids.shape[1], chunk_start + chunk_size)
+            ids_chunk = inputs_ids[:, chunk_start:chunk_end].to(device, non_blocking=True)
+            embed_chunk = self.word_embedding(ids_chunk)
+            hidden_states[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=True)
+
+    def _prefill_forward_cpu_staged(self, inputs_ids, batch_ranges, chunk_size: int, hidden_device, pin_hidden: bool):
         bsz, seq_len = inputs_ids.shape
         device = self.layers[0].device
-        chunk_size = max(int(self.prefill_attn_chunk_size), 1)
-        keep_hidden_gpu = self._should_keep_streaming_hidden_on_gpu(device, bsz, seq_len)
-        pin_hidden = False if keep_hidden_gpu else self._should_pin_streaming_hidden(bsz, seq_len)
-        hidden_device = device if keep_hidden_gpu else "cpu"
-
-        self._log_streaming_progress(
-            f"[IMI STREAM] prefill_start seq_len={seq_len} chunk_size={chunk_size} hidden_device={hidden_device} pin_hidden={int(pin_hidden)}"
-        )
-
         hidden_kwargs = {
             "dtype": self.dtype,
             "device": hidden_device,
         }
-        if not keep_hidden_gpu:
+        if str(hidden_device) == "cpu":
             hidden_kwargs["pin_memory"] = pin_hidden
         hidden_cpu = torch.empty((bsz, seq_len, self.hidden_size), **hidden_kwargs)
         next_cpu = torch.empty_like(hidden_cpu)
 
         embed_t0 = time.perf_counter() if getattr(self, "breakdown_enabled", False) else None
-        for chunk_start in range(0, seq_len, chunk_size):
-            chunk_end = min(seq_len, chunk_start + chunk_size)
-            ids_chunk = inputs_ids[:, chunk_start:chunk_end].to(device, non_blocking=True)
-            embed_chunk = self.word_embedding(ids_chunk)
-            hidden_cpu[:, chunk_start:chunk_end, :].copy_(embed_chunk, non_blocking=True)
+        self._prefill_embed_to_hidden(inputs_ids, hidden_cpu, device, chunk_size)
         if embed_t0 is not None:
             self.prefill_embedding_wall_ms += (time.perf_counter() - embed_t0) * 1000.0
         self._log_streaming_progress("[IMI STREAM] embedding_done")
-
-        batch_ranges = self._prefill_chunked_batch_ranges(bsz)
-        if len(batch_ranges) > 1:
-            self._log_streaming_progress(
-                "[IMI STREAM] batch_ranges="
-                + ",".join(f"[{start},{end})@{valid_start}" for start, end, valid_start in batch_ranges)
-            )
 
         for ldx in range(self.num_layers):
             for start_bdx, end_bdx, _valid_start in batch_ranges:
@@ -295,13 +337,102 @@ class PrefillMixin:
             hidden_cpu, next_cpu = next_cpu, hidden_cpu
             if self.num_gpus > 1:
                 next_device = self.layer_mapping[str(ldx + 1)] if str(ldx + 1) in self.layer_mapping else self.layer_mapping[str(0)]
-                self.position_ids = self.position_ids.to(next_device)
-                self.cos_sin_cache = self.cos_sin_cache.to(next_device)
+                self._activate_device_runtime_tensors(next_device)
+
+        return hidden_cpu
+
+    def _prefill_forward_stage_gpu(self, inputs_ids, batch_ranges, stages, chunk_size: int):
+        bsz, seq_len = inputs_ids.shape
+        root_device = self.layers[0].device
+        first_device = stages[0][2]
+        hidden_states = torch.empty(
+            (bsz, seq_len, self.hidden_size),
+            dtype=self.dtype,
+            device=first_device,
+        )
+
+        embed_t0 = time.perf_counter() if getattr(self, "breakdown_enabled", False) else None
+        self._prefill_embed_to_hidden(inputs_ids, hidden_states, root_device, chunk_size)
+        if embed_t0 is not None:
+            self.prefill_embedding_wall_ms += (time.perf_counter() - embed_t0) * 1000.0
+        self._log_streaming_progress("[IMI STREAM] embedding_done")
+
+        for stage_idx, (stage_start, stage_end, stage_device) in enumerate(stages):
+            if str(hidden_states.device) != str(torch.device(stage_device)):
+                torch.cuda.current_stream(hidden_states.device).synchronize()
+                hidden_states = hidden_states.to(stage_device, non_blocking=True)
+
+            next_states = torch.empty_like(hidden_states)
+            self._log_streaming_progress(
+                f"[IMI STREAM] stage={stage_idx} layers={stage_start}-{stage_end - 1} device={stage_device}"
+            )
+            for ldx in range(stage_start, stage_end):
+                for start_bdx, end_bdx, _valid_start in batch_ranges:
+                    self.layer_prefill_chunked(
+                        ldx,
+                        start_bdx,
+                        hidden_states[start_bdx:end_bdx],
+                        next_states[start_bdx:end_bdx],
+                        seq_len,
+                        chunk_size,
+                    )
+                hidden_states, next_states = next_states, hidden_states
+            del next_states
+
+        return hidden_states
+
+    def prefill_forward_chunked(self, inputs_ids):
+        bsz, seq_len = inputs_ids.shape
+        device = self.layers[0].device
+        chunk_size = max(int(self.prefill_attn_chunk_size), 1)
+        stages = self._prefill_layer_stages()
+        use_stage_gpu = self._should_use_stage_gpu_prefill(stages, bsz, seq_len)
+        keep_hidden_gpu = self._should_keep_streaming_hidden_on_gpu(device, bsz, seq_len)
+        pin_hidden = False if keep_hidden_gpu else self._should_pin_streaming_hidden(bsz, seq_len)
+        hidden_device = device if keep_hidden_gpu else "cpu"
+        path = "stage_gpu" if use_stage_gpu else "cpu_staged"
+        log_hidden_device = "stage_gpu" if use_stage_gpu else hidden_device
+        log_pin_hidden = 0 if use_stage_gpu else int(pin_hidden)
+        stage_desc = self._format_prefill_stages(stages)
+
+        self._log_streaming_progress(
+            f"[IMI STREAM] prefill_start path={path} seq_len={seq_len} chunk_size={chunk_size} "
+            f"hidden_device={log_hidden_device} pin_hidden={log_pin_hidden} stages={stage_desc}"
+        )
+        if seq_len >= 32768 and not self._streaming_progress_enabled():
+            print(
+                "[IMI STREAM] "
+                f"prefill_start path={path} seq_len={seq_len} chunk_size={chunk_size} "
+                f"hidden_device={log_hidden_device} pin_hidden={log_pin_hidden} "
+                f"stages={stage_desc} set IMI_STREAMING_PROGRESS=1 for per-layer/chunk progress",
+                flush=True,
+            )
+
+        batch_ranges = self._prefill_chunked_batch_ranges(bsz)
+        if len(batch_ranges) > 1:
+            self._log_streaming_progress(
+                "[IMI STREAM] batch_ranges="
+                + ",".join(f"[{start},{end})@{valid_start}" for start, end, valid_start in batch_ranges)
+            )
+
+        if use_stage_gpu:
+            hidden_cpu = self._prefill_forward_stage_gpu(inputs_ids, batch_ranges, stages, chunk_size)
+        else:
+            hidden_cpu = self._prefill_forward_cpu_staged(
+                inputs_ids,
+                batch_ranges,
+                chunk_size,
+                hidden_device,
+                pin_hidden,
+            )
 
         self._log_streaming_progress("[IMI STREAM] all_layers_done")
 
         output_t0 = time.perf_counter() if getattr(self, "breakdown_enabled", False) else None
+        if hidden_cpu.device.type == "cuda" and str(hidden_cpu.device) != str(torch.device(device)):
+            torch.cuda.current_stream(hidden_cpu.device).synchronize()
         last_hidden = hidden_cpu[:, -1:, :].to(device, non_blocking=True)
+        self._activate_device_runtime_tensors(device)
         last_hidden = self.layernorm(last_hidden, self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(last_hidden)
         if output_t0 is not None:

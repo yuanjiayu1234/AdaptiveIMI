@@ -49,14 +49,33 @@ class KV_Cache:
         # estimate free GPU memory when prefilling
         self.num_gpus = num_gpus
         self.model_size = model_size
-        # total gpu memory
-        total_gpu_memory = self.num_gpus * torch.cuda.get_device_properties(0).total_memory / 1024 / 1024 / 1024
-        # model weight consumption
-        model_weight_consumption = self.model_size * 2
+        self.device_list = sorted(set(self.layer_mapping.values()), key=lambda x: int(x.split(":")[-1]))
+        self.total_memory_by_device = {
+            dev: torch.cuda.get_device_properties(torch.device(dev)).total_memory / 1024 / 1024 / 1024
+            for dev in self.device_list
+        }
+        layers_by_device = {dev: 0 for dev in self.device_list}
+        for ldx in range(self.layer_num):
+            layers_by_device[self.layer_mapping[str(ldx)]] += 1
+        # Rough per-device model weight estimate kept only for admission
+        # heuristics. Actual allocation checks below should use mem_get_info().
+        self.model_weight_consumption_by_device = {
+            dev: (self.model_size * 2) * (layers_by_device[dev] / max(self.layer_num, 1))
+            for dev in self.device_list
+        }
         # prefill consumption for single GPU
         prefill_consumption = self.prefill_bsz * self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # hidden
         prefill_consumption += self.prefill_bsz * self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # residual
         prefill_consumption += self.prefill_bsz * (self.num_heads + 2*self.kv_head) * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # qkv
         prefill_consumption += 4 * self.prefill_bsz * self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # temp
-        # free memory during prefill
-        self.free_memory = total_gpu_memory - model_weight_consumption - prefill_consumption*self.num_gpus
+        self.prefill_consumption_by_device = {
+            dev: prefill_consumption if layers_by_device[dev] > 0 else 0.0
+            for dev in self.device_list
+        }
+        self.free_memory_by_device = {
+            dev: self.total_memory_by_device[dev]
+            - self.model_weight_consumption_by_device[dev]
+            - self.prefill_consumption_by_device[dev]
+            for dev in self.device_list
+        }
+        self.free_memory = min(self.free_memory_by_device.values()) if self.free_memory_by_device else 0.0

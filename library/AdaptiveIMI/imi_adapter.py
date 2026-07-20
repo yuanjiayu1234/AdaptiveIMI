@@ -148,7 +148,6 @@ class IMIPipeline:
                 dim=self.head_dim,
                 device_id=self.device_id,
                 kv_dtype=self.dtype,
-                cache_manager_ptr=None,
                 enable_direct_write=self.enable_direct_write,
                 subspace_parts=self.subspace_parts,
                 runtime_config=runtime_config,

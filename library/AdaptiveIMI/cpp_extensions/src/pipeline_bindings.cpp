@@ -71,30 +71,6 @@ int32_t py_dict_get_i32(const py::dict& dict_obj, const char* key, int32_t fallb
     return fallback;
 }
 
-float py_dict_get_f32(const py::dict& dict_obj, const char* key, float fallback) {
-    py::object value = py_dict_get_value(dict_obj, key);
-    if (value.is_none()) {
-        return fallback;
-    }
-    try {
-        if (py::isinstance<py::bool_>(value)) {
-            return py::cast<bool>(value) ? 1.0f : 0.0f;
-        }
-        if (py::isinstance<py::int_>(value)) {
-            return static_cast<float>(py::cast<int64_t>(value));
-        }
-        if (py::isinstance<py::float_>(value)) {
-            return py::cast<float>(value);
-        }
-        if (py::isinstance<py::str>(value)) {
-            return std::stof(py::cast<std::string>(value));
-        }
-    } catch (...) {
-        return fallback;
-    }
-    return fallback;
-}
-
 std::vector<int32_t> py_sequence_to_i32_vector(const py::handle& obj) {
     std::vector<int32_t> out;
     if (obj.is_none()) {
@@ -195,10 +171,6 @@ LayerPipelineRuntimeConfig runtime_config_from_python(const py::object& runtime_
     cfg.omp_max_active_levels = py_dict_get_i32(pipeline, "omp_max_active_levels", cfg.omp_max_active_levels);
 
     cfg.kmeans_max_iters = py_dict_get_i32(kmeans, "max_iters", cfg.kmeans_max_iters);
-    cfg.kmeans_tol = py_dict_get_f32(kmeans, "tol", cfg.kmeans_tol);
-    cfg.kmeans_early_stop_min_iter = py_dict_get_i32(kmeans, "early_stop_min_iter", cfg.kmeans_early_stop_min_iter);
-    cfg.kmeans_early_stop_rel_tol = py_dict_get_f32(kmeans, "early_stop_rel_tol", cfg.kmeans_early_stop_rel_tol);
-    cfg.fp32_convert_chunk_elems = py_dict_get_i32(kmeans, "fp32_convert_chunk_elems", cfg.fp32_convert_chunk_elems);
     cfg.kmeans_target_cluster_size = py_dict_get_i32(
         kmeans,
         "target_cluster_size",
@@ -252,19 +224,8 @@ py::dict kmeans_result_to_dict(const KmeansResult* result) {
     d["kv_heads"] = result->kv_heads;
     d["n_tokens"] = result->n_tokens;
     d["dim"] = result->dim;
-    // ✅ 【架构统一】转换合并后的labels
-    py::list per_head_labels_list;
-    for (const auto& labels : result->per_head_labels) {
-        auto labels_tensor = torch::from_blob(
-            const_cast<int32_t*>(labels.data()),
-            {static_cast<int64_t>(labels.size())},
-            torch::kInt32
-        ).clone();
-        per_head_labels_list.append(labels_tensor);
-    }
-    d["per_head_labels"] = per_head_labels_list;
 
-    // ✅ 【架构统一】转换合并后的centroids（完整128维）
+    // Merged full-dimensional centroids.
     py::list per_head_centroids_list;
     for (size_t head_idx = 0; head_idx < result->per_head_centroids.size(); head_idx++) {
         const auto& centroids = result->per_head_centroids[head_idx];
@@ -548,7 +509,6 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                          int dim,
                          int device_id,
                          py::object kv_dtype_obj,
-                         void* cache_manager_ptr,
                          bool enable_direct_write,
                          int subspace_parts,
                          py::object runtime_config_obj) {
@@ -564,7 +524,6 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                     dim,
                     device_id,
                     kv_dtype,
-                    cache_manager_ptr,
                     enable_direct_write,
                     subspace_parts,
                     runtime_config
@@ -576,7 +535,6 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
              py::arg("dim"),
              py::arg("device_id"),
              py::arg("kv_dtype") = py::none(),
-             py::arg("cache_manager_ptr") = nullptr,
              py::arg("enable_direct_write") = true,
              py::arg("subspace_parts") = 8,
              py::arg("runtime_config") = py::none(),
@@ -590,7 +548,6 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                     dim: Hidden dimension per head (typically 128)
                     device_id: CUDA device ID
                     kv_dtype: torch dtype for KV tensors (torch.float16 or torch.bfloat16)
-                    cache_manager_ptr: Optional pointer to cache manager (not used yet)
                     enable_direct_write: Enable C++ direct CPU buffer write (default: True)
                     subspace_parts: Learned partition subspace count. hybrid_8way_v2 requires 8.
 
@@ -800,10 +757,10 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
 
                 Returns:
                     Dictionary with keys:
-                      - 'per_head_labels': List[torch.Tensor] (int32, shape [n_tokens])
                       - 'per_head_centroids': List[torch.Tensor] (float32, shape [n_clusters, dim])
-                      - 'per_head_cluster_offsets': List[List[int]] (CSR format)
                       - 'per_head_n_clusters': List[int]
+                      - 'per_head_labels_m': List[List[torch.Tensor]] for subspace labels
+                      - 'per_head_centroids_m': List[List[torch.Tensor]] for subspace centroids
             )pbdoc")
 
         .def("get_metadata_result",
@@ -964,60 +921,6 @@ PYBIND11_MODULE(ultra_layer_pipeline_cpp, m) {
                         return results
 
                     pipeline.set_batch_allocate_cpu_buffer_callback(batch_allocate)
-            )pbdoc")
-
-        .def("set_batch_register_from_cpp_callback",
-            [](LayerPipeline& self, py::object callback) {
-                self.set_batch_register_from_cpp_callback(
-                    [callback](int32_t layer_idx, const std::vector<HeadMetadata>& all_heads_data) -> bool {
-                        py::gil_scoped_acquire acquire;
-
-                        try {
-                            // 转换HeadMetadata为Python list
-                            py::list py_heads_data;
-                            for (const auto& head_data : all_heads_data) {
-                                py::tuple item = py::make_tuple(
-                                    head_data.head_idx,
-                                    head_data.cluster_sizes,
-                                    head_data.cluster_offsets,
-                                    head_data.centroids
-                                );
-                                py_heads_data.append(item);
-                            }
-
-                            // Call Python: callback(layer_idx, all_heads_data) -> bool
-                            bool result = callback(layer_idx, py_heads_data).cast<bool>();
-                            return result;
-
-                        } catch (const std::exception& e) {
-                            std::cerr << "❌ [BatchRegisterCallback] Layer " << layer_idx
-                                      << ": " << e.what() << "\n";
-                            return false;
-                        }
-                    }
-                );
-            },
-            py::arg("callback"),
-            R"pbdoc(
-                Set batch callback for metadata + centroids registration (all row/head entries in one call).
-
-                Args:
-                    callback: Python function with signature:
-                              (layer_idx: int, all_heads_data: List[Tuple]) -> bool
-
-                              all_heads_data: List of (head_idx, cluster_sizes, cluster_offsets, centroids)
-                              Return: bool (success/failure)
-
-                Example:
-                    def batch_register(layer_idx, all_heads_data):
-                        for head_idx, cluster_sizes, cluster_offsets, centroids in all_heads_data:
-                            # Register metadata for this head
-                            cache_manager.register_metadata(layer_idx, head_idx, ...)
-                        return True
-
-                    pipeline.set_batch_register_from_cpp_callback(batch_register)
             )pbdoc");
-
-
 
 }

@@ -9,19 +9,18 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <cstdint>
 #include <vector>
 #include <deque>
 #include <memory>
 #include <functional>
 #include <optional>
-#include "types.hpp"  // ✅ 基础类型别名（fp16等）
 
 namespace imi {
 
 // ════════════════════════════════════════════════════════════════════════
 // Forward Declarations
 // ════════════════════════════════════════════════════════════════════════
-struct PipelineContext;
 struct HeadReorgInput;
 
 // ════════════════════════════════════════════════════════════════════════
@@ -60,8 +59,7 @@ struct KmeansResult {
     std::vector<std::vector<std::vector<float>>> per_head_centroids_m;  // [rows][8][k_m * sub_dim]
     std::vector<std::vector<int32_t>> per_head_subspace_dims;           // [rows][8]
 
-    // ✅ 【统一输出】合并后的labels和centroids（对外接口）
-    std::vector<std::vector<int32_t>> per_head_labels;          // [rows][n_tokens]（已合并）
+    // Merged full-dimensional centroids exposed to Python.
     std::vector<std::vector<float>> per_head_centroids;         // [rows][n_clusters * dim]（已合并）
 
     // ✅ 实际簇数
@@ -96,34 +94,12 @@ struct CPUBufferDescriptor {
     int32_t head_idx;
 };
 
-// Callback types (Original - per-head)
-    using AllocateCPUBufferCallback = std::function<CPUBufferDescriptor(int32_t layer_idx, int32_t head_idx, int32_t required_tokens)>;
-    using RegisterFromCppCallback = std::function<void(int32_t layer_idx, int32_t head_idx,
-                                                       const std::vector<int32_t>& cluster_sizes,
-                                                       const std::vector<int32_t>& cluster_offsets,
-                                                       const torch::Tensor& centroids)>;
-
 // Batch callback types. In multi-batch mode, row_idx = batch_idx * kv_heads + head_idx.
 // Batch allocate: input List[(row_idx, required_tokens)], output List[CPUBufferDescriptor].
 using BatchAllocateCPUBufferCallback = std::function<std::vector<CPUBufferDescriptor>(
     int32_t layer_idx,
     const std::vector<std::pair<int32_t, int32_t>>& heads_info  // [(row_idx, required_tokens)]
 )>;
-
-// Batch register: input all row/head metadata, output bool.
-struct HeadMetadata {
-    int32_t head_idx;
-    std::vector<int32_t> cluster_sizes;
-    std::vector<int32_t> cluster_offsets;
-    torch::Tensor centroids;
-};
-
-using BatchRegisterFromCppCallback = std::function<bool(
-    int32_t layer_idx,
-    const std::vector<HeadMetadata>& all_heads_data
-)>;
-
-
 
 // ════════════════════════════════════════════════════════════════════════
 // LayerPipeline - Complete End-to-End Pipeline
@@ -135,10 +111,6 @@ struct LayerPipelineRuntimeConfig {
     bool enable_omp_nested = false;
     int32_t omp_max_active_levels = 1;
     int32_t kmeans_max_iters = 25;
-    float kmeans_tol = 5e-4f;
-    int32_t kmeans_early_stop_min_iter = 5;
-    float kmeans_early_stop_rel_tol = 5e-4f;
-    int32_t fp32_convert_chunk_elems = 1 << 20;
     bool defer_merge_until_wait = false;
     int32_t kmeans_target_cluster_size = 16;
     bool learned_partition_enabled = false;
@@ -162,7 +134,6 @@ public:
         int dim,
         int device_id,
         torch::Dtype kv_dtype = torch::kFloat16,
-        void* cache_manager_ptr = nullptr,  // Python ClusterBasedCacheManager*
         bool enable_direct_write = true,  // Enable C++ direct CPU buffer write
         int subspace_parts = 8,
         LayerPipelineRuntimeConfig runtime_config = {}
@@ -266,12 +237,6 @@ public:
         batch_allocate_cpu_buffer_cb_ = std::move(callback);
     }
 
-    void set_batch_register_from_cpp_callback(BatchRegisterFromCppCallback callback) {
-        batch_register_from_cpp_cb_ = std::move(callback);
-    }
-
-  
-
 private:
     struct ChunkTransfer {
         int chunk_id = 0;
@@ -321,19 +286,13 @@ private:
     LayerPipelineRuntimeConfig runtime_config_{};
     int worker_threads_ = 32;
 
-    // Python cache_manager reference (NOT owned)
-    void* cache_manager_ptr_;
     bool enable_direct_write_;
 
     // ════════════════════════════════════════════════════════════════════════
     // CPU Buffer Write Interface
     // ════════════════════════════════════════════════════════════════════════
-    // Original per-head callbacks
-    AllocateCPUBufferCallback allocate_cpu_buffer_cb_;
-
-    // ✅ 【GIL优化】Batch callbacks (priority over per-head)
+    // Batch callback used to allocate final CPU buffers.
     BatchAllocateCPUBufferCallback batch_allocate_cpu_buffer_cb_;
-    BatchRegisterFromCppCallback batch_register_from_cpp_cb_;
 
 
 
