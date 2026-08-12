@@ -10,7 +10,6 @@
 *.userosscache
 *.sln.docstates
 
-/outputs/
 *.so
 
 # Local third-party dependency checkouts. Install these as environment
@@ -453,14 +452,56 @@ third_party/*
 third_party/weighted_flash_attention/**/__pycache__/
 third_party/weighted_flash_attention/**/*.py[cod]
 
-# Keep outputs ignored except the small learned partition needed by the
-# checked-in llama3 RULER config.
-!/outputs/
+# Keep generated outputs ignored by default. Only learned partition maps are
+# published; calibration data, profiles, traces, and temporary files remain
+# local.
 /outputs/*
 !/outputs/train_data/
 /outputs/train_data/*
 !/outputs/train_data/partitions/
-/outputs/train_data/partitions/*
-!/outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/
-/outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/*
-!/outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/llama3_partition.json
+/outputs/train_data/partitions/**
+
+# ---------------------------------------------------------------------------
+# AdaptiveIMI local experiment artifacts
+# ---------------------------------------------------------------------------
+
+# Benchmark runtime caches and generated files.
+benchmark/**/__pycache__/
+benchmark/**/*.py[cod]
+benchmark/**/.cache/
+benchmark/**/*.log
+benchmark/**/*.out
+benchmark/**/*.err
+benchmark/**/*.tsv
+
+# Keep benchmark source/configuration files, but do not commit local datasets
+# or generated predictions/results.
+benchmark/AIME26/data/
+benchmark/math500/test.jsonl
+benchmark/**/results/
+
+# Keep the complete reviewer-results directory, including all file types.
+# Do not add an ignore rule below this line for newResults/.
+!newResults/
+!newResults/**
+
+# Keep learned RoPE-pair/subspace partition maps, but not calibration data,
+# temporary search traces, or other generated files under the partition trees.
+!/outputs/train_data/partitions/**/
+!/outputs/train_data/partitions/**/*_partition.json
+
+# Local model/checkpoint and experiment output directories.
+**/checkpoints/
+**/runs/
+**/wandb/
+**/tensorboard/
+**/*.safetensors
+**/*.pt
+**/*.pth
+**/*.bin
+
+# newResults is intentionally published in full, including any future
+# supporting files placed under this directory. These rules come last so they
+# override generic model/checkpoint extension rules above.
+!newResults/
+!newResults/**

@@ -1,0 +1,22 @@
+component,statistic_level,unit,mean,median,p95,maximum,notes
+calibration_documents,shared_calibration_set,count,11,,,,4 BookSum + 4 NoLiMa + 3 BABILong documents
+calibration_input_characters,shared_calibration_set,count,5231886,,,,No evaluation examples used
+collected_tokens,per_layer_head,count,1323074,,,,After prompt construction and static trimming
+retained_k_vectors,per_layer_head,count,131072,,,,Reservoir-sampled vectors used by each layer-head search
+teacher_clusters,per_layer_head,count,8192,,,,Full-dimensional KMeans teacher
+key_collection_time,per_profiled_layer,s,32.4810,32.6782,44.4250,45.7302,LAYER_BATCH_SIZE=1 and device=auto
+teacher_construction_time,per_layer_head,s,0.3503,0.3183,0.5743,0.5752,Aggregated over profiled layer-head scopes
+partition_search_time,per_layer_head,s,92.3121,92.5229,95.4541,97.6020,Aggregated over profiled layer-head scopes
+partition_search_process_time,per_profiled_layer,s,742.3665,740.5724,745.5350,746.0864,Includes teacher construction and all 8 heads
+candidate_partitions,per_layer_head,count,12476.7083,12474.5000,12492.0000,12498.0000,Unique cached candidates evaluated
+normalized_centroid_mse,per_layer_head,unitless,0.2559,0.2472,0.3346,0.4135,Final value
+final_max_cell_size,per_layer_head,count,87.0000,89.0000,95.8500,96.0000,All hard-cap violations are zero
+convergence_to_1pct_final,per_layer_head,candidate_evaluations,3975.7917,4320.0000,8771.3000,10958.0000,Best-so-far objective trace
+convergence_to_1pct_final,per_layer_head,s,29.5897,32.6829,66.2014,78.8705,Best-so-far objective trace
+collection_peak_cpu_rss,maximum_over_profiling_runs,GiB,,,,5.3885,Process RSS
+collection_peak_gpu_reserved,maximum_over_profiling_runs,GiB,,,,10.3594,PyTorch reserved memory
+search_peak_cpu_rss,maximum_over_profiling_runs,GiB,,,,1.2587,Process RSS
+search_peak_gpu_reserved,maximum_over_profiling_runs,GiB,,,,6.4727,PyTorch reserved memory
+projected_full_search_time,32_layer_model,hours,6.5988,,,,Projection from mean per-layer search-process time
+projected_full_collection_time,32_layer_model,hours,2.0091,,,,Linear-fit planning estimate from profiled runs
+projected_full_preprocessing_time,32_layer_model,hours,8.6079,,,,Estimated rather than directly measured

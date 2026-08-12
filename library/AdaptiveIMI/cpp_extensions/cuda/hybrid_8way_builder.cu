@@ -26,11 +26,12 @@ __device__ __forceinline__ float load_key_value(
     int64_t h,
     int64_t t,
     int64_t d,
-    int64_t kv_heads,
-    int64_t max_tokens,
-    int64_t head_dim
+    int64_t stride_b,
+    int64_t stride_h,
+    int64_t stride_t,
+    int64_t stride_d
 ) {
-    const int64_t offset = (((b * kv_heads + h) * max_tokens + t) * head_dim + d);
+    const int64_t offset = b * stride_b + h * stride_h + t * stride_t + d * stride_d;
     return static_cast<float>(keys[offset]);
 }
 
@@ -81,6 +82,45 @@ __device__ __forceinline__ int sample_token_index(int token_count, int row, int 
     return static_cast<int>(make_seed(row, subspace, k, iter, salt) % static_cast<uint64_t>(token_count));
 }
 
+__global__ void materialize_hybrid_decode_metadata_kernel(
+    const float* __restrict__ centroids_compact,
+    const int32_t* __restrict__ cluster_sizes_compact,
+    const int32_t* __restrict__ cluster_counts,
+    float* __restrict__ centroids_full,
+    int32_t* __restrict__ cluster_sizes_full,
+    bool* __restrict__ centroids_mask_full,
+    int64_t rows,
+    int64_t compact_clusters,
+    int64_t n_centroids,
+    int64_t head_dim
+) {
+    const int64_t total_centroids = rows * compact_clusters * head_dim;
+    const int64_t total_metadata = rows * n_centroids;
+    const int64_t total = total_centroids > total_metadata ? total_centroids : total_metadata;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        if (idx < total_centroids) {
+            const int64_t row_stride = compact_clusters * head_dim;
+            const int64_t row = idx / row_stride;
+            const int64_t row_rem = idx - row * row_stride;
+            const int64_t cluster = row_rem / head_dim;
+            const int64_t dim = row_rem - cluster * head_dim;
+            centroids_full[(row * n_centroids + cluster) * head_dim + dim] =
+                centroids_compact[idx];
+        }
+        if (idx < total_metadata) {
+            const int64_t row = idx / n_centroids;
+            const int64_t cluster = idx - row * n_centroids;
+            const int32_t count = cluster_counts[row];
+            const bool valid = cluster < compact_clusters && cluster < static_cast<int64_t>(count);
+            const int32_t size = valid ? cluster_sizes_compact[row * compact_clusters + cluster] : 0;
+            cluster_sizes_full[idx] = size;
+            centroids_mask_full[idx] = (!valid) || (size == 0);
+        }
+    }
+}
+
 template <typename scalar_t>
 __global__ void init_centroids_sampled_kernel(
     const scalar_t* __restrict__ keys,
@@ -94,6 +134,10 @@ __global__ void init_centroids_sampled_kernel(
     int kv_heads,
     int max_tokens,
     int head_dim,
+    int64_t key_stride_b,
+    int64_t key_stride_h,
+    int64_t key_stride_t,
+    int64_t key_stride_d,
     int max_k,
     int max_sub_dim
 ) {
@@ -133,7 +177,7 @@ __global__ void init_centroids_sampled_kernel(
         for (int d = threadIdx.x; d < sub_dim; d += blockDim.x) {
             const int64_t source_dim = dim_ids[dim_base + d];
             centroids[centroid_base + d] = load_key_value(
-                keys, b, h, selected, source_dim, kv_heads, max_tokens, head_dim
+                keys, b, h, selected, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d
             );
         }
         if (threadIdx.x == 0) {
@@ -158,6 +202,10 @@ __global__ void assign_reduce_kernel(
     int kv_heads,
     int max_tokens,
     int head_dim,
+    int64_t key_stride_b,
+    int64_t key_stride_h,
+    int64_t key_stride_t,
+    int64_t key_stride_d,
     int max_k,
     int max_sub_dim
 ) {
@@ -189,7 +237,7 @@ __global__ void assign_reduce_kernel(
             const int centroid_base = ((row * kSubspaces + subspace) * max_k + k) * max_sub_dim;
             for (int d = 0; d < sub_dim; ++d) {
                 const int64_t source_dim = dim_ids[dim_base + d];
-                const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+                const float x = load_key_value(keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d);
                 const float c = centroids[centroid_base + d];
                 const float diff = x - c;
                 dist += diff * diff;
@@ -205,7 +253,7 @@ __global__ void assign_reduce_kernel(
         const int sum_base = ((row * kSubspaces + subspace) * max_k + best_k) * max_sub_dim;
         for (int d = 0; d < sub_dim; ++d) {
             const int64_t source_dim = dim_ids[dim_base + d];
-            const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+            const float x = load_key_value(keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d);
             atomicAdd(&sums[sum_base + d], x);
         }
     }
@@ -226,6 +274,10 @@ __global__ void assign_reduce_tiled_kernel(
     int kv_heads,
     int max_tokens,
     int head_dim,
+    int64_t key_stride_b,
+    int64_t key_stride_h,
+    int64_t key_stride_t,
+    int64_t key_stride_d,
     int max_k,
     int max_sub_dim,
     int tile_tokens,
@@ -273,7 +325,7 @@ __global__ void assign_reduce_tiled_kernel(
             float dist = 0.0f;
             for (int d = 0; d < sub_dim; ++d) {
                 const int source_dim = shared_dim_ids[d];
-                const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+                const float x = load_key_value(keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d);
                 const float c = shared_centroids[k * max_sub_dim + d];
                 const float diff = x - c;
                 dist += diff * diff;
@@ -289,7 +341,7 @@ __global__ void assign_reduce_tiled_kernel(
         const int sum_base = best_k * max_sub_dim;
         for (int d = 0; d < sub_dim; ++d) {
             const int source_dim = shared_dim_ids[d];
-            const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+            const float x = load_key_value(keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d);
             atomicAdd(&shared_sums[sum_base + d], x);
         }
     }
@@ -320,6 +372,10 @@ __global__ void assign_reduce_tiled_warp_private_kernel(
     int kv_heads,
     int max_tokens,
     int head_dim,
+    int64_t key_stride_b,
+    int64_t key_stride_h,
+    int64_t key_stride_t,
+    int64_t key_stride_d,
     int max_k,
     int max_sub_dim,
     int tile_tokens,
@@ -374,7 +430,7 @@ __global__ void assign_reduce_tiled_warp_private_kernel(
             float dist = 0.0f;
             for (int d = 0; d < sub_dim; ++d) {
                 const int source_dim = shared_dim_ids[d];
-                const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+                const float x = load_key_value(keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d);
                 const float c = shared_centroids[k * max_sub_dim + d];
                 const float diff = x - c;
                 dist += diff * diff;
@@ -390,7 +446,7 @@ __global__ void assign_reduce_tiled_warp_private_kernel(
         const int sum_base = (warp_id * max_k + best_k) * max_sub_dim;
         for (int d = 0; d < sub_dim; ++d) {
             const int source_dim = shared_dim_ids[d];
-            const float x = load_key_value(keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim);
+            const float x = load_key_value(keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d);
             atomicAdd(&warp_sums[sum_base + d], x);
         }
     }
@@ -433,6 +489,10 @@ __global__ void reduce_update_tiled_kernel(
     int kv_heads,
     int max_tokens,
     int head_dim,
+    int64_t key_stride_b,
+    int64_t key_stride_h,
+    int64_t key_stride_t,
+    int64_t key_stride_d,
     int max_k,
     int max_sub_dim,
     int tiles_per_task,
@@ -486,7 +546,7 @@ __global__ void reduce_update_tiled_kernel(
             const int token = sample_token_index(token_count, row, subspace, k, iter, 12345ULL);
             const int64_t source_dim = dim_ids[dim_base + dim];
             centroids[value_offset] = load_key_value(
-                keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim
+                keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d
             );
         }
     }
@@ -507,6 +567,10 @@ __global__ void update_centroids_kernel(
     int kv_heads,
     int max_tokens,
     int head_dim,
+    int64_t key_stride_b,
+    int64_t key_stride_h,
+    int64_t key_stride_t,
+    int64_t key_stride_d,
     int max_k,
     int max_sub_dim,
     int iter
@@ -548,7 +612,7 @@ __global__ void update_centroids_kernel(
             const int token = sample_token_index(token_count, row, subspace, k, iter, 12345ULL);
             const int64_t source_dim = dim_ids[dim_base + dim];
             centroids[value_offset] = load_key_value(
-                keys, b, h, token, source_dim, kv_heads, max_tokens, head_dim
+                keys, b, h, token, source_dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d
             );
         }
     }
@@ -747,7 +811,11 @@ __global__ void compute_true_full_centroids_kernel(
     int kv_heads,
     int max_tokens,
     int max_clusters,
-    int head_dim
+    int head_dim,
+    int64_t key_stride_b,
+    int64_t key_stride_h,
+    int64_t key_stride_t,
+    int64_t key_stride_d
 ) {
     const int64_t total = static_cast<int64_t>(rows) * max_clusters * head_dim;
     for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x; linear < total; linear += gridDim.x * blockDim.x) {
@@ -774,15 +842,19 @@ __global__ void compute_true_full_centroids_kernel(
         for (int i = 0; i < size; ++i) {
             const int token = token_ids[token_base + start + i];
             if (token >= 0 && token < max_tokens) {
-                sum += load_key_value(keys, b, h, token, dim, kv_heads, max_tokens, head_dim);
+                sum += load_key_value(keys, b, h, token, dim, key_stride_b, key_stride_h, key_stride_t, key_stride_d);
             }
         }
         full_centroids[(row * max_clusters + cluster) * head_dim + dim] = sum / static_cast<float>(size);
     }
 }
 
-inline void check_cuda(const torch::Tensor& tensor, const char* name) {
+inline void check_cuda_tensor(const torch::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+}
+
+inline void check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
+    check_cuda_tensor(tensor, name);
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
@@ -798,11 +870,11 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     int64_t max_k_arg,
     int64_t max_compact_clusters_arg
 ) {
-    check_cuda(keys, "keys");
-    check_cuda(row_token_counts, "row_token_counts");
-    check_cuda(subspace_dim_ids, "subspace_dim_ids");
-    check_cuda(subspace_dim_masks, "subspace_dim_masks");
-    check_cuda(k_values, "k_values");
+    check_cuda_tensor(keys, "keys");
+    check_cuda_contiguous(row_token_counts, "row_token_counts");
+    check_cuda_contiguous(subspace_dim_ids, "subspace_dim_ids");
+    check_cuda_contiguous(subspace_dim_masks, "subspace_dim_masks");
+    check_cuda_contiguous(k_values, "k_values");
 
     TORCH_CHECK(keys.dim() == 4, "keys must be [batch, kv_heads, max_tokens, head_dim]");
     TORCH_CHECK(row_token_counts.scalar_type() == torch::kInt32, "row_token_counts must be int32");
@@ -815,6 +887,10 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     const auto kv_heads = keys.size(1);
     const auto max_tokens = keys.size(2);
     const auto head_dim = keys.size(3);
+    const int64_t key_stride_b = keys.stride(0);
+    const int64_t key_stride_h = keys.stride(1);
+    const int64_t key_stride_t = keys.stride(2);
+    const int64_t key_stride_d = keys.stride(3);
     const int rows = static_cast<int>(batch_size * kv_heads);
     TORCH_CHECK(row_token_counts.numel() == rows, "row_token_counts rows mismatch");
     TORCH_CHECK(subspace_dim_ids.size(0) == rows, "subspace_dim_ids rows mismatch");
@@ -836,6 +912,16 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     int sm_count = 1;
     cudaGetDevice(&current_device);
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, current_device);
+    const int threads = 256;
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const int64_t assign_total = static_cast<int64_t>(rows) * kSubspaces * max_tokens;
+    const int assign_blocks = capped_blocks(assign_total, threads, sm_count);
+    const int tile_tokens = 512;
+    const int tiles_per_task = static_cast<int>((max_tokens + tile_tokens - 1) / tile_tokens);
+    const bool use_tiled_reduce = max_k <= 32 && max_sub_dim <= 64;
+    const bool use_warp_private_reduce = use_tiled_reduce && max_k <= 16 && max_sub_dim <= 32;
+    const int64_t partial_tasks = static_cast<int64_t>(rows) * kSubspaces * tiles_per_task;
+
     auto labels = torch::zeros({rows, kSubspaces, max_tokens}, keys.options().dtype(torch::kInt32));
     auto centroids = torch::zeros({rows, kSubspaces, max_k, max_sub_dim}, keys.options().dtype(torch::kFloat32));
     auto centroid_masks = torch::ones({rows, kSubspaces, max_k}, keys.options().dtype(torch::kBool));
@@ -853,8 +939,6 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     auto cluster_scan = torch::empty({rows, max_tokens}, keys.options().dtype(torch::kInt32));
     auto segment_offsets = torch::empty({rows + 1}, keys.options().dtype(torch::kInt64));
 
-    const int threads = 256;
-    const auto stream = at::cuda::getCurrentCUDAStream();
     const int64_t init_tasks = static_cast<int64_t>(rows) * kSubspaces;
     const int init_blocks = static_cast<int>(init_tasks);
     const int64_t update_total = static_cast<int64_t>(rows) * kSubspaces * max_k * max_sub_dim;
@@ -878,6 +962,10 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
                 static_cast<int>(kv_heads),
                 static_cast<int>(max_tokens),
                 static_cast<int>(head_dim),
+                key_stride_b,
+                key_stride_h,
+                key_stride_t,
+                key_stride_d,
                 max_k,
                 max_sub_dim
             );
@@ -885,13 +973,6 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    const int64_t assign_total = static_cast<int64_t>(rows) * kSubspaces * max_tokens;
-    const int assign_blocks = capped_blocks(assign_total, threads, sm_count);
-    const int tile_tokens = 512;
-    const int tiles_per_task = static_cast<int>((max_tokens + tile_tokens - 1) / tile_tokens);
-    const bool use_tiled_reduce = max_k <= 32 && max_sub_dim <= 64;
-    const bool use_warp_private_reduce = use_tiled_reduce && max_k <= 16 && max_sub_dim <= 32;
-    const int64_t partial_tasks = static_cast<int64_t>(rows) * kSubspaces * tiles_per_task;
     torch::Tensor partial_sums;
     torch::Tensor partial_counts;
     if (use_tiled_reduce) {
@@ -943,6 +1024,10 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
                             static_cast<int>(kv_heads),
                             static_cast<int>(max_tokens),
                             static_cast<int>(head_dim),
+                            key_stride_b,
+                            key_stride_h,
+                            key_stride_t,
+                            key_stride_d,
                             max_k,
                             max_sub_dim,
                             tile_tokens,
@@ -963,6 +1048,10 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
                             static_cast<int>(kv_heads),
                             static_cast<int>(max_tokens),
                             static_cast<int>(head_dim),
+                            key_stride_b,
+                            key_stride_h,
+                            key_stride_t,
+                            key_stride_d,
                             max_k,
                             max_sub_dim,
                             tile_tokens,
@@ -994,6 +1083,10 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
                         static_cast<int>(kv_heads),
                         static_cast<int>(max_tokens),
                         static_cast<int>(head_dim),
+                        key_stride_b,
+                        key_stride_h,
+                        key_stride_t,
+                        key_stride_d,
                         max_k,
                         max_sub_dim,
                         tiles_per_task,
@@ -1026,6 +1119,10 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
                         static_cast<int>(kv_heads),
                         static_cast<int>(max_tokens),
                         static_cast<int>(head_dim),
+                        key_stride_b,
+                        key_stride_h,
+                        key_stride_t,
+                        key_stride_d,
                         max_k,
                         max_sub_dim
                     );
@@ -1053,6 +1150,10 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
                         static_cast<int>(kv_heads),
                         static_cast<int>(max_tokens),
                         static_cast<int>(head_dim),
+                        key_stride_b,
+                        key_stride_h,
+                        key_stride_t,
+                        key_stride_d,
                         max_k,
                         max_sub_dim,
                         iter
@@ -1202,7 +1303,11 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
                 static_cast<int>(kv_heads),
                 static_cast<int>(max_tokens),
                 static_cast<int>(max_compact_clusters),
-                static_cast<int>(head_dim)
+                static_cast<int>(head_dim),
+                key_stride_b,
+                key_stride_h,
+                key_stride_t,
+                key_stride_d
             );
         }
     );
@@ -1215,6 +1320,75 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
         cluster_counts,
         full_centroids,
     };
+}
+
+void materialize_hybrid_decode_metadata_cuda(
+    const torch::Tensor& centroids_compact,
+    const torch::Tensor& cluster_sizes_compact,
+    const torch::Tensor& cluster_counts,
+    const torch::Tensor& centroids_full,
+    const torch::Tensor& cluster_sizes_full,
+    const torch::Tensor& centroids_mask_full
+) {
+    TORCH_CHECK(centroids_compact.is_cuda(), "centroids_compact must be a CUDA tensor");
+    TORCH_CHECK(cluster_sizes_compact.is_cuda(), "cluster_sizes_compact must be a CUDA tensor");
+    TORCH_CHECK(cluster_counts.is_cuda(), "cluster_counts must be a CUDA tensor");
+    TORCH_CHECK(centroids_full.is_cuda(), "centroids_full must be a CUDA tensor");
+    TORCH_CHECK(cluster_sizes_full.is_cuda(), "cluster_sizes_full must be a CUDA tensor");
+    TORCH_CHECK(centroids_mask_full.is_cuda(), "centroids_mask_full must be a CUDA tensor");
+    TORCH_CHECK(centroids_compact.is_contiguous(), "centroids_compact must be contiguous");
+    TORCH_CHECK(cluster_sizes_compact.is_contiguous(), "cluster_sizes_compact must be contiguous");
+    TORCH_CHECK(cluster_counts.is_contiguous(), "cluster_counts must be contiguous");
+    TORCH_CHECK(centroids_full.is_contiguous(), "centroids_full must be contiguous");
+    TORCH_CHECK(cluster_sizes_full.is_contiguous(), "cluster_sizes_full must be contiguous");
+    TORCH_CHECK(centroids_mask_full.is_contiguous(), "centroids_mask_full must be contiguous");
+    TORCH_CHECK(centroids_compact.dim() == 3, "centroids_compact must be [rows, compact_clusters, head_dim]");
+    TORCH_CHECK(cluster_sizes_compact.dim() == 2, "cluster_sizes_compact must be [rows, compact_clusters]");
+    TORCH_CHECK(cluster_counts.dim() == 1, "cluster_counts must be [rows]");
+    TORCH_CHECK(centroids_full.dim() == 3, "centroids_full must be [rows, n_centroids, head_dim]");
+    TORCH_CHECK(cluster_sizes_full.dim() == 2, "cluster_sizes_full must be [rows, n_centroids]");
+    TORCH_CHECK(centroids_mask_full.dim() == 2, "centroids_mask_full must be [rows, n_centroids]");
+    TORCH_CHECK(centroids_compact.scalar_type() == torch::kFloat32, "centroids_compact must be float32");
+    TORCH_CHECK(cluster_sizes_compact.scalar_type() == torch::kInt32, "cluster_sizes_compact must be int32");
+    TORCH_CHECK(cluster_counts.scalar_type() == torch::kInt32, "cluster_counts must be int32");
+    TORCH_CHECK(centroids_full.scalar_type() == torch::kFloat32, "centroids_full must be float32");
+    TORCH_CHECK(cluster_sizes_full.scalar_type() == torch::kInt32, "cluster_sizes_full must be int32");
+    TORCH_CHECK(centroids_mask_full.scalar_type() == torch::kBool, "centroids_mask_full must be bool");
+
+    const int64_t rows = centroids_compact.size(0);
+    const int64_t compact_clusters = centroids_compact.size(1);
+    const int64_t head_dim = centroids_compact.size(2);
+    const int64_t n_centroids = centroids_full.size(1);
+    TORCH_CHECK(cluster_sizes_compact.size(0) == rows, "cluster_sizes_compact row mismatch");
+    TORCH_CHECK(cluster_sizes_compact.size(1) == compact_clusters, "cluster_sizes_compact cluster mismatch");
+    TORCH_CHECK(cluster_counts.size(0) == rows, "cluster_counts row mismatch");
+    TORCH_CHECK(centroids_full.size(0) == rows, "centroids_full row mismatch");
+    TORCH_CHECK(centroids_full.size(2) == head_dim, "centroids_full head_dim mismatch");
+    TORCH_CHECK(cluster_sizes_full.size(0) == rows && cluster_sizes_full.size(1) == n_centroids, "cluster_sizes_full shape mismatch");
+    TORCH_CHECK(centroids_mask_full.size(0) == rows && centroids_mask_full.size(1) == n_centroids, "centroids_mask_full shape mismatch");
+    TORCH_CHECK(cluster_counts.numel() == rows, "cluster_counts numel mismatch");
+    TORCH_CHECK(n_centroids >= compact_clusters, "n_centroids must be >= compact_clusters");
+
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    const int threads = 256;
+    const int64_t total_centroids = rows * compact_clusters * head_dim;
+    const int64_t total_metadata = rows * n_centroids;
+    const int64_t total = total_centroids > total_metadata ? total_centroids : total_metadata;
+    const int blocks = capped_blocks(total, threads, at::cuda::getCurrentDeviceProperties()->multiProcessorCount, 4);
+
+    materialize_hybrid_decode_metadata_kernel<<<blocks, threads, 0, stream>>>(
+        centroids_compact.data_ptr<float>(),
+        cluster_sizes_compact.data_ptr<int32_t>(),
+        cluster_counts.data_ptr<int32_t>(),
+        centroids_full.data_ptr<float>(),
+        cluster_sizes_full.data_ptr<int32_t>(),
+        centroids_mask_full.data_ptr<bool>(),
+        rows,
+        compact_clusters,
+        n_centroids,
+        head_dim
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 } // namespace imi_hybrid

@@ -1,0 +1,45 @@
+{
+    "model_path": "../models/DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic",
+    "model_family": "qwen",
+    "notes": {
+        "architecture": "Qwen2ForCausalLM",
+        "quantization": "compressed-tensors FP8 dynamic activation / channel weight scaling",
+        "runtime_loading": "AdaptiveIMI uses the dedicated QwenFp8Model path with vLLM compressed-tensors FP8 linear kernels."
+    },
+    "AdaptiveIMI": {
+        "static_pattern_start": 4,
+        "static_pattern_end": 64,
+        "retrieval_budget": 0.1,
+        "buffer_cluster_num": 32,
+        "cache_ratio": 0.05,
+        "partition_path": null,
+        "partition_layout": "sequential_rope_pairs",
+        "hybrid_index": {
+            "policy": "gpu_only",
+            "start": "gpu"
+        },
+        "cache": {
+            "execution_buffer_ring_size": 2,
+            "cluster_uva_warmup_steps": 3,
+            "promotion_warmup_steps": 4
+        },
+        "kmeans": {
+            "max_iters": 15
+        },
+        "prefill": {
+            "prefill_chunk_size": 8192
+        },
+        "streaming": {
+            "hidden_device": "auto",
+            "hidden_gpu_limit_gb": 8.0,
+            "hidden_pinned_limit_gb": 8.0
+        },
+        "async_update": {
+            "enabled": true,
+            "recent_generated_tokens": 512,
+            "interval": 16,
+            "delta_nprobe": 8
+        },
+        "cpu_threads": 24
+    }
+}

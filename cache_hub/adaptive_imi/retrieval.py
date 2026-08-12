@@ -25,6 +25,8 @@ class AdaptiveIMIRetrievalMixin:
     _CACHE_PROFILE_SUM_KEYS = (
         "hit_blocks",
         "miss_blocks",
+        "hit_tokens",
+        "miss_tokens",
         "update_blocks",
         "miss_pages",
         "miss_copy_runs",
@@ -82,6 +84,22 @@ class AdaptiveIMIRetrievalMixin:
             "miss_runs_gt8p": float((run_pages > 8).sum().item()),
             "max_miss_run_pages": float(run_pages.max().item()),
         }
+
+    @staticmethod
+    def _sum_descriptor_units(sizes: torch.Tensor, counts: torch.Tensor) -> float:
+        if sizes.numel() == 0 or counts.numel() == 0:
+            return 0.0
+        max_count = int(counts.max().item())
+        if max_count <= 0:
+            return 0.0
+        bounded_sizes = sizes[:, :max_count]
+        columns = torch.arange(
+            max_count,
+            device=sizes.device,
+            dtype=counts.dtype,
+        ).view(1, -1)
+        mask = columns < counts.view(-1, 1)
+        return float(bounded_sizes.masked_select(mask).sum().item())
 
     def _cluster_uva_warmup_steps(self) -> int:
         cache_cfg = self.runtime_config.get("cache") or {}
@@ -466,7 +484,7 @@ class AdaptiveIMIRetrievalMixin:
             "miss_copy_runs": desc["miss_copy_num_units"].sum(),
             "promotion_inflight_at_retrieval": promotion_inflight_at_retrieval,
         }
-        return {
+        retrieval_result = {
             "lookup_events": (lookup_start_event, lookup_end_event),
             "gather_events": (gather_start_event, gather_end_event),
             "copy_events": {
@@ -483,6 +501,16 @@ class AdaptiveIMIRetrievalMixin:
                 "miss_copy_counts": desc["miss_copy_num_units"],
             },
         }
+        if getattr(self, "profile_token_hit_rate", False):
+            retrieval_result["diagnostic_tensors"].update(
+                {
+                    "hit_unit_sizes": desc["hit_unit_sizes"],
+                    "hit_num_units": desc["hit_num_units"],
+                    "miss_unit_sizes": desc["miss_unit_sizes"],
+                    "miss_num_units": desc["miss_num_units"],
+                }
+            )
+        return retrieval_result
     def _schedule_gpu_cache_promotion(
         self,
         layer_idx: int,
@@ -668,11 +696,12 @@ class AdaptiveIMIRetrievalMixin:
         profile = self.profile_decode and self.profile_decode_count < self.profile_decode_steps
         if profile and layer_idx == 0:
             self.profile_decode_step_idx += 1
+            self._profile_step_use_cluster_uva = self._use_cluster_uva_for_decode_step()
             self._profile_step_breakdown = {
                 "search_ms": 0.0,
                 "gather_ms": 0.0,
                 "selection_d2h_ms": 0.0,
-                "cpu_lookup_ms": 0.0,
+                "gpu_cache_plan_ms": 0.0,
                 "concat_copy_ms": 0.0,
                 "static_copy_ms": 0.0,
                 "miss_copy_ms": 0.0,
@@ -854,6 +883,14 @@ class AdaptiveIMIRetrievalMixin:
                                 diagnostic_tensors["miss_copy_counts"],
                             )
                         )
+                        cache_profile_stats["hit_tokens"] = self._sum_descriptor_units(
+                            diagnostic_tensors["hit_unit_sizes"],
+                            diagnostic_tensors["hit_num_units"],
+                        )
+                        cache_profile_stats["miss_tokens"] = self._sum_descriptor_units(
+                            diagnostic_tensors["miss_unit_sizes"],
+                            diagnostic_tensors["miss_num_units"],
+                        )
 
                     search_ms = self._elapsed_ms(event_record["start"], event_record["sim_end"])
                     attn_ms = self._elapsed_ms(event_record["attn_start"], event_record["attn_end"])
@@ -863,7 +900,7 @@ class AdaptiveIMIRetrievalMixin:
                     self._profile_step_breakdown["search_ms"] += float(search_ms)
                     self._profile_step_breakdown["gather_ms"] += float(gather_total_ms)
                     self._profile_step_breakdown["selection_d2h_ms"] += float(selection_transfer_ms)
-                    self._profile_step_breakdown["cpu_lookup_ms"] += float(lookup_ms)
+                    self._profile_step_breakdown["gpu_cache_plan_ms"] += float(lookup_ms)
                     self._profile_step_breakdown["concat_copy_ms"] += float(concat_copy_ms)
                     self._profile_step_breakdown["static_copy_ms"] += float(static_copy_ms)
                     self._profile_step_breakdown["miss_copy_ms"] += float(miss_copy_ms)
@@ -896,9 +933,31 @@ class AdaptiveIMIRetrievalMixin:
                     self.decode_breakdown_accum[k] += float(v)
 
                 self.profile_decode_count += 1
-                if self.profile_decode_count == self.profile_decode_steps:
+                hit_blocks = float(step_breakdown.get("hit_blocks", 0.0) or 0.0)
+                miss_blocks = float(step_breakdown.get("miss_blocks", 0.0) or 0.0)
+                total_blocks = hit_blocks + miss_blocks
+                use_cluster_uva = bool(
+                    getattr(self, "_profile_step_use_cluster_uva", False)
+                )
+                self.decode_profile_rows.append(
+                    {
+                        "profile_step": int(self.profile_decode_count),
+                        "use_cluster_uva": use_cluster_uva,
+                        "cache_hit_rate_valid": not use_cluster_uva,
+                        "block_hit_rate": (
+                            hit_blocks / total_blocks if total_blocks > 0 else 0.0
+                        ),
+                        **{
+                            key: float(value)
+                            for key, value in step_breakdown.items()
+                            if isinstance(value, (int, float))
+                        },
+                    }
+                )
+                if self.profile_decode_count >= self.profile_decode_steps:
                     self.decode_breakdown = {
-                        k: v / float(self.profile_decode_steps) for k, v in self.decode_breakdown_accum.items()
+                        k: v / float(self.profile_decode_count)
+                        for k, v in self.decode_breakdown_accum.items()
                     }
 
                 print(
@@ -912,15 +971,15 @@ class AdaptiveIMIRetrievalMixin:
                         step_breakdown["total_ms"],
                     )
                 )
-                if os.getenv("IMI_PROFILE_GATHER_DETAIL", "1") == "1":
+                if os.getenv("IMI_PROFILE_GATHER_DETAIL", "0") == "1":
                     print(
-                        "[IMI decode gather] step={} selection_d2h={:.3f}ms cpu_lookup={:.3f}ms "
+                        "[IMI decode gather] step={} selection_d2h={:.3f}ms gpu_cache_plan={:.3f}ms "
                         "concat_copy={:.3f}ms static_copy={:.3f}ms miss_copy={:.3f}ms hit_copy={:.3f}ms "
                         "cache_sync={:.3f}ms scatter={:.3f}ms "
                         "delta_append={:.3f}ms".format(
                             self.profile_decode_count,
                             step_breakdown.get("selection_d2h_ms", 0.0),
-                            step_breakdown.get("cpu_lookup_ms", 0.0),
+                            step_breakdown.get("gpu_cache_plan_ms", 0.0),
                             step_breakdown.get("concat_copy_ms", 0.0),
                             step_breakdown.get("static_copy_ms", 0.0),
                             step_breakdown.get("miss_copy_ms", 0.0),
@@ -930,7 +989,7 @@ class AdaptiveIMIRetrievalMixin:
                             step_breakdown.get("delta_append_ms", 0.0),
                         )
                     )
-                    if os.getenv("IMI_PROFILE_CACHE_DETAIL", os.getenv("IMI_PROFILE_GATHER_DETAIL", "1")) == "1":
+                    if os.getenv("IMI_PROFILE_CACHE_DETAIL", os.getenv("IMI_PROFILE_GATHER_DETAIL", "0")) == "1":
                         miss_pages = float(step_breakdown.get("miss_pages", step_breakdown.get("miss_blocks", 0.0)) or 0.0)
                         miss_copy_runs = float(step_breakdown.get("miss_copy_runs", 0.0) or 0.0)
                         miss_coalescing = miss_pages / max(miss_copy_runs, 1.0)
@@ -971,7 +1030,7 @@ class AdaptiveIMIRetrievalMixin:
                             )
                         )
 
-                if self.profile_decode_count == self.profile_decode_steps:
+                if self.profile_decode_count >= self.profile_decode_steps:
                     avg = self.decode_breakdown
                     print(
                         "[IMI decode breakdown][avg] search={:.3f}ms gather={:.3f}ms "
@@ -983,14 +1042,14 @@ class AdaptiveIMIRetrievalMixin:
                             avg["total_ms"],
                         )
                     )
-                    if os.getenv("IMI_PROFILE_GATHER_DETAIL", "1") == "1":
+                    if os.getenv("IMI_PROFILE_GATHER_DETAIL", "0") == "1":
                         print(
-                            "[IMI decode gather][avg] selection_d2h={:.3f}ms cpu_lookup={:.3f}ms "
+                            "[IMI decode gather][avg] selection_d2h={:.3f}ms gpu_cache_plan={:.3f}ms "
                             "concat_copy={:.3f}ms static_copy={:.3f}ms miss_copy={:.3f}ms hit_copy={:.3f}ms "
                             "cache_sync={:.3f}ms scatter={:.3f}ms "
                             "delta_append={:.3f}ms".format(
                                 avg.get("selection_d2h_ms", 0.0),
-                                avg.get("cpu_lookup_ms", 0.0),
+                                avg.get("gpu_cache_plan_ms", 0.0),
                                 avg.get("concat_copy_ms", 0.0),
                                 avg.get("static_copy_ms", 0.0),
                                 avg.get("miss_copy_ms", 0.0),
@@ -1000,7 +1059,7 @@ class AdaptiveIMIRetrievalMixin:
                                 avg.get("delta_append_ms", 0.0),
                             )
                         )
-                    if os.getenv("IMI_PROFILE_CACHE_DETAIL", os.getenv("IMI_PROFILE_GATHER_DETAIL", "1")) == "1":
+                    if os.getenv("IMI_PROFILE_CACHE_DETAIL", os.getenv("IMI_PROFILE_GATHER_DETAIL", "0")) == "1":
                         miss_pages = float(avg.get("miss_pages", avg.get("miss_blocks", 0.0)) or 0.0)
                         miss_copy_runs = float(avg.get("miss_copy_runs", 0.0) or 0.0)
                         miss_coalescing = miss_pages / max(miss_copy_runs, 1.0)

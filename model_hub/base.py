@@ -426,6 +426,7 @@ class LLM(PrefillMixin, SamplingMixin):
         self.breakdown_enabled = os.getenv("IMI_BREAKDOWN_BENCHMARK", "0") == "1"
         self.breakdown_mode = os.getenv("IMI_BREAKDOWN_MODE", "wall")
         self.last_timing_stats = {}
+        self.profile_decode_step_totals_ms = []
         self.cache_init_ms = 0.0
         self.cache_reused = False
         self.prefill_embedding_wall_ms = 0.0
@@ -467,6 +468,15 @@ class LLM(PrefillMixin, SamplingMixin):
         decode_steps = int(getattr(self, "decode_steps", 0) or 0)
         decode_total_ms = float(getattr(self, "decode_latency_s", 0.0) or 0.0) * 1000.0
         decode_ms_per_step = decode_total_ms / decode_steps if decode_steps > 0 else 0.0
+        profile_step_totals_ms = [
+            round(float(value), 4)
+            for value in (getattr(self, "profile_decode_step_totals_ms", []) or [])
+        ]
+        profile_decode_step_ms = (
+            sum(profile_step_totals_ms) / len(profile_step_totals_ms)
+            if profile_step_totals_ms
+            else 0.0
+        )
         decode_sparse = dict(getattr(kv_cache, "decode_breakdown", None) or {})
         if not decode_sparse:
             accum = dict(getattr(kv_cache, "decode_breakdown_accum", {}) or {})
@@ -475,6 +485,23 @@ class LLM(PrefillMixin, SamplingMixin):
                 decode_sparse = {key: float(value) / float(count) for key, value in accum.items()}
         sparse_total_ms = float(decode_sparse.get("total_ms", 0.0) or 0.0)
         decode_sparse["non_sparse_model_ms"] = max(decode_ms_per_step - sparse_total_ms, 0.0)
+        profile_rows = [
+            {
+                key: (bool(value) if key == "use_cluster_uva" else value)
+                for key, value in row.items()
+            }
+            for row in (getattr(kv_cache, "decode_profile_rows", []) or [])
+        ]
+
+        def hit_rate(rows, hit_key, miss_key):
+            hits = sum(float(row.get(hit_key, 0.0) or 0.0) for row in rows)
+            misses = sum(float(row.get(miss_key, 0.0) or 0.0) for row in rows)
+            total = hits + misses
+            return hits / total if total > 0 else 0.0
+
+        steady_profile_rows = [
+            row for row in profile_rows if not bool(row.get("use_cluster_uva", False))
+        ]
 
         layer_rows = []
         for row in rows:
@@ -546,8 +573,33 @@ class LLM(PrefillMixin, SamplingMixin):
                 "total_ms": round(decode_total_ms, 4),
                 "steps": decode_steps,
                 "ms_per_step": round(decode_ms_per_step, 4),
+                "profiled_steps": len(profile_rows),
+                "profile_decode_step_ms": round(profile_decode_step_ms, 4),
+                "profile_decode_step_totals_ms": profile_step_totals_ms,
+                "all_steps_block_hit_rate": round(
+                    hit_rate(profile_rows, "hit_blocks", "miss_blocks"),
+                    6,
+                ),
+                "steady_steps_block_hit_rate": round(
+                    hit_rate(steady_profile_rows, "hit_blocks", "miss_blocks"),
+                    6,
+                ),
+                "all_steps_token_hit_rate": round(
+                    hit_rate(profile_rows, "hit_tokens", "miss_tokens"),
+                    6,
+                ),
+                "steady_steps_token_hit_rate": round(
+                    hit_rate(steady_profile_rows, "hit_tokens", "miss_tokens"),
+                    6,
+                ),
+                "token_hit_rate_measured": bool(
+                    getattr(kv_cache, "profile_token_hit_rate", False)
+                ),
+                "profile_step_rows": profile_rows,
                 "sparse_avg_per_step_ms": {
-                    key: round(float(value), 4) for key, value in decode_sparse.items()
+                    key: round(float(value), 4)
+                    for key, value in decode_sparse.items()
+                    if isinstance(value, (int, float))
                 },
             },
         }
@@ -729,6 +781,9 @@ class LLM(PrefillMixin, SamplingMixin):
         decode_start = time.perf_counter()
         self.decode_latency_s = 0.0
         self.decode_steps = 0
+        profile_decode_enabled = os.getenv("IMI_PROFILE_DECODE", "0") == "1"
+        profile_decode_limit = max(int(os.getenv("IMI_PROFILE_STEPS", "5")), 0)
+        self.profile_decode_step_totals_ms = []
         debug_max_decode_steps = self._debug_max_decode_steps()
         debug_decode_steps = 0
 
@@ -736,9 +791,20 @@ class LLM(PrefillMixin, SamplingMixin):
             print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
         else:
             max_decode_steps = self.max_new_length - 1
-            for _ in range(max_decode_steps):
+            for decode_idx in range(max_decode_steps):
+                profile_step_start = (
+                    time.perf_counter()
+                    if profile_decode_enabled and decode_idx < profile_decode_limit
+                    else None
+                )
                 logits = self.decode_forward(inputs_ids=output_ids)
                 output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+                if profile_step_start is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    self.profile_decode_step_totals_ms.append(
+                        (time.perf_counter() - profile_step_start) * 1000.0
+                    )
                 debug_decode_steps += 1
                 self._debug_log_token_ids(f"decode_step_{debug_decode_steps}", output_ids)
                 if end_of_text is not None:
@@ -751,6 +817,10 @@ class LLM(PrefillMixin, SamplingMixin):
                 if debug_max_decode_steps is not None and debug_decode_steps >= debug_max_decode_steps:
                     break
 
+        # CUDA launches are asynchronous. Synchronize before measuring the
+        # complete decode wall time so TPOT includes the actual device work.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         decode_end = time.perf_counter()
         self.decode_latency_s = decode_end - decode_start
         decode_steps = max(len(outputs_ids) - 1, 0)
@@ -774,6 +844,14 @@ class LLM(PrefillMixin, SamplingMixin):
             "total_time": float(self.end2end_latency_s),
             "actual_generated": len(outputs_ids),
             "decode_steps": int(decode_steps),
+            "profile_decode_step_ms": (
+                float(sum(self.profile_decode_step_totals_ms) / len(self.profile_decode_step_totals_ms))
+                if self.profile_decode_step_totals_ms
+                else 0.0
+            ),
+            "profile_decode_step_totals_ms": [
+                float(value) for value in self.profile_decode_step_totals_ms
+            ],
             "breakdown": self._build_breakdown_stats() if self.breakdown_enabled else {},
         }
         print(colored(f"End2End Latency: {round(self.end2end_latency_s, 4)} s\n", 'green'))

@@ -2,5 +2,7 @@
     "llama-3-8b-1048k": 130000,
     "qwen2.5-7b": 130000,
     "llama-3.1-8b": 130000,
-    "qwen2.5-72b": 130000
+    "qwen2.5-72b": 130000,
+    "deepseek32b-fp8": 130000,
+    "deepseek-r1-distill-qwen-32b-fp8-dynamic": 130000
 }

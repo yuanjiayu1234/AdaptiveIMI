@@ -1,0 +1,90 @@
+{
+  "format": "adaptive_imi_representative_layer_profile_v1",
+  "model": "Llama-3.1-8B-Instruct",
+  "statistics_scope": "Aggregate statistics across profiled layer-level runs and layer-head scopes.",
+  "calibration": {
+    "documents": 11,
+    "source_document_counts": {
+      "booksum_train": 4,
+      "nolima_haystack_rand_shuffle": 4,
+      "babilong_en10k_train": 3
+    },
+    "input_characters": 5231886,
+    "max_input_characters": 524285,
+    "seen_tokens_per_layer_head": 1323074,
+    "retained_k_vectors_per_layer_head": 131072,
+    "kv_heads": 8,
+    "head_dim": 128
+  },
+  "training_configuration": {
+    "scope": "layer_head",
+    "subspaces": 8,
+    "teacher_clusters_per_scope": 8192,
+    "kmeans_iterations": 10,
+    "random_starts": 32,
+    "sequential_starts": 1,
+    "steps_per_start": 384,
+    "objective_mode": "constrained_mse",
+    "oversize_hard_cap": 96,
+    "layer_batch_size": 1
+  },
+  "measured_layers_summary": {
+    "collection_elapsed_s": {
+      "values": [19.0346, 32.6782, 45.7302],
+      "mean": 32.4810
+    },
+    "search_process_elapsed_s": {
+      "values": [746.0864, 740.4407, 740.5724],
+      "mean": 742.3665
+    },
+    "teacher_elapsed_s_per_layer": {
+      "values": [2.8017, 2.8027, 2.8017],
+      "mean": 2.8020
+    },
+    "search_elapsed_s_per_head": {
+      "mean": 92.3121,
+      "median": 92.5229,
+      "p95": 95.4541
+    },
+    "teacher_elapsed_s_per_head": {
+      "mean": 0.3503,
+      "median": 0.3183,
+      "p95": 0.5743
+    },
+    "candidate_evaluations_per_head": {
+      "mean": 12476.7083,
+      "median": 12474.5,
+      "p95": 12492.0
+    },
+    "final_max_cell_size": {
+      "maximum": 96,
+      "all_hard_cap_violations_zero": true
+    },
+    "peak_memory_bytes": {
+      "collection_cpu_rss": 5785825280,
+      "collection_gpu_reserved": 11123294208,
+      "search_cpu_rss": 1351495680,
+      "search_gpu_reserved": 6949961728
+    }
+  },
+  "convergence": {
+    "within_one_percent_of_final": {
+      "candidate_evaluations": {
+        "mean": 3975.7917,
+        "median": 4320.0,
+        "p95": 8771.3
+      },
+      "search_elapsed_s": {
+        "mean": 29.5897,
+        "median": 32.6829,
+        "p95": 66.2014
+      }
+    }
+  },
+  "projected_full_model_cost_not_direct_measurement": {
+    "partition_search_hours": 6.5988,
+    "collection_hours_from_early_layer_linear_fit": 2.0091,
+    "combined_hours": 8.6079,
+    "limitation": "Collection projection is based on aggregated profiled collection measurements and must not be presented as a directly measured full-model wall-clock time."
+  }
+}

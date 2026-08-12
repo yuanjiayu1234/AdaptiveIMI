@@ -302,8 +302,20 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
                 ).contiguous()
             )
 
+        cache_cfg = dict(self.runtime_config.get("cache") or {})
+        self.raw_d2h_pool_enabled = bool(cache_cfg.get("raw_d2h_pool_enabled", True))
+        self.raw_d2h_pool_group_size = max(1, int(cache_cfg.get("raw_d2h_pool_group_size", 2)))
+
         self.list_keys = [None] * self.layer_num
         self.list_values = [None] * self.layer_num
+
+        self._raw_d2h_key_slabs = [None] * ((self.layer_num + self.raw_d2h_pool_group_size - 1) // self.raw_d2h_pool_group_size)
+        self._raw_d2h_value_slabs = [None] * len(self._raw_d2h_key_slabs)
+        self._raw_d2h_group_shapes = [None] * len(self._raw_d2h_key_slabs)
+        self._raw_d2h_group_spans = [0] * len(self._raw_d2h_key_slabs)
+        self._raw_d2h_group_pending = [0] * len(self._raw_d2h_key_slabs)
+        self._raw_d2h_layer_acquired = [False] * self.layer_num
+        self._raw_d2h_layer_to_group = [self._layer_group_index(ldx, self.raw_d2h_pool_group_size) for ldx in range(self.layer_num)]
 
         self.imi_pipelines = []
         if self.build_index_when_prefilling:
@@ -457,8 +469,10 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         self.profile_decode_steps = int(os.getenv("IMI_PROFILE_STEPS", "5"))
         self.profile_decode_count = 0
         self.profile_decode_step_idx = -1
+        self.profile_token_hit_rate = os.getenv("IMI_PROFILE_TOKEN_HIT_RATE", "0") == "1"
         self.decode_breakdown: Optional[dict] = None
         self.decode_breakdown_accum: dict = {}
+        self.decode_profile_rows: List[Dict[str, object]] = []
         self.prefill_breakdown_rows: List[Dict[str, object]] = []
         self.profile_block_hit_rate = os.getenv("IMI_PROFILE_HIT_RATE", "0") == "1"
         self.profile_block_hit_every = int(os.getenv("IMI_PROFILE_HIT_EVERY", "1"))
@@ -494,6 +508,68 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
             max_concurrent=max_concurrent,
         )
         self._metadata_lock = threading.Lock()
+
+    @staticmethod
+    def _layer_group_index(layer_idx: int, group_size: int) -> int:
+        return int(layer_idx) // max(int(group_size), 1)
+
+    @staticmethod
+    def _group_span_for_layer(layer_idx: int, group_size: int, layer_num: int) -> int:
+        group_size = max(int(group_size), 1)
+        group_start = (int(layer_idx) // group_size) * group_size
+        return min(group_size, int(layer_num) - group_start)
+
+    def _ensure_raw_d2h_storage(self, layer_idx: int, raw_shape, dtype: torch.dtype):
+        layer_idx = int(layer_idx)
+        group_idx = self._raw_d2h_layer_to_group[layer_idx]
+        group_start = group_idx * self.raw_d2h_pool_group_size
+        span = self._group_span_for_layer(group_start, self.raw_d2h_pool_group_size, self.layer_num)
+        expected_shape = (span, *tuple(raw_shape))
+        needs_alloc = (
+            self._raw_d2h_key_slabs[group_idx] is None
+            or tuple(self._raw_d2h_key_slabs[group_idx].shape) != expected_shape
+            or self._raw_d2h_key_slabs[group_idx].dtype != dtype
+            or self._raw_d2h_value_slabs[group_idx] is None
+            or tuple(self._raw_d2h_value_slabs[group_idx].shape) != expected_shape
+            or self._raw_d2h_value_slabs[group_idx].dtype != dtype
+        )
+        if needs_alloc:
+            if self._raw_d2h_group_pending[group_idx] > 0:
+                raise RuntimeError("cannot resize raw D2H staging slab while the group has active layers")
+            self._raw_d2h_key_slabs[group_idx] = torch.empty(
+                expected_shape,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._raw_d2h_value_slabs[group_idx] = torch.empty(
+                expected_shape,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._raw_d2h_group_shapes[group_idx] = expected_shape
+            self._raw_d2h_group_spans[group_idx] = span
+            self._raw_d2h_group_pending[group_idx] = 0
+        if not self._raw_d2h_layer_acquired[layer_idx]:
+            self._raw_d2h_group_pending[group_idx] += 1
+            self._raw_d2h_layer_acquired[layer_idx] = True
+        local_idx = layer_idx - group_start
+        return self._raw_d2h_key_slabs[group_idx][local_idx], self._raw_d2h_value_slabs[group_idx][local_idx]
+
+    def _release_raw_d2h_storage(self, layer_idx: int) -> None:
+        layer_idx = int(layer_idx)
+        if not self._raw_d2h_layer_acquired[layer_idx]:
+            return
+        group_idx = self._raw_d2h_layer_to_group[layer_idx]
+        self._raw_d2h_layer_acquired[layer_idx] = False
+        self._raw_d2h_group_pending[group_idx] = max(0, self._raw_d2h_group_pending[group_idx] - 1)
+        if self._raw_d2h_group_pending[group_idx] > 0:
+            return
+        self._raw_d2h_key_slabs[group_idx] = None
+        self._raw_d2h_value_slabs[group_idx] = None
+        self._raw_d2h_group_shapes[group_idx] = None
+        self._raw_d2h_group_spans[group_idx] = 0
 
     def can_reuse_for_next_sequence(self, valid_start, max_new_length: int, input_length: int) -> bool:
         new_input_length = int(input_length)
@@ -555,6 +631,7 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         self.profile_decode_step_idx = -1
         self.decode_breakdown = None
         self.decode_breakdown_accum = {}
+        self.decode_profile_rows = []
         self.prefill_breakdown_rows = []
         self.profile_block_step = 0
         self.profile_block_hits = 0

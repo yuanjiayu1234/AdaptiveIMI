@@ -7,6 +7,7 @@ import time
 
 import torch
 
+from cache_hub.adaptive_imi.nvtx_utils import nvtx_range
 from cache_hub.cluster_plan import choose_learned_k_values, product_k_values
 
 
@@ -118,16 +119,17 @@ class AdaptiveIMIIndexingMixin:
             return
         if self.list_keys[layer_idx] is not None and self.list_values[layer_idx] is not None:
             return
-        self.list_keys[layer_idx] = torch.empty(
-            (self.batch_size, self.kv_head, self.list_capacity, self.head_dim),
-            dtype=self.dtype,
-            pin_memory=True,
-        ).contiguous()
-        self.list_values[layer_idx] = torch.empty(
-            (self.batch_size, self.kv_head, self.list_capacity, self.head_dim),
-            dtype=self.dtype,
-            pin_memory=True,
-        ).contiguous()
+        with nvtx_range(f"imi.prefill.L{layer_idx}.ensure_list_storage.allocate_pinned"):
+            self.list_keys[layer_idx] = torch.empty(
+                (self.batch_size, self.kv_head, self.list_capacity, self.head_dim),
+                dtype=self.dtype,
+                pin_memory=True,
+            ).contiguous()
+            self.list_values[layer_idx] = torch.empty(
+                (self.batch_size, self.kv_head, self.list_capacity, self.head_dim),
+                dtype=self.dtype,
+                pin_memory=True,
+            ).contiguous()
 
     def _resize_metadata_capacity(self, required_centroids: int) -> None:
         required_centroids = int(required_centroids)
@@ -289,7 +291,7 @@ class AdaptiveIMIIndexingMixin:
         if self.centroids_mask[layer_idx] is not None:
             self.centroids_mask[layer_idx].copy_(centroids_mask_cpu)
         self.layer_ready[layer_idx] = True
-    def _ensure_metadata_buffers(self) -> None:
+    def _ensure_metadata_buffers(self, *, preallocate_gpu_only: bool = False) -> None:
         if self.n_centroids <= 0:
             n_tokens = max(self.list_capacity, self.list_stride, 1)
             kmeans_cfg = self.runtime_config.get("kmeans") or {}
@@ -313,21 +315,23 @@ class AdaptiveIMIIndexingMixin:
             self.nprobe = min(self.nprobe, self.n_centroids - 1)
 
         for ldx in range(self.layer_num):
-            if self.cluster_sizes_cpu[ldx] is not None and self.cluster_offsets_cpu[ldx] is not None:
-                continue
-            cluster_sizes = torch.zeros(
-                (self.batch_groups, self.n_centroids),
-                dtype=torch.int32,
-                pin_memory=True,
-            )
-            cluster_offsets = torch.zeros(
-                (self.batch_groups, self.n_centroids + 1),
-                dtype=torch.int32,
-                pin_memory=True,
-            )
-            self.cluster_sizes_cpu[ldx] = cluster_sizes
-            self.cluster_offsets_cpu[ldx] = cluster_offsets
-            if self.allocated:
+            cluster_sizes = self.cluster_sizes_cpu[ldx]
+            cluster_offsets = self.cluster_offsets_cpu[ldx]
+            if cluster_sizes is None or cluster_offsets is None:
+                cluster_sizes = torch.zeros(
+                    (self.batch_groups, self.n_centroids),
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+                cluster_offsets = torch.zeros(
+                    (self.batch_groups, self.n_centroids + 1),
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+                self.cluster_sizes_cpu[ldx] = cluster_sizes
+                self.cluster_offsets_cpu[ldx] = cluster_offsets
+            should_allocate_gpu = self.allocated or preallocate_gpu_only
+            if should_allocate_gpu:
                 if self.cluster_sizes_gpu[ldx] is None:
                     self.cluster_sizes_gpu[ldx] = cluster_sizes.to(self.layer_mapping[str(ldx)])
                 if self.cluster_offsets_gpu[ldx] is None:

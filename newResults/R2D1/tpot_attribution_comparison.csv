@@ -1,0 +1,8 @@
+stage,adaptiveimi_ms,retroinfer_ms,adaptive_minus_retro_ms,adaptive_reduction_percent,unit
+search,5.6108,3.0060,2.6048,-86.6504,ms/step
+retrieval_plan,1.7054,20.6544,-18.9490,91.7433,ms/step
+fetch_gather,12.4497,16.4378,-3.9880,24.2614,ms/step
+attention_total,2.3910,4.9895,-2.5986,52.0801,ms/step
+decode_tpot_wall,37.0710,73.9996,-36.9286,49.9037,ms/step
+block_hit_steady,83.1894,75.1766,8.0128,10.6565,percent
+token_hit_steady,82.5504,75.1100,7.4404,9.9061,percent

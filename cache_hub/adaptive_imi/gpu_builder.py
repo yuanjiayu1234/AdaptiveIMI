@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
+from cache_hub.adaptive_imi.nvtx_utils import nvtx_range
 from cache_hub.cluster_plan import choose_learned_k_values
 
 
@@ -90,6 +91,11 @@ class HybridLayerBuildJob:
         source_ready_event: Optional[torch.cuda.Event] = None,
         auto_start_raw_d2h: bool = True,
         auto_start_gpu_build: bool = True,
+        raw_keys: Optional[torch.Tensor] = None,
+        raw_values: Optional[torch.Tensor] = None,
+        raw_keys_cpu: Optional[torch.Tensor] = None,
+        raw_values_cpu: Optional[torch.Tensor] = None,
+        raw_layout: str = "bhtd",
     ) -> None:
         if keys.dim() != 4 or values.dim() != 4:
             raise ValueError("keys/values must be [batch, kv_heads, tokens, head_dim]")
@@ -99,6 +105,38 @@ class HybridLayerBuildJob:
             raise ValueError("HybridLayerBuildJob only supports GPU metadata build; CPU layers use the C++ pipeline")
         if not keys.is_cuda:
             raise ValueError("GPU build requires CUDA keys")
+        if raw_keys is not None or raw_values is not None:
+            if raw_keys is None or raw_values is None:
+                raise ValueError("raw_keys and raw_values must be provided together")
+            if raw_keys.dim() != 4 or raw_values.dim() != 4:
+                raise ValueError("raw_keys/raw_values must be 4D tensors")
+            if raw_keys.size() != raw_values.size():
+                raise ValueError("raw_keys and raw_values must share the same shape")
+            if not raw_keys.is_cuda or not raw_values.is_cuda:
+                raise ValueError("raw_keys/raw_values must be CUDA tensors")
+            if str(raw_layout) not in ("bhtd", "bthd"):
+                raise ValueError("raw_layout must be 'bhtd' or 'bthd'")
+            if str(raw_layout) == "bhtd" and tuple(raw_keys.shape) != tuple(keys.shape):
+                raise ValueError("bhtd raw_keys shape must match keys shape")
+            if str(raw_layout) == "bthd":
+                expected = (int(keys.size(0)), int(keys.size(2)), int(keys.size(1)), int(keys.size(3)))
+                if tuple(raw_keys.shape) != expected:
+                    raise ValueError(f"bthd raw_keys shape {tuple(raw_keys.shape)} != expected {expected}")
+            if raw_keys_cpu is not None or raw_values_cpu is not None:
+                if raw_keys_cpu is None or raw_values_cpu is None:
+                    raise ValueError("raw_keys_cpu and raw_values_cpu must be provided together")
+                if raw_keys_cpu.dim() != 4 or raw_values_cpu.dim() != 4:
+                    raise ValueError("raw_keys_cpu/raw_values_cpu must be 4D tensors")
+                if raw_keys_cpu.size() != raw_values_cpu.size():
+                    raise ValueError("raw_keys_cpu and raw_values_cpu must share the same shape")
+                if raw_keys_cpu.device.type != "cpu" or raw_values_cpu.device.type != "cpu":
+                    raise ValueError("raw_keys_cpu/raw_values_cpu must be CPU tensors")
+                if not raw_keys_cpu.is_pinned() or not raw_values_cpu.is_pinned():
+                    raise ValueError("raw_keys_cpu/raw_values_cpu must be pinned CPU tensors")
+                if tuple(raw_keys_cpu.shape) != tuple(raw_keys.shape):
+                    raise ValueError("raw_keys_cpu shape must match raw_keys shape")
+                if raw_keys_cpu.dtype != raw_keys.dtype or raw_values_cpu.dtype != raw_values.dtype:
+                    raise ValueError("raw CPU staging dtype mismatch")
 
         self.layer_idx = int(layer_idx)
         self.partition_spec = partition_spec
@@ -120,6 +158,11 @@ class HybridLayerBuildJob:
         self.source_device = keys.device
         self._keys_ref: Optional[torch.Tensor] = keys
         self._values_ref: Optional[torch.Tensor] = values
+        self._raw_keys_ref: Optional[torch.Tensor] = raw_keys if raw_keys is not None else keys
+        self._raw_values_ref: Optional[torch.Tensor] = raw_values if raw_values is not None else values
+        self._raw_keys_cpu_ref: Optional[torch.Tensor] = raw_keys_cpu
+        self._raw_values_cpu_ref: Optional[torch.Tensor] = raw_values_cpu
+        self.raw_layout = str(raw_layout)
         self.source_ready_event = source_ready_event
 
         self.copy_event: Optional[torch.cuda.Event] = None
@@ -153,22 +196,38 @@ class HybridLayerBuildJob:
             return
         keys = self._keys_ref
         values = self._values_ref
-        if keys is None or values is None:
+        raw_keys = self._raw_keys_ref
+        raw_values = self._raw_values_ref
+        raw_keys_cpu = self._raw_keys_cpu_ref
+        raw_values_cpu = self._raw_values_cpu_ref
+        if keys is None or values is None or raw_keys is None or raw_values is None:
             raise RuntimeError("hybrid raw KV source tensors were released before D2H started")
         event = source_ready_event if source_ready_event is not None else self.source_ready_event
         device_index = int(keys.device.index or 0)
-        self.copy_stream = torch.cuda.Stream(device=device_index)
-        self.copy_event = torch.cuda.Event()
-        self.keys_cpu = torch.empty(keys.shape, dtype=keys.dtype, device="cpu", pin_memory=True)
-        self.values_cpu = torch.empty(values.shape, dtype=values.dtype, device="cpu", pin_memory=True)
-        with torch.cuda.stream(self.copy_stream):
-            if event is not None:
-                self.copy_stream.wait_event(event)
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.create_stream_event"):
+            self.copy_stream = torch.cuda.Stream(device=device_index)
+            self.copy_event = torch.cuda.Event()
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.allocate_pinned"):
+            if raw_keys_cpu is None or raw_values_cpu is None:
+                self.keys_cpu = torch.empty(raw_keys.shape, dtype=raw_keys.dtype, device="cpu", pin_memory=True)
+                self.values_cpu = torch.empty(raw_values.shape, dtype=raw_values.dtype, device="cpu", pin_memory=True)
             else:
-                self.copy_stream.wait_stream(torch.cuda.current_stream(device_index))
-            self.keys_cpu.copy_(keys, non_blocking=True)
-            self.values_cpu.copy_(values, non_blocking=True)
-            self.copy_event.record()
+                self.keys_cpu = raw_keys_cpu
+                self.values_cpu = raw_values_cpu
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.enqueue_copy"):
+            with torch.cuda.stream(self.copy_stream):
+                if event is not None:
+                    with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.wait_source_event"):
+                        self.copy_stream.wait_event(event)
+                else:
+                    with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.wait_current_stream"):
+                        self.copy_stream.wait_stream(torch.cuda.current_stream(device_index))
+                with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.copy_keys"):
+                    self.keys_cpu.copy_(raw_keys, non_blocking=True)
+                with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.copy_values"):
+                    self.values_cpu.copy_(raw_values, non_blocking=True)
+                with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.record_copy_event"):
+                    self.copy_event.record()
         self._raw_d2h_started = True
 
     def start_gpu_metadata_build(self, source_ready_event: Optional[torch.cuda.Event] = None) -> None:
@@ -190,14 +249,15 @@ class HybridLayerBuildJob:
             low_priority, _high_priority = get_priority_range()
             priority = int(low_priority)
         self.build_stream = torch.cuda.Stream(device=device_index, priority=priority)
-        with torch.cuda.stream(self.build_stream):
-            if event is not None:
-                self.build_stream.wait_event(event)
-            else:
-                self.build_stream.wait_stream(torch.cuda.current_stream(device_index))
-            self.build_start.record()
-            self._metadata_device = self._build_metadata(keys)
-            self.build_end.record()
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.gpu_metadata.enqueue_build"):
+            with torch.cuda.stream(self.build_stream):
+                if event is not None:
+                    self.build_stream.wait_event(event)
+                else:
+                    self.build_stream.wait_stream(torch.cuda.current_stream(device_index))
+                self.build_start.record()
+                self._metadata_device = self._build_metadata(keys)
+                self.build_end.record()
         self._build_ready = True
         self._gpu_build_started = True
 
@@ -208,15 +268,21 @@ class HybridLayerBuildJob:
             self.start_raw_d2h()
         if not self._gpu_build_started:
             self.start_gpu_metadata_build()
-        self.wait_gpu_metadata_build()
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.wait_gpu_metadata_build_for_sources"):
+            self.wait_gpu_metadata_build()
         if self.copy_event is not None:
-            copy_wait_start = time.perf_counter()
-            self.copy_event.synchronize()
-            self._raw_d2h_wait_ms = (time.perf_counter() - copy_wait_start) * 1000.0
+            with nvtx_range(f"imi.prefill.L{self.layer_idx}.raw_d2h.wait_copy_event"):
+                copy_wait_start = time.perf_counter()
+                self.copy_event.synchronize()
+                self._raw_d2h_wait_ms = (time.perf_counter() - copy_wait_start) * 1000.0
         if self.keys_cpu is None or self.values_cpu is None:
             raise RuntimeError("hybrid raw KV D2H did not produce CPU buffers")
         self._keys_ref = None
         self._values_ref = None
+        self._raw_keys_ref = None
+        self._raw_values_ref = None
+        self._raw_keys_cpu_ref = None
+        self._raw_values_cpu_ref = None
         self._gpu_sources_released = True
 
     def wait_gpu_metadata_build(self) -> None:
@@ -226,7 +292,8 @@ class HybridLayerBuildJob:
             self.start_gpu_metadata_build()
         if self.build_end is None:
             return
-        self.build_end.synchronize()
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.gpu_metadata.wait_build_end"):
+            self.build_end.synchronize()
         self._gpu_build_ms = (
             float(self.build_start.elapsed_time(self.build_end))
             if self.build_start is not None and self.build_end is not None
@@ -242,6 +309,10 @@ class HybridLayerBuildJob:
             self.copy_event.synchronize()
         self._keys_ref = None
         self._values_ref = None
+        self._raw_keys_ref = None
+        self._raw_values_ref = None
+        self._raw_keys_cpu_ref = None
+        self._raw_values_cpu_ref = None
         self._gpu_sources_released = True
 
     def _build_metadata(self, keys: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -309,7 +380,7 @@ class HybridLayerBuildJob:
         row_token_counts = self._row_token_counts(keys.device)
         k_values_tensor = torch.tensor(k_values, dtype=torch.int32, device=keys.device)
         build_outputs = ext.run_hybrid_8way_kmeans(
-            keys.contiguous(),
+            keys,
             row_token_counts.contiguous(),
             subspace_dim_ids.contiguous(),
             subspace_dim_masks.contiguous(),
@@ -356,10 +427,11 @@ class HybridLayerBuildJob:
             return
         self.start_cpu_metadata_d2h()
         if self._metadata_cpu_event is not None:
-            meta_d2h_start = time.perf_counter()
-            self._metadata_cpu_event.synchronize()
-            self._metadata_d2h_ms = (time.perf_counter() - meta_d2h_start) * 1000.0
-            self._metadata_cpu_event = None
+            with nvtx_range(f"imi.prefill.L{self.layer_idx}.metadata_d2h.wait_event"):
+                meta_d2h_start = time.perf_counter()
+                self._metadata_cpu_event.synchronize()
+                self._metadata_d2h_ms = (time.perf_counter() - meta_d2h_start) * 1000.0
+                self._metadata_cpu_event = None
 
     def start_cpu_metadata_d2h(self) -> None:
         if self._metadata_cpu is not None or self._metadata_cpu_started:
@@ -383,22 +455,24 @@ class HybridLayerBuildJob:
         device_index = int(first_tensor.device.index or 0)
         self._metadata_cpu_stream = torch.cuda.Stream(device=device_index)
         self._metadata_cpu_event = torch.cuda.Event()
-        self._metadata_cpu = {
-            key: torch.empty(
-                self._metadata_device[key].shape,
-                dtype=self._metadata_device[key].dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            for key in cpu_metadata_keys
-            if key in self._metadata_device
-        }
-        with torch.cuda.stream(self._metadata_cpu_stream):
-            if self.build_end is not None:
-                self._metadata_cpu_stream.wait_event(self.build_end)
-            for key, dst in self._metadata_cpu.items():
-                dst.copy_(self._metadata_device[key], non_blocking=True)
-            self._metadata_cpu_event.record()
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.metadata_d2h.allocate_pinned"):
+            self._metadata_cpu = {
+                key: torch.empty(
+                    self._metadata_device[key].shape,
+                    dtype=self._metadata_device[key].dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for key in cpu_metadata_keys
+                if key in self._metadata_device
+            }
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.metadata_d2h.enqueue_copy"):
+            with torch.cuda.stream(self._metadata_cpu_stream):
+                if self.build_end is not None:
+                    self._metadata_cpu_stream.wait_event(self.build_end)
+                for key, dst in self._metadata_cpu.items():
+                    dst.copy_(self._metadata_device[key], non_blocking=True)
+                self._metadata_cpu_event.record()
         self._metadata_cpu_started = True
 
     def _validate_cpu_metadata(self, metadata_cpu: Dict[str, torch.Tensor]) -> None:
@@ -462,29 +536,43 @@ class HybridLayerBuildJob:
         *,
         on_sources_consumed=None,
     ) -> HybridBuildResult:
-        self.wait_gpu_sources_consumed()
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.finish.wait_gpu_sources_consumed"):
+            self.wait_gpu_sources_consumed()
         if on_sources_consumed is not None:
             on_sources_consumed()
         gpu_build_ms = float(self._gpu_build_ms)
         raw_d2h_wait_ms = float(self._raw_d2h_wait_ms)
 
-        self.prepare_cpu_metadata()
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.finish.prepare_cpu_metadata"):
+            self.prepare_cpu_metadata()
         if self._metadata_cpu is None or self._metadata_device is None:
             raise RuntimeError("hybrid build metadata was not produced")
         metadata_cpu = self._metadata_cpu
-        self._validate_cpu_metadata(metadata_cpu)
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.finish.validate_cpu_metadata"):
+            self._validate_cpu_metadata(metadata_cpu)
         metadata_d2h_ms = float(self._metadata_d2h_ms)
 
         reorg_start = time.perf_counter()
         ext = _load_hybrid_8way_cuda_extension()
-        ext.reorder_raw_kv_by_token_ids(
-            self.keys_cpu.contiguous(),
-            self.values_cpu.contiguous(),
-            metadata_cpu["token_ids_by_cluster"].contiguous(),
-            metadata_cpu["token_counts"].contiguous(),
-            list_keys,
-            list_values,
-        )
+        with nvtx_range(f"imi.prefill.L{self.layer_idx}.finish.reorder_raw_kv"):
+            if self.raw_layout == "bthd":
+                ext.reorder_raw_kv_by_token_ids_bthd(
+                    self.keys_cpu.contiguous(),
+                    self.values_cpu.contiguous(),
+                    metadata_cpu["token_ids_by_cluster"].contiguous(),
+                    metadata_cpu["token_counts"].contiguous(),
+                    list_keys,
+                    list_values,
+                )
+            else:
+                ext.reorder_raw_kv_by_token_ids(
+                    self.keys_cpu.contiguous(),
+                    self.values_cpu.contiguous(),
+                    metadata_cpu["token_ids_by_cluster"].contiguous(),
+                    metadata_cpu["token_counts"].contiguous(),
+                    list_keys,
+                    list_values,
+                )
         reorg_ms = (time.perf_counter() - reorg_start) * 1000.0
         self.keys_cpu = None
         self.values_cpu = None
@@ -524,6 +612,10 @@ class HybridLayerBuildJob:
         self._metadata_cpu = None
         self._keys_ref = None
         self._values_ref = None
+        self._raw_keys_ref = None
+        self._raw_values_ref = None
+        self._raw_keys_cpu_ref = None
+        self._raw_values_cpu_ref = None
         return HybridBuildResult(
             metadata=structured,
             base_metadata_gpu=base_gpu,

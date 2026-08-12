@@ -142,6 +142,12 @@ class QwenModel(LLM):
         rope_scaling = getattr(self.config, "rope_scaling", None) or {}
         if rope_parameters.get("rope_type") == "yarn":
             rope_scaling = rope_parameters
+        rope_type = str(rope_scaling.get("rope_type") or rope_scaling.get("type") or "").lower()
+        model_type = str(getattr(self.config, "model_type", "")).lower()
+        self.use_yarn_rope = bool(
+            rope_type == "yarn"
+            or (model_type == "qwen3" and int(self.max_length) > 32768)
+        )
         self.yarn_factor = float(rope_scaling.get("factor", 4.0))
         self.original_max_position_embeddings = int(
             rope_scaling.get(
@@ -154,7 +160,7 @@ class QwenModel(LLM):
 
     
     def _set_cos_sin_cache(self):
-        if self.max_length > 32768:
+        if self.use_yarn_rope:
             def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
                 """Inverse dimension formula to find the dimension based on the number of rotations"""
                 return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))

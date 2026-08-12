@@ -610,6 +610,8 @@ class Hybrid8WayIMICache(HybridGpuPrefillMixin, HybridCpuPrefillMixin, HybridMet
                 "tag": "IMI_WAIT_ALL_LAYERS_READY",
                 "layers": waited_layers,
             })
+        for layer_idx in range(self.layer_num):
+            self._release_raw_d2h_storage(layer_idx)
 
     def reset_for_next_sequence(self, valid_start, max_new_length: int, input_length: int) -> None:
         self._wait_for_hybrid_background_finishes()
@@ -623,6 +625,12 @@ class Hybrid8WayIMICache(HybridGpuPrefillMixin, HybridCpuPrefillMixin, HybridMet
         self.hybrid_cpu_stream_seen = [None] * self.layer_num
         self.hybrid_gpu_finish_scheduled = [False] * self.layer_num
         self.hybrid_gpu_profile_rows = []
+        self._raw_d2h_group_pending = [0] * len(self._raw_d2h_group_pending)
+        self._raw_d2h_layer_acquired = [False] * len(self._raw_d2h_layer_acquired)
+        self._raw_d2h_key_slabs = [None] * len(self._raw_d2h_key_slabs)
+        self._raw_d2h_value_slabs = [None] * len(self._raw_d2h_value_slabs)
+        self._raw_d2h_group_shapes = [None] * len(self._raw_d2h_group_shapes)
+        self._raw_d2h_group_spans = [0] * len(self._raw_d2h_group_spans)
 
     def cleanup(self):
         try:
@@ -649,4 +657,16 @@ class Hybrid8WayIMICache(HybridGpuPrefillMixin, HybridCpuPrefillMixin, HybridMet
         if hasattr(self, "hybrid_finish_scheduler") and self.hybrid_finish_scheduler is not None:
             self.hybrid_finish_scheduler.shutdown()
             self.hybrid_finish_scheduler = None
+        if hasattr(self, "_raw_d2h_group_pending"):
+            self._raw_d2h_group_pending = [0] * len(self._raw_d2h_group_pending)
+        if hasattr(self, "_raw_d2h_layer_acquired"):
+            self._raw_d2h_layer_acquired = [False] * len(self._raw_d2h_layer_acquired)
+        if hasattr(self, "_raw_d2h_key_slabs"):
+            self._raw_d2h_key_slabs = [None] * len(self._raw_d2h_key_slabs)
+        if hasattr(self, "_raw_d2h_value_slabs"):
+            self._raw_d2h_value_slabs = [None] * len(self._raw_d2h_value_slabs)
+        if hasattr(self, "_raw_d2h_group_shapes"):
+            self._raw_d2h_group_shapes = [None] * len(self._raw_d2h_group_shapes)
+        if hasattr(self, "_raw_d2h_group_spans"):
+            self._raw_d2h_group_spans = [0] * len(self._raw_d2h_group_spans)
         super().cleanup()

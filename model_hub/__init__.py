@@ -1,9 +1,29 @@
 
 from .llama import LlamaModel
 from .qwen import QwenModel
+from .qwen_fp8 import QwenFp8Model
 from .mistral import MistralModel
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from config import get_default_model_name, get_model_choices, resolve_model_path
+
+
+def is_fp8_compressed_model(model_path: str) -> bool:
+    try:
+        cfg = AutoConfig.from_pretrained(model_path)
+    except Exception:
+        return False
+    quant = getattr(cfg, "quantization_config", None) or {}
+    if not isinstance(quant, dict):
+        return False
+    if str(quant.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if str(quant.get("format", "")).lower() != "float-quantized":
+        return False
+    for group in (quant.get("config_groups") or {}).values():
+        weights = (group or {}).get("weights") or {}
+        if str(weights.get("type", "")).lower() == "float" and int(weights.get("num_bits", 0) or 0) == 8:
+            return True
+    return False
 
 
 def add_model_args(parser):
@@ -37,8 +57,9 @@ def load_model(
     gpu_memory_utilization=0.90,
 ):
     model_path = resolve_model_path(model_name)
-    model_name_lower = model_name.lower()
-    if 'llama' in model_name_lower:
+    model_probe = f"{model_name} {model_path}".lower()
+    fp8_compressed = is_fp8_compressed_model(model_path)
+    if 'llama' in model_probe:
         llm = LlamaModel(model_name,
                          max_length=max_len,
                          dtype=dtype,
@@ -48,8 +69,9 @@ def load_model(
                          parallel_mode=parallel_mode,
                          weight_loading=weight_loading,
                          gpu_memory_utilization=gpu_memory_utilization)
-    elif 'qwen' in model_name_lower:
-        llm = QwenModel(model_name,
+    elif 'qwen' in model_probe:
+        model_cls = QwenFp8Model if fp8_compressed else QwenModel
+        llm = model_cls(model_name,
                         max_length=max_len,
                         dtype=dtype,
                         device_map=device,
@@ -58,7 +80,7 @@ def load_model(
                         parallel_mode=parallel_mode,
                         weight_loading=weight_loading,
                         gpu_memory_utilization=gpu_memory_utilization)
-    elif 'mistral' in model_name_lower:
+    elif 'mistral' in model_probe:
         llm = MistralModel(model_name,
                            max_length=max_len,
                            dtype=dtype,

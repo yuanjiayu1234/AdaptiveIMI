@@ -16,6 +16,10 @@ MODEL_REGISTRY = {
         "path": os.path.join("models", "qwen3-8b"),
         "config_name": "Qwen3-8B.json",
     },
+    "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic": {
+        "path": os.path.join("models", "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic"),
+        "config_name": "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic.json",
+    },
     "Llama-3.1-8B-Instruct": {
         "path": os.path.join("models", "Llama-3.1-8B-Instruct"),
         "config_name": "Llama-3.1-8B-Instruct.json",
@@ -51,6 +55,26 @@ MODEL_PATH_ALIASES = {
         "local": os.path.join("models", "qwen3-8b"),
         "remote": "Qwen/Qwen3-8B",
         "config": "Qwen3-8B.json",
+    },
+    "deepseek-r1-distill-qwen-32b-fp8-dynamic": {
+        "local": os.path.join("models", "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic"),
+        "remote": "cortecs/DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic",
+        "config": "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic.json",
+    },
+    "deepseek32b-fp8": {
+        "local": os.path.join("models", "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic"),
+        "remote": "cortecs/DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic",
+        "config": "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic.json",
+    },
+    "deepseek32b": {
+        "local": os.path.join("models", "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic"),
+        "remote": "cortecs/DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic",
+        "config": "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic.json",
+    },
+    "cortecs/deepseek-r1-distill-qwen-32b-fp8-dynamic": {
+        "local": os.path.join("models", "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic"),
+        "remote": "cortecs/DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic",
+        "config": "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic.json",
     },
     "qwen2.5-72b": {
         "local": None,

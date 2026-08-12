@@ -5,8 +5,8 @@
         "static_pattern_end": 64,
         "retrieval_budget": 0.1,
         "buffer_cluster_num": 32,
-        "cache_ratio": 0.1,
-        "partition_path": "outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/qwen3_partition.json",
+        "cache_ratio": 0.05,
+        "partition_path": "outputs/train_data/partitions/booksum_nolima_babilong_constrained_mse_cap96_alltokens_tokentrim_search32x384/qwen3_partition.json",
         "hybrid_index": {
             "policy": "gpu_only",
             "start": "gpu"

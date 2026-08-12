@@ -53,9 +53,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..
 sys.path.append(PROJECT_ROOT)
 from model_hub import LlamaModel
 try:
-    from model_hub import QwenModel
+    from model_hub import QwenFp8Model, QwenModel, is_fp8_compressed_model
 except ImportError:
+    QwenFp8Model = None
     QwenModel = None
+    is_fp8_compressed_model = None
 
 from config import generate_config
 
@@ -151,8 +153,9 @@ class HuggingFaceModel:
         stop_at_period=False,
     ) -> None:
         load_path = model_path or model_name
+        model_probe = f"{model_name} {load_path}".lower()
 
-        if 'llama' in model_name.lower():
+        if 'llama' in model_probe:
             llm = LlamaModel(model_name,
                 max_length=max_len+max_new_len,
                 dtype=dtype,
@@ -161,8 +164,15 @@ class HuggingFaceModel:
                 parallel_mode=parallel_mode,
                 weight_loading=weight_loading,
                 gpu_memory_utilization=gpu_memory_utilization)
-        elif 'qwen' in model_name.lower():
-            llm = QwenModel(model_name,
+        elif 'qwen' in model_probe:
+            if QwenModel is None:
+                raise ImportError("QwenModel is not available")
+            model_cls = QwenModel
+            if is_fp8_compressed_model is not None and is_fp8_compressed_model(load_path):
+                if QwenFp8Model is None:
+                    raise ImportError("QwenFp8Model is not available")
+                model_cls = QwenFp8Model
+            llm = model_cls(model_name,
                 max_length=max_len+max_new_len,
                 dtype=dtype,
                 device_map=device,
@@ -170,7 +180,7 @@ class HuggingFaceModel:
                 parallel_mode=parallel_mode,
                 weight_loading=weight_loading,
                 gpu_memory_utilization=gpu_memory_utilization)
-        elif 'mistral' in model_name.lower():
+        elif 'mistral' in model_probe:
             from model_hub import MistralModel
             llm = MistralModel(model_name,
                 max_length=max_len+max_new_len,
@@ -572,6 +582,9 @@ if __name__ == '__main__':
                 "qwen2.5-7b",
                 "qwen3-8b",
                 "Qwen/Qwen3-8B",
+                "deepseek32b-fp8",
+                "DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic",
+                "cortecs/DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic",
                 "llama-3-8b-1048k",
                 "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
                 "Llama-3-8B-Instruct-Gradient-1048k",

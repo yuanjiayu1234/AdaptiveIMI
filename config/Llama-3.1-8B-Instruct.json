@@ -5,8 +5,8 @@
         "static_pattern_end": 64,
         "cache_ratio": 0.1,
         "retrieval_budget": 0.1,
-        "buffer_cluster_num": 32,
-        "partition_path": "outputs/train_data/partitions/real100_ruler100_mixed_128k_heavy/llama3_partition.json",
+        "buffer_cluster_num": 32,   
+        "partition_path": "outputs/train_data/partitions/booksum_nolima_babilong_constrained_mse_cap96_alltokens_tokentrim_search32x384/llama3_partition.json",
         "hybrid_index": {
             "policy": "gpu_only",
             "start": "gpu"
@@ -14,13 +14,16 @@
         "cache": {
             "execution_buffer_ring_size": 2,
             "cluster_uva_warmup_steps": 3,
-            "promotion_warmup_steps": 4
+            "promotion_warmup_steps": 4,
+            "preallocate_decode_metadata": true,
+            "raw_d2h_pool_enabled": true,
+            "raw_d2h_pool_group_size": 2
         },
         "kmeans": {
             "max_iters": 10
         },
         "prefill": {
-            "prefill_chunk_size": 131072
+            "prefill_chunk_size": 32768
         },
         "streaming": {
             "hidden_device": "auto",

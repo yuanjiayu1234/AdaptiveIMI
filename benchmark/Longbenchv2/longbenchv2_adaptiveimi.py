@@ -11,6 +11,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Keep repeated 128K samples from fragmenting the CUDA caching allocator.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -53,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=-1)
+    parser.add_argument(
+        "--sample_indices",
+        type=str,
+        default=None,
+        help="Comma-separated absolute dataset indices, e.g. 2,3,5,7,10.",
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--parallel_mode", "--parallel-mode", type=str, default="auto", choices=("auto", "single", "layer", "tp"))
     parser.add_argument("--weight_loading", "--weight-loading", type=str, default="hf", choices=("hf", "auto", "accelerate_meta", "streaming_safetensors"))
@@ -188,6 +197,9 @@ def completed_ids(path: str) -> set[str]:
 
 
 def cleanup_after_sample(llm: Any) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
     kv_cache = getattr(llm, "kv_cache", None)
     if kv_cache is not None:
         try:
@@ -213,6 +225,7 @@ def cleanup_after_sample(llm: Any) -> None:
             torch.cuda.ipc_collect()
         except RuntimeError:
             pass
+        torch.cuda.synchronize()
 
 
 def resolve_local_hf_snapshot(model_name: str) -> str:
@@ -267,6 +280,27 @@ def build_decode_search_config(args: argparse.Namespace) -> dict[str, Any] | Non
     return None
 
 
+def select_data(data: list[dict[str, Any]], args: argparse.Namespace) -> list[tuple[int, dict[str, Any]]]:
+    if args.sample_indices:
+        indices: list[int] = []
+        for value in args.sample_indices.split(","):
+            value = value.strip()
+            if not value:
+                continue
+            index = int(value)
+            if index < 0 or index >= len(data):
+                raise IndexError(f"--sample_indices index {index} is outside dataset range [0, {len(data) - 1}]")
+            indices.append(index)
+        if not indices:
+            raise ValueError("--sample_indices did not contain any valid indices")
+        return [(index, data[index]) for index in indices]
+
+    selected = data[args.start :]
+    if args.max_samples > 0:
+        selected = selected[: args.max_samples]
+    return list(enumerate(selected, start=args.start))
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -288,9 +322,7 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
-    data = load_data(args.data_path)[args.start :]
-    if args.max_samples > 0:
-        data = data[: args.max_samples]
+    data = select_data(load_data(args.data_path), args)
 
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,7 +330,7 @@ def main() -> None:
     max_input_tokens = args.max_model_len - args.max_new_tokens
 
     with out_path.open("a", encoding="utf-8") as fout:
-        for item in tqdm(data):
+        for dataset_index, item in tqdm(data):
             item_id = str(item.get("_id"))
             if item_id in done:
                 continue
@@ -359,13 +391,133 @@ def main() -> None:
                         "response": response,
                         "pred": pred,
                         "judge": pred == answer,
+                        "dataset_index": dataset_index,
                         "input_tokens": input_len,
                         "model_name": args.model_name,
                         "model_path": model_name_or_path,
                         "attn_type": args.attn_type,
                         "imi_engine": args.imi_engine,
+                        "timing": dict(getattr(llm, "last_timing_stats", {}) or {}),
+                        "benchmark_config": {
+                            "data_path": args.data_path,
+                            "model_path": model_name_or_path,
+                            "config_model_name": config_model_name,
+                            "attn_type": args.attn_type,
+                            "device": args.device,
+                            "parallel_mode": args.parallel_mode,
+                            "dtype": args.dtype,
+                            "max_model_len": args.max_model_len,
+                            "max_new_tokens": args.max_new_tokens,
+                            "retrieval_budget": args.retrieval_budget,
+                            "cache_ratio": args.cache_ratio,
+                            "prefill_chunk_size": args.prefill_chunk_size,
+                            "sample_indices": args.sample_indices,
+                            "profile_decode": os.getenv("IMI_PROFILE_DECODE", "0") == "1",
+                            "profile_steps": int(os.getenv("IMI_PROFILE_STEPS", "5")),
+                            "breakdown_benchmark": os.getenv("IMI_BREAKDOWN_BENCHMARK", "0") == "1",
+                            "profile_hit_rate": os.getenv("IMI_PROFILE_HIT_RATE", "0") == "1",
+                            "profile_cache": os.getenv("IMI_PROFILE_CACHE", "0") == "1",
+                            "profile_token_hit_rate": os.getenv("IMI_PROFILE_TOKEN_HIT_RATE", "0") == "1",
+                            "tpot_valid_for_performance": not (
+                                os.getenv("IMI_PROFILE_DECODE", "0") == "1"
+                                or os.getenv("IMI_BREAKDOWN_BENCHMARK", "0") == "1"
+                            ),
+                        },
                     }
                 )
+                timing = record["timing"]
+                decode_time = float(timing.get("decode_time", 0.0) or 0.0)
+                decode_steps = int(timing.get("decode_steps", 0) or 0)
+                timing["tpot_ms"] = decode_time * 1000.0 / decode_steps if decode_steps > 0 else 0.0
+                profile_enabled = os.getenv("IMI_PROFILE_DECODE", "0") == "1"
+                breakdown_enabled = os.getenv("IMI_BREAKDOWN_BENCHMARK", "0") == "1"
+                timing["measurement_mode"] = (
+                    "instrumented_profile"
+                    if profile_enabled or breakdown_enabled
+                    else "unprofiled_wall"
+                )
+                timing["tpot_valid_for_performance"] = not (
+                    profile_enabled or breakdown_enabled
+                )
+                decode_breakdown = (
+                    timing.get("breakdown", {}).get("decode", {})
+                    if isinstance(timing.get("breakdown"), dict)
+                    else {}
+                )
+                sparse_profile = decode_breakdown.get("sparse_avg_per_step_ms", {})
+                if not isinstance(sparse_profile, dict):
+                    sparse_profile = {}
+                hit_blocks = float(sparse_profile.get("hit_blocks", 0.0) or 0.0)
+                miss_blocks = float(sparse_profile.get("miss_blocks", 0.0) or 0.0)
+                hit_tokens = float(sparse_profile.get("hit_tokens", 0.0) or 0.0)
+                miss_tokens = float(sparse_profile.get("miss_tokens", 0.0) or 0.0)
+                profile_rows = decode_breakdown.get("profile_step_rows", [])
+                if not isinstance(profile_rows, list):
+                    profile_rows = []
+                profiled_steps = int(
+                    decode_breakdown.get(
+                        "profiled_steps",
+                        getattr(getattr(llm, "kv_cache", None), "profile_decode_count", 0),
+                    )
+                    or 0
+                )
+                timing["profiled_steps"] = profiled_steps
+                timing["decode_profile"] = {
+                    "search_ms": float(sparse_profile.get("search_ms", 0.0) or 0.0),
+                    "selection_d2h_ms": float(sparse_profile.get("selection_d2h_ms", 0.0) or 0.0),
+                    "cpu_lookup_ms": 0.0,
+                    "gpu_cache_plan_ms": float(
+                        sparse_profile.get("gpu_cache_plan_ms", 0.0) or 0.0
+                    ),
+                    "gather_ms": float(sparse_profile.get("gather_ms", 0.0) or 0.0),
+                    "attention_ms": float(sparse_profile.get("attn_ms", 0.0) or 0.0),
+                    "cache_sync_ms": float(sparse_profile.get("cache_sync_ms", 0.0) or 0.0),
+                    "scatter_ms": float(sparse_profile.get("scatter_ms", 0.0) or 0.0),
+                    # This is the sparse-attention/retrieval window only. It
+                    # is not the complete cross-layer decode step.
+                    "sparse_attention_total_ms": float(sparse_profile.get("total_ms", 0.0) or 0.0),
+                    "full_decode_step_ms": float(
+                        decode_breakdown.get(
+                            "profile_decode_step_ms",
+                            timing.get("profile_decode_step_ms", timing["tpot_ms"]),
+                        )
+                        or 0.0
+                    ),
+                    "other_ms": float(sparse_profile.get("other_ms", 0.0) or 0.0),
+                    "hit_blocks": hit_blocks,
+                    "miss_blocks": miss_blocks,
+                    "block_hit_rate": hit_blocks / (hit_blocks + miss_blocks)
+                    if hit_blocks + miss_blocks > 0
+                    else 0.0,
+                    "hit_tokens": hit_tokens,
+                    "miss_tokens": miss_tokens,
+                    "token_hit_rate": hit_tokens / (hit_tokens + miss_tokens)
+                    if hit_tokens + miss_tokens > 0
+                    else 0.0,
+                    "block_hit_rate_all_steps": float(
+                        decode_breakdown.get("all_steps_block_hit_rate", 0.0) or 0.0
+                    ),
+                    "block_hit_rate_steady": float(
+                        decode_breakdown.get("steady_steps_block_hit_rate", 0.0) or 0.0
+                    ),
+                    "token_hit_rate_all_steps": float(
+                        decode_breakdown.get("all_steps_token_hit_rate", 0.0) or 0.0
+                    ),
+                    "token_hit_rate_steady": float(
+                        decode_breakdown.get("steady_steps_token_hit_rate", 0.0) or 0.0
+                    ),
+                    "token_hit_rate_measured": bool(
+                        decode_breakdown.get("token_hit_rate_measured", False)
+                    ),
+                    "sparse_timing_scope": "sparse_attention_only",
+                    "unseparated_stages": [
+                        "selection_d2h",
+                        "cache_sync",
+                        "scatter",
+                    ],
+                    "not_used_stages": ["cpu_lookup"],
+                    "profile_step_rows": profile_rows,
+                }
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 fout.flush()
                 done.add(item_id)

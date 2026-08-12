@@ -100,7 +100,7 @@ MODEL_SELECT() {
     MODEL_PATH=$(resolve_repo_model_path "${MODEL_NAME}")
 
     case $MODEL_NAME in
-        qwen3-8b|Qwen/Qwen3-8B)
+        qwen3-8b|Qwen/Qwen3-8B|deepseek32b-fp8|DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic|cortecs/DeepSeek-R1-Distill-Qwen-32B-FP8-Dynamic)
             MODEL_TEMPLATE_TYPE="hf-chat"
             ;;
         *)

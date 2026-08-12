@@ -54,7 +54,9 @@ def _device_total_bytes(device: str) -> int:
 
 
 def _estimate_layer_weight_bytes(config: Any, dtype: torch.dtype) -> int:
-    itemsize = _dtype_size(dtype)
+    runtime_itemsize = _dtype_size(dtype)
+    fp8_linear = _is_compressed_tensors_fp8_config(config)
+    linear_itemsize = 1 if fp8_linear else runtime_itemsize
     hidden = int(config.hidden_size)
     heads = int(config.num_attention_heads)
     kv_heads = int(config.num_key_value_heads)
@@ -69,10 +71,36 @@ def _estimate_layer_weight_bytes(config: Any, dtype: torch.dtype) -> int:
     down = hidden * intermediate
     norms = 2 * hidden
     bias = 0
-    if bool(getattr(config, "attention_bias", False)):
+    if bool(getattr(config, "attention_bias", False)) or str(getattr(config, "model_type", "")).lower() == "qwen2":
         bias += (heads + 2 * kv_heads) * head_dim
+    linear_params = q + k + v + o + gate + up + down
+    if fp8_linear:
+        scale_params = heads * head_dim + 2 * kv_heads * head_dim + heads * head_dim + 3 * intermediate
+        return int(
+            (
+                linear_params * linear_itemsize
+                + scale_params * 4
+                + (norms + bias) * runtime_itemsize
+            )
+            * 1.03
+        )
     # Keep a small overhead for concatenated qkv/gate_up tensors and allocator rounding.
-    return int((q + k + v + o + gate + up + down + norms + bias) * itemsize * 1.03)
+    return int((linear_params + norms + bias) * runtime_itemsize * 1.03)
+
+
+def _is_compressed_tensors_fp8_config(config: Any) -> bool:
+    quant = getattr(config, "quantization_config", None) or {}
+    if not isinstance(quant, dict):
+        return False
+    if str(quant.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if str(quant.get("format", "")).lower() != "float-quantized":
+        return False
+    for group in (quant.get("config_groups") or {}).values():
+        weights = (group or {}).get("weights") or {}
+        if str(weights.get("type", "")).lower() == "float" and int(weights.get("num_bits", 0) or 0) == 8:
+            return True
+    return False
 
 
 def _estimate_shared_weight_bytes(config: Any, dtype: torch.dtype) -> int:

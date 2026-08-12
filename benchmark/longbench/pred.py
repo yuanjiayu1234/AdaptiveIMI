@@ -13,7 +13,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import generate_config  # noqa: E402
+from config import generate_config, resolve_model_path  # noqa: E402
 
 
 def load_json(name):
@@ -58,7 +58,14 @@ def parse_args(args=None):
         "--model",
         type=str,
         default="llama-3.1-8b",
-        choices=["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"],
+        choices=[
+            "llama-3-8b-1048k",
+            "qwen2.5-7b",
+            "llama-3.1-8b",
+            "qwen2.5-72b",
+            "deepseek32b-fp8",
+            "deepseek-r1-distill-qwen-32b-fp8-dynamic",
+        ],
     )
     parser.add_argument("--model_path", type=str, default=None, help="HF model path. Overrides config/model2path.json.")
     parser.add_argument("--config_model_name", type=str, default=None, help="Model key used to find AdaptiveIMI config.")
@@ -134,7 +141,7 @@ def dtype_from_arg(dtype):
 
 
 def load_model(model_name, model_path, max_len, dtype, device, parallel_mode="auto", weight_loading="hf", gpu_memory_utilization=0.90):
-    from model_hub import LlamaModel, QwenModel
+    from model_hub import LlamaModel, QwenModel, QwenFp8Model, is_fp8_compressed_model
 
     model_path_lower = model_path.lower()
     model_name_lower = model_name.lower()
@@ -150,7 +157,8 @@ def load_model(model_name, model_path, max_len, dtype, device, parallel_mode="au
             gpu_memory_utilization=gpu_memory_utilization,
         )
     elif "qwen" in model_path_lower or "qwen" in model_name_lower:
-        llm = QwenModel(
+        model_cls = QwenFp8Model if is_fp8_compressed_model(model_path) else QwenModel
+        llm = model_cls(
             model_name,
             max_length=max_len,
             dtype=dtype,
@@ -306,7 +314,7 @@ if __name__ == "__main__":
 
     model_name = args.model
     config_model_name = args.config_model_name or model_name
-    model_path = args.model_path or os.getenv("MODEL_PATH_OVERRIDE") or model2path[model_name]
+    model_path = args.model_path or os.getenv("MODEL_PATH_OVERRIDE") or resolve_model_path(config_model_name) or model2path[model_name]
     max_length = args.max_len or model2maxlen[model_name]
     args.model_path = model_path
     args.max_len = max_length
