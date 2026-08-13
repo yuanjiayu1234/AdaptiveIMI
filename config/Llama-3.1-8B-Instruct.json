@@ -6,7 +6,7 @@
         "cache_ratio": 0.1,
         "retrieval_budget": 0.1,
         "buffer_cluster_num": 32,   
-        "partition_path": "outputs/train_data/partitions/booksum_nolima_babilong_constrained_mse_cap96_alltokens_tokentrim_search32x384/llama3_partition.json",
+        "partition_path": "",
         "hybrid_index": {
             "policy": "gpu_only",
             "start": "gpu"

@@ -209,6 +209,12 @@ class HybridMetadataMixin:
                 cluster_offsets[row_idx, : cluster_count + 1].copy_(offsets_tensor)
                 cluster_offsets[row_idx, cluster_count + 1 :] = int(offsets_tensor[-1].item())
 
+        # When decode metadata was preallocated, this GPU buffer was created
+        # from the initially empty CPU offsets. Publish the populated offsets
+        # before decode retrieval consumes them.
+        if self.cluster_offsets_gpu[layer_idx] is not None:
+            self.cluster_offsets_gpu[layer_idx].copy_(cluster_offsets, non_blocking=True)
+
         self.layer_metadata[layer_idx] = None
         with nvtx_range(f"imi.prefill.L{layer_idx}.load_metadata.cpu_stats"):
             self.layer_index_stats[layer_idx] = {

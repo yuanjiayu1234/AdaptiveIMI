@@ -114,13 +114,16 @@ if __name__ == '__main__':
         raise FileNotFoundError(f"Prediction directory not found: {path}")
     
     scores = dict()
-    all_files = os.listdir(path)
+    all_files = sorted(os.listdir(path))
     print("Evaluating on:", all_files)
     for filename in all_files:
         if not filename.endswith("jsonl"):
             continue
         predictions, answers, lengths = [], [], []
         dataset = filename.split('.')[0]
+        if dataset not in dataset2metric:
+            print(f"Skipping non-dataset prediction file: {filename}")
+            continue
         with open(f"{path}{filename}", "r", encoding="utf-8") as f:
             for line in f:
                 data = json.loads(line)
