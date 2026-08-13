@@ -637,6 +637,7 @@ class Hybrid8WayIMICache(HybridGpuPrefillMixin, HybridCpuPrefillMixin, HybridMet
             self._wait_for_hybrid_background_finishes()
         except Exception:
             pass
+        self._shutdown_generated_history_worker()
         if hasattr(self, "hybrid_cpu_submit_queue"):
             self.hybrid_cpu_submit_stop = True
             self.hybrid_cpu_submit_queue.put(None)

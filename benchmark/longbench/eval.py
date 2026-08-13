@@ -17,7 +17,14 @@ sub_categories = {
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None, 
-                        choices=["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
+                        choices=[
+                            "llama-3-8b-1048k",
+                            "qwen2.5-7b",
+                            "llama-3.1-8b",
+                            "qwen2.5-72b",
+                            "deepseek32b-fp8",
+                            "deepseek-r1-distill-qwen-32b-fp8-dynamic",
+                        ])
     parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",
                         choices=["Full_Flash_Attn", "Full_Flash_Attn_Offload", "AdaptiveIMI", "ExternalBaseline"],
                         help="Attention method")

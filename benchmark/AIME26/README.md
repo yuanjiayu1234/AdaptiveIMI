@@ -41,3 +41,40 @@ MODEL_PATH=/path/to/Qwen3-8B \
 
 Use the same `temperature`, `top_p`, `top_k`, seed policy, and generation
 length for Full Attention and AdaptiveIMI.
+
+## Fixed 30-Problem Full vs AdaptiveIMI Run
+
+Run the fixed comparable experiment with:
+
+```bash
+./benchmark/AIME26/run_full_vs_adaptiveimi_30x8.sh
+```
+
+It sequentially runs all 30 dataset problems with pass@8 for Full Flash
+Attention and AdaptiveIMI. The fixed AdaptiveIMI `retrieval_budget` and
+`cache_ratio` are both `0.1`. Both methods use the same sampling settings and
+a `65536` model context / `49152` generation safety cap, while stopping early
+after the first valid `\boxed{0..999}` answer.
+
+## Replay an Existing Full-Attention Attempt Set
+
+The checked-in Full Attention result currently contains **84 attempt records**
+over 12 problem IDs; it is not 84 complete pass@8 problems. To make an
+AdaptiveIMI comparison, replay the same `(id, attempt_index)` whitelist with
+the original seed and per-attempt generation limits:
+
+```bash
+python benchmark/AIME26/continue_aime26_adaptiveimi.py \
+  --seed_path benchmark/AIME26/results/adaptiveimi_pass@8_clean.jsonl \
+  --patch_path benchmark/AIME26/adaptiveimi_target84_patch.jsonl \
+  --merged_path benchmark/AIME26/results/adaptiveimi_pass@8_target84.jsonl \
+  --target_path benchmark/AIME26/results/full_flash_attn_pass@8_clean.jsonl \
+  --model_path /path/to/Qwen3-8B \
+  --device cuda:0
+```
+
+Run the same command with `--dry_run` first. The tool reuses only existing
+AdaptiveIMI attempts whose seed, sampling parameters, thinking mode, and
+`max_model_len` / `max_new_tokens` match the Full Attention reference.
+Length-limited outputs are retained as valid attempts rather than rerun with a
+different seed or a larger generation limit.

@@ -231,6 +231,8 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
             self.async_update_interval,
         )
         self.async_update_delta_nprobe = max(int(async_cfg.get("delta_nprobe", 8)), 0)
+        self.async_update_spill_slots = max(int(async_cfg.get("spill_slots", 4)), 1)
+        self.async_update_cpu_block_chunks = max(int(async_cfg.get("cpu_block_chunks", 256)), 1)
 
         self.input_length = int(input_length) if input_length is not None else self.max_length - max_new_length
         actual_gen_len = max_new_length - 1
@@ -452,16 +454,29 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         self.generated_tokens_total = 0
         self.generated_recent_counts = [0] * self.layer_num
         self.static_layer_lengths = [self.base_static_pattern_total] * self.layer_num
-        max_delta_tokens = max(self.capacity_actual_gen_len - self.async_update_start_after_tokens, 0)
-        self.async_update_max_delta_chunks = (
-            (max_delta_tokens + self.async_update_interval - 1) // self.async_update_interval
-            if self.async_update_enabled
-            else 0
-        )
-        self.delta_active_chunks = [0] * self.layer_num
-        self.delta_mini_keys: List[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.delta_mini_values: List[Optional[torch.Tensor]] = [None] * self.layer_num
-        self.delta_mini_centroids: List[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.generated_published_chunks = [0] * self.layer_num
+        self.generated_next_chunk_ids = [0] * self.layer_num
+        self.generated_history_keys: List[List[torch.Tensor]] = [[] for _ in range(self.layer_num)]
+        self.generated_history_values: List[List[torch.Tensor]] = [[] for _ in range(self.layer_num)]
+        self.generated_history_centroid_blocks: List[List[torch.Tensor]] = [[] for _ in range(self.layer_num)]
+        self.generated_spill_keys: List[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.generated_spill_values: List[Optional[torch.Tensor]] = [None] * self.layer_num
+        self.generated_spill_states: List[List[Optional[tuple[int, int]]]] = [
+            [None] * self.async_update_spill_slots for _ in range(self.layer_num)
+        ]
+        self.generated_spill_next_slots = [0] * self.layer_num
+        self.generated_commit_queue: queue.Queue[tuple[int, int, int, torch.Tensor]] = queue.Queue()
+        self.generated_history_lock = threading.Lock()
+        self.generated_history_worker_queue: queue.Queue[Optional[tuple[int, int, int, torch.Tensor, torch.Tensor, torch.cuda.Event]]] = queue.Queue()
+        self.generated_history_worker = None
+        self.generated_history_worker_streams: Dict[str, torch.cuda.Stream] = {}
+        if self.async_update_enabled:
+            self.generated_history_worker = threading.Thread(
+                target=self._generated_history_worker_loop,
+                daemon=True,
+                name="imi-generated-history-append",
+            )
+            self.generated_history_worker.start()
 
         self.prefill_chunk_size = max(int(self.runtime_config["streaming"].get("prefill_chunk_size", 32768)), 1)
         self.profile_decode = os.getenv("IMI_PROFILE_DECODE", "0") == "1"
@@ -578,11 +593,6 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         new_list_stride = max(new_input_length - base_static_pattern_total, 0)
         if new_list_stride > self.list_capacity:
             return False
-        if self.async_update_enabled:
-            max_delta_tokens = max(new_actual_gen_len - self.async_update_start_after_tokens, 0)
-            required_delta_chunks = (max_delta_tokens + self.async_update_interval - 1) // self.async_update_interval
-            if required_delta_chunks > self.async_update_max_delta_chunks:
-                return False
         if self.build_index_when_prefilling:
             if self.async_update_enabled:
                 new_static_stride = base_static_pattern_total + min(new_actual_gen_len, self.async_update_recent_capacity)
@@ -614,10 +624,12 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
             self.static_stride = self.input_length + self.actual_gen_len
         self.context = 0
         self.attn_func = self.dense_attention
+        self._reset_generated_history()
         self.generated_tokens_total = 0
         self.generated_recent_counts = [0] * self.layer_num
         self.static_layer_lengths = [self.base_static_pattern_total] * self.layer_num
-        self.delta_active_chunks = [0] * self.layer_num
+        self.generated_published_chunks = [0] * self.layer_num
+        self.generated_next_chunk_ids = [0] * self.layer_num
 
         self.layer_metadata = [None] * self.layer_num
         self.layer_index_stats = [None] * self.layer_num
@@ -712,8 +724,7 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
                 self.centroids[layer_idx].zero_()
             if self.centroids_mask[layer_idx] is not None:
                 self.centroids_mask[layer_idx].fill_(True)
-            if self.delta_mini_centroids[layer_idx] is not None:
-                self.delta_mini_centroids[layer_idx].zero_()
+            self.generated_history_centroid_blocks[layer_idx].clear()
 
     def _estimate_cache_parameters(self) -> Tuple[int, int, int, int]:
         if not self.build_index_when_prefilling:

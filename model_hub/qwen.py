@@ -369,7 +369,7 @@ class QwenModel(LLM):
         torch.cuda.set_device(next_device)
         hidden_states = hidden_states.to(next_device, non_blocking=True)
         self._activate_device_runtime_tensors(next_device)
-        if self.attention_type in ('Full_Flash_Attn', 'Full_Flash_Attn_Offload'):
+        if self.attention_type == 'Full_Flash_Attn':
             if hidden_states.shape[1] == 1:
                 self.kv_cache.batch_indices = self.kv_cache.batch_indices_dict[next_device]
                 self.kv_cache.valid_length = self.kv_cache.valid_length_dict[next_device]

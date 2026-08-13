@@ -119,7 +119,7 @@ class AdaptiveIMIRuntimeMixin:
         self.buffer_budget_pages = self.buffer_size
 
         delta_execution_tokens = (
-            int(self.async_update_delta_nprobe) * int(self.async_update_interval)
+            (int(self.async_update_delta_nprobe) + int(self.async_update_spill_slots)) * int(self.async_update_interval)
             if self.async_update_enabled
             else 0
         )
@@ -145,23 +145,16 @@ class AdaptiveIMIRuntimeMixin:
         if self.async_update_enabled:
             for ldx in range(self.layer_num):
                 device = self.layer_mapping[str(ldx)]
-                chunk_capacity = max(int(self.async_update_max_delta_chunks), 1)
-                self.delta_mini_keys[ldx] = torch.empty(
-                    (self.batch_groups, chunk_capacity, self.async_update_interval, self.head_dim),
+                self.generated_spill_keys[ldx] = torch.empty(
+                    (self.batch_groups, self.async_update_spill_slots, self.async_update_interval, self.head_dim),
                     dtype=self.dtype,
                     device=device,
                 ).contiguous()
-                self.delta_mini_values[ldx] = torch.empty(
-                    (self.batch_groups, chunk_capacity, self.async_update_interval, self.head_dim),
+                self.generated_spill_values[ldx] = torch.empty(
+                    (self.batch_groups, self.async_update_spill_slots, self.async_update_interval, self.head_dim),
                     dtype=self.dtype,
                     device=device,
                 ).contiguous()
-                self.delta_mini_centroids[ldx] = torch.zeros(
-                    (self.batch_groups, chunk_capacity, self.head_dim),
-                    dtype=torch.float32,
-                    device=device,
-                ).contiguous()
-                self.delta_active_chunks[ldx] = 0
 
         if profile_prepare:
             log_step("async_update")

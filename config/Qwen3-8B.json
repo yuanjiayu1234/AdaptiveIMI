@@ -13,8 +13,9 @@
         },
         "cache": {
             "execution_buffer_ring_size": 2,
-            "cluster_uva_warmup_steps": 3,
-            "promotion_warmup_steps": 4
+            "cluster_uva_warmup_steps": 0,
+            "promotion_warmup_steps": 4,
+            "promotion_start_step": 2
         },
         "kmeans": {
             "max_iters": 15

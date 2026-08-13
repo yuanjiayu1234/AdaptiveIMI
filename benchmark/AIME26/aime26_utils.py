@@ -113,6 +113,15 @@ def extract_integer_answer(response: str) -> str | None:
     return None
 
 
+def extract_boxed_aime_answer(response: str) -> str | None:
+    """Return the first valid AIME answer explicitly written in ``\\boxed{}``."""
+    for candidate in _boxed_contents(str(response or "")):
+        answer = _strict_integer(candidate)
+        if answer is not None and 0 <= int(answer) <= 999:
+            return answer
+    return None
+
+
 def normalize_integer_answer(answer: Any) -> str:
     value = _strict_integer(answer)
     return value or ""
@@ -130,9 +139,33 @@ def completed_problem_ids(path: str | Path) -> set[str]:
     if not file_path.exists():
         return completed
     for row in load_jsonl(file_path):
-        if row.get("record_type") == "summary":
+        expected_attempts = int(row.get("n_generate", row.get("pass_k", 1)) or 1)
+        attempted = int(row.get("attempted_generate", 0) or 0)
+        if row.get("record_type") == "summary" and attempted >= expected_attempts:
             completed.add(str(row.get("id", row.get("dataset_index"))))
     return completed
+
+
+def latest_attempts_by_problem(
+    path: str | Path,
+) -> dict[str, dict[int, dict[str, Any]]]:
+    """Load the last JSONL record for every ``(problem_id, attempt_index)``.
+
+    AIME26 result files are append-only so an interrupted run may contain an
+    earlier failed record followed by a successful retry. The final record is
+    the one that represents the attempt during resume and evaluation.
+    """
+    file_path = Path(path)
+    attempts: dict[str, dict[int, dict[str, Any]]] = {}
+    if not file_path.exists():
+        return attempts
+    for row in load_jsonl(file_path):
+        if row.get("record_type") != "attempt":
+            continue
+        item_id = str(row.get("id", row.get("dataset_index")))
+        attempt_index = int(row.get("attempt_index", 1) or 1)
+        attempts.setdefault(item_id, {})[attempt_index] = row
+    return attempts
 
 
 def summarize_pass_at_k(

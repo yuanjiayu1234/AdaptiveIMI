@@ -185,6 +185,10 @@ class AdaptiveIMIRetrievalMixin:
             return max(int(cold_capacity * ratio), self._GPU_CACHE_PROMOTION_STEADY_PAGES_PER_GROUP)
         ratio = float(cache_cfg.get("promotion_steady_fill_ratio", 0.10))
         return max(int(cold_capacity * ratio), self._GPU_CACHE_PROMOTION_STEADY_PAGES_PER_GROUP)
+
+    def _gpu_cache_promotion_start_step(self) -> int:
+        cache_cfg = self.runtime_config.get("cache") or {}
+        return max(int(cache_cfg.get("promotion_start_step", 2)), 1)
     def _gpu_cache_hot_cold_capacities(self) -> tuple[int, int]:
         cache_cfg = self.runtime_config.get("cache") or {}
         hot_ratio = float(cache_cfg.get("hot_ratio", 0.3))
@@ -531,7 +535,12 @@ class AdaptiveIMIRetrievalMixin:
             "promotion_ms_max": 0.0,
             "promotion_skipped_busy": 0.0,
             "promotion_skipped_no_buffer": 0.0,
+            "promotion_skipped_warmup": 0.0,
         }
+
+        if int(getattr(self, "gpu_cache_promotion_decode_step", 0)) < self._gpu_cache_promotion_start_step():
+            stats["promotion_skipped_warmup"] = 1.0
+            return stats
 
         prior_event = self.gpu_cache_promote_events[layer_idx]
         if prior_event is not None:
@@ -759,12 +768,23 @@ class AdaptiveIMIRetrievalMixin:
             use_cluster_uva=use_cluster_uva,
             profile_decode=profile,
         )
+        if debug_decode and layer_idx == 0:
+            print(
+                f"[IMI DECODE] step={self.decode_debug_step} layer=0 phase=retrieval_done",
+                flush=True,
+            )
         if profile:
             delta_start_event = self._record_timing_event()
-        self._append_delta_to_execution(
+        self._append_generated_history_to_execution(
             layer_idx,
             device,
             query_grouped,
+            execution_keys,
+            execution_values,
+        )
+        self._append_inflight_spills_to_execution(
+            layer_idx,
+            device,
             execution_keys,
             execution_values,
         )
@@ -796,6 +816,11 @@ class AdaptiveIMIRetrievalMixin:
             execution_values,
             self.valid_lengths_dict[device],
         )
+        if debug_decode and layer_idx == 0:
+            print(
+                f"[IMI DECODE] step={self.decode_debug_step} layer=0 phase=attention_done",
+                flush=True,
+            )
 
         if profile:
             attn_end_event = self._record_timing_event()

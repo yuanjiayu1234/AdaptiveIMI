@@ -349,6 +349,14 @@ def generate_config(
     CONFIG_FILE = os.path.join(CONFIG_DIR, model_config_name)
     with open(CONFIG_FILE, "r") as f:
         _config = json.load(f)
+
+    if prefill_chunk_size is not None:
+        prefill_chunk_size = int(prefill_chunk_size)
+        if prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be positive")
+        prefill_cfg = dict(_config.get("prefill") or {})
+        prefill_cfg["prefill_chunk_size"] = prefill_chunk_size
+        _config["prefill"] = prefill_cfg
     
     if attn_type == "AdaptiveIMI":
         base_config = _clone_attn_config_section(_config.get("AdaptiveIMI"))
@@ -409,9 +417,6 @@ def generate_config(
                     "use the default flat decode path."
                 )
         if prefill_chunk_size is not None:
-            prefill_chunk_size = int(prefill_chunk_size)
-            if prefill_chunk_size <= 0:
-                raise ValueError("prefill_chunk_size must be positive")
             prefill_cfg = dict(base_config.get("prefill") or {})
             prefill_cfg["prefill_chunk_size"] = prefill_chunk_size
             base_config["prefill"] = prefill_cfg

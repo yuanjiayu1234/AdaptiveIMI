@@ -37,8 +37,9 @@ finally:
 
 from aime26_utils import (  # noqa: E402
     answers_equal,
-    completed_problem_ids,
+    extract_boxed_aime_answer,
     extract_integer_answer,
+    latest_attempts_by_problem,
     load_aime26_data,
     select_rows,
 )
@@ -61,7 +62,7 @@ def set_seed(seed: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run AIME26 with Full Attention or AdaptiveIMI using pass@k."
+        description="Run AIME26 with full attention, full-attention offload, or AdaptiveIMI using pass@k."
     )
     parser.add_argument("--data_path", type=str, default=str(DEFAULT_DATA_PATH))
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_NAME)
@@ -93,7 +94,7 @@ def parse_args() -> argparse.Namespace:
         "--attention_type",
         type=str,
         default="Full_Flash_Attn",
-        choices=("Full_Flash_Attn", "AdaptiveIMI"),
+        choices=("Full_Flash_Attn", "Full_Flash_Attn_Offload", "AdaptiveIMI"),
     )
     parser.add_argument("--retrieval_budget", type=float, default=None)
     parser.add_argument("--cache_ratio", type=float, default=None)
@@ -109,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early_stop_on_first_correct", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--disable_thinking", action="store_true")
+    parser.add_argument(
+        "--boxed_answer_stop_interval",
+        type=int,
+        default=8,
+        help="Check generated text every N tokens and stop after a valid \\boxed{0..999}.",
+    )
     parser.add_argument("--disable_resume", action="store_true")
     return parser.parse_args()
 
@@ -184,15 +191,47 @@ def output_path_for(args: argparse.Namespace) -> Path:
     return DEFAULT_OUTPUT_DIR / f"{args.attn_type.lower()}_{mode}.jsonl"
 
 
+def matches_experiment(row: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Return whether a stored record belongs to this exact experiment."""
+    if row.get("attn_type") != args.attn_type:
+        return False
+    if int(row.get("n_generate", 1) or 1) != args.n_generate:
+        return False
+    if int(row.get("pass_k", 1) or 1) != args.pass_k:
+        return False
+
+    config = dict(row.get("benchmark_config") or {})
+    expected = {
+        "max_model_len": args.max_model_len,
+        "max_new_tokens": args.max_new_tokens,
+        "dtype": args.dtype,
+        "config_model_name": args.config_model_name,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "enable_thinking": not args.disable_thinking,
+        "boxed_answer_stop_interval": args.boxed_answer_stop_interval,
+        "boxed_answer_after_thinking": True,
+    }
+    return all(config.get(name) == value for name, value in expected.items())
+
+
 def main() -> None:
     args = parse_args()
     args.pass_k = args.n_generate if args.pass_k is None else args.pass_k
     if args.n_generate <= 0 or args.pass_k <= 0 or args.pass_k > args.n_generate:
         raise ValueError("Require 0 < pass_k <= n_generate")
+    if args.early_stop_on_first_correct and args.pass_k > 1:
+        raise ValueError(
+            "--early_stop_on_first_correct is incompatible with pass@k for k > 1; "
+            "it would write incomplete attempt groups."
+        )
     if args.max_model_len <= args.max_new_tokens:
         raise ValueError("--max_model_len must be larger than --max_new_tokens")
     if args.temperature < 0:
         raise ValueError("--temperature must be non-negative")
+    if args.boxed_answer_stop_interval <= 0:
+        raise ValueError("--boxed_answer_stop_interval must be positive")
     if args.attn_type == "AdaptiveIMI" and args.retrieval_budget is None:
         args.retrieval_budget = 0.1
     if args.attn_type == "AdaptiveIMI" and args.cache_ratio is None:
@@ -203,7 +242,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if args.disable_resume and out_path.exists():
         out_path.unlink()
-    done_ids = completed_problem_ids(out_path)
+    existing_attempts = latest_attempts_by_problem(out_path)
 
     data = load_aime26_data(args.data_path)
     selected = select_rows(data, start_idx=args.start_idx, num_samples=args.num_samples)
@@ -235,8 +274,18 @@ def main() -> None:
     with out_path.open("a", encoding="utf-8") as fout:
         for dataset_index, item in selected:
             item_id = str(item.get("id", dataset_index))
-            if item_id in done_ids:
-                continue
+            existing_by_index = existing_attempts.get(item_id, {})
+            incompatible_indices = [
+                attempt_index
+                for attempt_index, row in existing_by_index.items()
+                if not matches_experiment(row, args)
+            ]
+            if incompatible_indices:
+                raise ValueError(
+                    f"Output {out_path} already contains incompatible records for "
+                    f"problem {item_id}, attempt(s) {sorted(incompatible_indices)}. "
+                    "Use a new --out_path or pass --disable_resume."
+                )
 
             problem = str(item["problem"]).strip()
             target = str(item["answer"]).strip()
@@ -269,8 +318,29 @@ def main() -> None:
                 prefill_chunk_size=args.prefill_chunk_size,
             )
 
+            def stop_after_boxed_answer(generated_ids: torch.Tensor) -> str | None:
+                generated_text = tokenizer.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                )[0]
+                think_start = generated_text.find("<think>")
+                if think_start >= 0:
+                    think_end = generated_text.find("</think>", think_start)
+                    if think_end < 0:
+                        return None
+                    generated_text = generated_text[think_end + len("</think>") :]
+                return (
+                    "boxed_answer"
+                    if extract_boxed_aime_answer(generated_text) is not None
+                    else None
+                )
+
             attempt_rows: list[dict[str, Any]] = []
             for attempt_index in range(args.n_generate):
+                stored_attempt = existing_by_index.get(attempt_index + 1)
+                if stored_attempt is not None and not stored_attempt.get("error"):
+                    attempt_rows.append(stored_attempt)
+                    continue
                 attempt_seed = args.seed + dataset_index * 1000 + attempt_index
                 set_seed(attempt_seed)
                 started = time.perf_counter()
@@ -289,6 +359,8 @@ def main() -> None:
                         top_p=args.top_p,
                         top_k=args.top_k,
                         ignore_eos=False,
+                        text_stop_callback=stop_after_boxed_answer,
+                        text_stop_interval=args.boxed_answer_stop_interval,
                     )
                     response = tokenizer.batch_decode(
                         output_ids,
@@ -345,7 +417,14 @@ def main() -> None:
                         "top_p": args.top_p,
                         "top_k": args.top_k,
                         "enable_thinking": not args.disable_thinking,
+                        "boxed_answer_stop_interval": args.boxed_answer_stop_interval,
+                        "boxed_answer_after_thinking": True,
                     },
+                    "completion_status": (
+                        "error"
+                        if error
+                        else str(timing.get("stop_reason", "length_limit"))
+                    ),
                 }
                 fout.write(json.dumps(attempt, ensure_ascii=False) + "\n")
                 fout.flush()
@@ -354,33 +433,43 @@ def main() -> None:
                 if args.early_stop_on_first_correct and is_correct:
                     break
 
-            correct_count = sum(bool(row["is_correct"]) for row in attempt_rows)
+            successful_attempts = [row for row in attempt_rows if not row.get("error")]
+            if len(successful_attempts) != args.n_generate:
+                print(
+                    f"Problem {item_id} remains incomplete: "
+                    f"{len(successful_attempts)}/{args.n_generate} successful attempts.",
+                    file=sys.stderr,
+                )
+                cleanup_model_after_problem(llm)
+                continue
+
+            successful_attempts.sort(key=lambda row: int(row["attempt_index"]))
+            correct_count = sum(bool(row["is_correct"]) for row in successful_attempts)
             summary = {
                 "record_type": "summary",
                 "dataset_index": dataset_index,
                 "id": item_id,
                 "n_generate": args.n_generate,
                 "pass_k": args.pass_k,
-                "attempted_generate": len(attempt_rows),
+                "attempted_generate": len(successful_attempts),
                 "correct_count": correct_count,
                 "pass_at_k": correct_count > 0,
                 "problem": problem,
                 "target_answer": target,
                 "input_tokens": input_tokens,
                 "mean_output_tokens": (
-                    sum(row["output_tokens"] for row in attempt_rows) / len(attempt_rows)
-                    if attempt_rows else 0.0
+                    sum(row["output_tokens"] for row in successful_attempts) / len(successful_attempts)
+                    if successful_attempts else 0.0
                 ),
                 "mean_wall_time_s": (
-                    sum(row["timing"]["wall_time_s"] for row in attempt_rows) / len(attempt_rows)
-                    if attempt_rows else 0.0
+                    sum(row["timing"]["wall_time_s"] for row in successful_attempts) / len(successful_attempts)
+                    if successful_attempts else 0.0
                 ),
                 "model_path": model_path,
                 "attn_type": args.attn_type,
             }
             fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
             fout.flush()
-            done_ids.add(item_id)
             cleanup_model_after_problem(llm)
 
     print(f"Finished. Results saved to: {out_path}")

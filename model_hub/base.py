@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 
 import flashinfer
 import torch
@@ -714,6 +715,8 @@ class LLM(PrefillMixin, SamplingMixin):
         top_k=20,
         ignore_eos=True,
         stop_token_ids=None,
+        text_stop_callback: Callable[[torch.Tensor], str | None] | None = None,
+        text_stop_interval: int = 1,
     ):
         outputs_ids = []    # multi iteration, multi request
         output_ids = []     # single iteration, multi request
@@ -732,8 +735,14 @@ class LLM(PrefillMixin, SamplingMixin):
         self.prefill_sampling_ms = (sampling_end - prefill_forward_end) * 1000.0
         outputs_ids.append(output_ids)
         self._debug_log_token_ids("prefill", output_ids)
+        self.generation_stop_reason = None
 
-        if self._debug_stop_after_prefill():
+        if text_stop_callback is not None:
+            initial_reason = text_stop_callback(output_ids.detach().cpu())
+            if initial_reason:
+                self.generation_stop_reason = str(initial_reason)
+
+        if self._debug_stop_after_prefill() or self.generation_stop_reason is not None:
             torch.cuda.synchronize()
             final_sync_end = time.perf_counter()
             self.prefill_final_sync_ms = (final_sync_end - sampling_end) * 1000.0
@@ -775,6 +784,8 @@ class LLM(PrefillMixin, SamplingMixin):
             ).view(1, 1, -1)
             end_of_text = torch.zeros((self.batch_size, 1), dtype=torch.bool, device=inputs_ids.device)
             end_of_text |= (output_ids.unsqueeze(-1) == stop_tokens).any(-1)
+            if end_of_text.all():
+                self.generation_stop_reason = "eos"
         
         # Decoding
         print("Start decoding ...")
@@ -786,18 +797,30 @@ class LLM(PrefillMixin, SamplingMixin):
         self.profile_decode_step_totals_ms = []
         debug_max_decode_steps = self._debug_max_decode_steps()
         debug_decode_steps = 0
+        text_stop_interval = max(int(text_stop_interval), 1)
+        decode_progress_every = max(int(os.getenv("IMI_DECODE_PROGRESS_EVERY", "0")), 0)
 
         if end_of_text is not None and end_of_text.all():
             print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
         else:
             max_decode_steps = self.max_new_length - 1
             for decode_idx in range(max_decode_steps):
+                if decode_progress_every and decode_idx % decode_progress_every == 0:
+                    print(
+                        f"[decode] step={decode_idx + 1}/{max_decode_steps} phase=start",
+                        flush=True,
+                    )
                 profile_step_start = (
                     time.perf_counter()
                     if profile_decode_enabled and decode_idx < profile_decode_limit
                     else None
                 )
                 logits = self.decode_forward(inputs_ids=output_ids)
+                if decode_progress_every and decode_idx % decode_progress_every == 0:
+                    print(
+                        f"[decode] step={decode_idx + 1}/{max_decode_steps} phase=forward_done",
+                        flush=True,
+                    )
                 output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
                 if profile_step_start is not None:
                     if torch.cuda.is_available():
@@ -810,10 +833,26 @@ class LLM(PrefillMixin, SamplingMixin):
                 if end_of_text is not None:
                     end_of_text |= (output_ids.unsqueeze(-1) == stop_tokens).any(-1)
                     if end_of_text.all():
+                        self.generation_stop_reason = "eos"
                         print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
                         outputs_ids.append(output_ids)
                         break
                 outputs_ids.append(output_ids)
+                if (
+                    text_stop_callback is not None
+                    and len(outputs_ids) % text_stop_interval == 0
+                ):
+                    generated_ids = torch.cat(outputs_ids, dim=-1).detach().cpu()
+                    text_stop_reason = text_stop_callback(generated_ids)
+                    if text_stop_reason:
+                        self.generation_stop_reason = str(text_stop_reason)
+                        print(
+                            colored(
+                                f"Text stop condition reached: {self.generation_stop_reason}",
+                                'yellow',
+                            )
+                        )
+                        break
                 if debug_max_decode_steps is not None and debug_decode_steps >= debug_max_decode_steps:
                     break
 
@@ -844,6 +883,7 @@ class LLM(PrefillMixin, SamplingMixin):
             "total_time": float(self.end2end_latency_s),
             "actual_generated": len(outputs_ids),
             "decode_steps": int(decode_steps),
+            "stop_reason": self.generation_stop_reason or "length_limit",
             "profile_decode_step_ms": (
                 float(sum(self.profile_decode_step_totals_ms) / len(self.profile_decode_step_totals_ms))
                 if self.profile_decode_step_totals_ms
@@ -872,10 +912,11 @@ class LLM(PrefillMixin, SamplingMixin):
 
     def generate(self, attention_type, inputs_ids, attention_masks, max_new_length, attn_config,
                  do_sample=False, temperature=0.6, top_p=0.95, top_k=20, ignore_eos=True,
-                 prefill_bsz=1, stop_token_ids=None):
+                 prefill_bsz=1, stop_token_ids=None, text_stop_callback=None,
+                 text_stop_interval=1):
         """ LLM Inference.
         Args:
-            attention_type: str, Full_Flash_Attn or AdaptiveIMI
+            attention_type: str, Full_Flash_Attn, Full_Flash_Attn_Offload, or AdaptiveIMI
             input_ids (torch.tensor): The input of LLM.
             attention_masks (torch.tensor): The attention masks of LLM.
             max_new_length (int): The maximum length of generated sequences.
@@ -915,6 +956,8 @@ class LLM(PrefillMixin, SamplingMixin):
             top_k=top_k, 
             ignore_eos=ignore_eos,
             stop_token_ids=stop_token_ids,
+            text_stop_callback=text_stop_callback,
+            text_stop_interval=text_stop_interval,
         )
 
         return outputs

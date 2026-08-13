@@ -47,7 +47,11 @@ class Fp8Linear:
                 f"expected weight_scale shape {(out_features, 1)}, got {tuple(weight_scale.shape)}"
             )
 
-        weight_t = weight.t().contiguous().to(device=device, non_blocking=True)
+        # vLLM's FP8 scaled-mm path expects [in_features, out_features]
+        # with column-major strides.  Do not call contiguous() after the
+        # transpose: that would turn the matrix row-major and cuBLASLt
+        # rejects the row-major x row-major combination.
+        weight_t = weight.t().to(device=device, non_blocking=True)
         scale = weight_scale.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
         if bias is not None:
             bias = bias.to(device=device, dtype=dtype, non_blocking=True).contiguous()

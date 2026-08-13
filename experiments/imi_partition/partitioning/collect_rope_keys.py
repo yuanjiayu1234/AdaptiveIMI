@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
@@ -61,7 +62,14 @@ class RopeKeyCollector:
         else:
             self.current_valid_starts = [max(int(value), 0) for value in valid_starts]
 
-    def add(self, layer_idx: int, key_states: torch.Tensor) -> None:
+    def add(
+        self,
+        layer_idx: int,
+        key_states: torch.Tensor,
+        *,
+        sequence_start: int = 0,
+        sequence_total: Optional[int] = None,
+    ) -> None:
         if layer_idx not in self.layer_ids:
             return
         if key_states.dim() != 4:
@@ -69,6 +77,13 @@ class RopeKeyCollector:
         # HF Llama uses [batch, kv_heads, seq, head_dim] at the RoPE call.
         bsz = int(key_states.size(0))
         seq_len = int(key_states.size(2))
+        sequence_start = max(int(sequence_start), 0)
+        sequence_total = int(sequence_total) if sequence_total is not None else sequence_start + seq_len
+        if sequence_total < sequence_start + seq_len:
+            raise ValueError(
+                f"collector sequence_total={sequence_total} is smaller than "
+                f"sequence_start+chunk_len={sequence_start + seq_len}"
+            )
         if self.current_valid_starts is None:
             valid_starts = [0] * bsz
         else:
@@ -78,11 +93,13 @@ class RopeKeyCollector:
 
         compact_chunks: List[torch.Tensor] = []
         for batch_idx, valid_start in enumerate(valid_starts):
-            start = min(int(valid_start) + self.static_start, seq_len)
-            end = seq_len - self.static_end if self.static_end > 0 else seq_len
-            end = max(start, end)
+            global_start = int(valid_start) + self.static_start
+            global_end = sequence_total - self.static_end if self.static_end > 0 else sequence_total
             if self.max_tokens_per_prompt > 0:
-                end = min(end, start + self.max_tokens_per_prompt)
+                global_end = min(global_end, global_start + self.max_tokens_per_prompt)
+            start = min(max(global_start - sequence_start, 0), seq_len)
+            end = min(global_end - sequence_start, seq_len)
+            end = max(start, end)
             if end <= start:
                 continue
             sliced = key_states[batch_idx : batch_idx + 1, :, start:end, :].detach()
@@ -332,6 +349,21 @@ def _apply_runtime_rope_config(config, *, model_path: str, model_name: str, max_
     return config
 
 
+def _is_fp8_compressed_config(config: Any) -> bool:
+    quant = getattr(config, "quantization_config", None) or {}
+    if not isinstance(quant, dict):
+        return False
+    if str(quant.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if str(quant.get("format", "")).lower() != "float-quantized":
+        return False
+    for group in (quant.get("config_groups") or {}).values():
+        weights = (group or {}).get("weights") or {}
+        if str(weights.get("type", "")).lower() == "float" and int(weights.get("num_bits", 0) or 0) == 8:
+            return True
+    return False
+
+
 def _build_distributed_device_map(
     *,
     num_layers: int,
@@ -401,6 +433,80 @@ def _load_model_for_collection(
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs).to(args.device)
     print(f"[collect] loaded model on device={args.device}", flush=True)
+    return model
+
+
+def _load_qwen_fp8_runtime(
+    model_path: str,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    *,
+    stop_layer: int,
+):
+    """Load compressed-tensors FP8 Qwen models without the HF quantizer path."""
+    workspace = os.environ.setdefault(
+        "FLASHINFER_WORKSPACE_BASE",
+        str(PROJECT_ROOT / "outputs" / "flashinfer"),
+    )
+    Path(workspace).mkdir(parents=True, exist_ok=True)
+
+    try:
+        from model_hub.qwen_fp8 import QwenFp8Model
+    except Exception as exc:
+        raise RuntimeError(
+            "QwenFp8Model collection requires the AdaptiveIMI runtime dependencies "
+            "(flashinfer and vLLM FP8 support)."
+        ) from exc
+
+    class CollectionQwenFp8Model(QwenFp8Model):
+        def init_model(self):
+            self.weight_loading = "compressed_tensors_fp8"
+            stop = max(0, min(int(stop_layer), int(self.num_layers) - 1))
+            if str(args.device).strip().lower() == "auto":
+                visible_gpus = int(torch.cuda.device_count())
+                if visible_gpus <= 0:
+                    raise RuntimeError("--device auto requires at least one CUDA device")
+                devices = [f"cuda:{idx}" for idx in range(visible_gpus)]
+            elif str(args.device).strip().lower().startswith("cuda"):
+                devices = [str(args.device)]
+            else:
+                raise ValueError(
+                    "QwenFp8Model collection requires a CUDA device; "
+                    f"got --device {args.device!r}"
+                )
+
+            used_gpus = min(len(devices), stop + 1)
+            devices = devices[:used_gpus]
+            layers_per_gpu = max(1, math.ceil((stop + 1) / used_gpus))
+            self.device_list = list(devices)
+            self.num_gpus = len(devices)
+            self.layer_mapping = {}
+            for layer_idx in range(self.num_layers):
+                if layer_idx <= stop:
+                    device_idx = min(layer_idx // layers_per_gpu, used_gpus - 1)
+                    self.layer_mapping[str(layer_idx)] = devices[device_idx]
+                else:
+                    # Later layers are not executed for this layerwise
+                    # collection pass and remain CPU-resident.
+                    self.layer_mapping[str(layer_idx)] = "cpu"
+            root_device = devices[0]
+            self._init_model_from_safetensors(root_device)
+
+    model = CollectionQwenFp8Model(
+        model_name=str(model_path),
+        max_length=int(args.max_length),
+        dtype=dtype,
+        device_map=str(args.device),
+        model_path=str(model_path),
+        parallel_mode="auto",
+        gpu_memory_utilization=0.90,
+    )
+    print(
+        "[collect] loaded QwenFp8Model runtime "
+        f"devices={getattr(model, 'device_list', None)} "
+        f"layers={getattr(model, 'layer_mapping', None)}",
+        flush=True,
+    )
     return model
 
 
@@ -479,6 +585,248 @@ def _forward_last_logits(model, **kwargs):
     )
 
 
+class _CollectionOnlyCache:
+    """Minimal cache state required by the existing chunked prefill path."""
+
+    def __init__(self, valid_starts: Sequence[int]) -> None:
+        self.valid_start_list = [int(value) for value in valid_starts]
+        self.context = 0
+        self.prefill_kv_workspace_available = None
+
+    def prefill_submit_kv_chunk(self, *args, **kwargs) -> None:
+        return None
+
+    def prefill_update_kv_cache(self, *args, **kwargs) -> None:
+        return None
+
+    def sync(self, *args, **kwargs) -> None:
+        return None
+
+
+def _collect_qwen_fp8_runtime(
+    model,
+    tokenizer,
+    args: argparse.Namespace,
+    collector: RopeKeyCollector,
+) -> tuple[int, str]:
+    """Collect keys through QwenFp8Model's existing chunked prefill."""
+    if int(args.collect_batch_size) != 1:
+        raise ValueError(
+            "QwenFp8Model collection currently requires --collect-batch-size 1; "
+            "use the default COLLECT_BATCH_SIZE=1."
+        )
+    root_device = str(model.layers[0].device)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(torch.device(root_device))
+    original_prefill_chunk_size = int(model.prefill_chunk_size)
+    original_prefill_attn_chunk_size = int(model.prefill_attn_chunk_size)
+    had_prefill_bsz = hasattr(model, "prefill_bsz")
+    original_prefill_bsz = getattr(model, "prefill_bsz", None)
+    chunk_size = int(args.mlp_chunk_size)
+    if chunk_size <= 0:
+        chunk_size = 8192
+    model.prefill_chunk_size = chunk_size
+    model.prefill_attn_chunk_size = chunk_size
+    model.prefill_bsz = 1
+    prompt_count = 0
+    stop_layer = max(collector.layer_ids)
+
+    original_num_layers = int(model.num_layers)
+    original_layers = model.layers
+    original_apply_rope = model.apply_rotary_pos_emb
+    original_layer_prefill_chunked = model.layer_prefill_chunked
+    original_layer_mapping = model.layer_mapping
+    had_attention_type = hasattr(model, "attention_type")
+    original_attention_type = getattr(model, "attention_type", None)
+    had_collector_active_layer = hasattr(model, "_collector_active_layer")
+    original_collector_active_layer = getattr(model, "_collector_active_layer", None)
+    had_collector = hasattr(model, "_collector")
+    original_collector = getattr(model, "_collector", None)
+    had_collector_sequence_total = hasattr(model, "_collector_sequence_total")
+    original_collector_sequence_total = getattr(model, "_collector_sequence_total", None)
+    had_kv_cache = hasattr(model, "kv_cache")
+    original_kv_cache = getattr(model, "kv_cache", None)
+    original_prefill_workspace = model._prefill_prefix_kv_workspace
+
+    model.num_layers = stop_layer + 1
+    model.layers = model.layers[: stop_layer + 1]
+    model.layer_mapping = {
+        str(layer_idx): original_layer_mapping[str(layer_idx)]
+        for layer_idx in range(stop_layer + 1)
+    }
+    model._prefill_prefix_kv_workspace = {}
+    # The runtime's prefill path only uses this for the optional debug branch,
+    # but setting it makes the collector independent of that environment flag.
+    model.attention_type = "Full_Flash_Attn"
+
+    def wrapped_apply_rope(query_states, key_states, position_ids):
+        query_embed, key_embed = original_apply_rope(
+            query_states,
+            key_states,
+            position_ids,
+        )
+        active_layer = getattr(model, "_collector_active_layer", None)
+        if active_layer is not None and active_layer in collector.layer_ids:
+            if position_ids.dim() != 2 or int(position_ids.size(0)) != 1:
+                raise RuntimeError(
+                    "QwenFp8Model key collection currently requires batch size 1"
+                )
+            sequence_start = int(position_ids[0, 0].item()) if position_ids.numel() else 0
+            bsz, seq_len, _ = key_embed.shape
+            key_for_collection = key_embed.view(
+                bsz,
+                seq_len,
+                model.num_key_value_heads,
+                model.head_dim,
+            ).transpose(1, 2).contiguous()
+            collector.add(
+                int(active_layer),
+                key_for_collection,
+                sequence_start=sequence_start,
+                sequence_total=int(model._collector_sequence_total),
+            )
+        return query_embed, key_embed
+
+    def wrapped_layer_prefill_chunked(
+        layer_idx,
+        start_bdx,
+        hidden_cpu,
+        output_cpu,
+        seq_len,
+        chunk_size_arg,
+    ):
+        model._collector_active_layer = int(layer_idx)
+        try:
+            return original_layer_prefill_chunked(
+                layer_idx,
+                start_bdx,
+                hidden_cpu,
+                output_cpu,
+                seq_len,
+                chunk_size_arg,
+            )
+        finally:
+            model._collector_active_layer = None
+
+    model.apply_rotary_pos_emb = wrapped_apply_rope
+    model.layer_prefill_chunked = wrapped_layer_prefill_chunked
+
+    try:
+        records = _progress(
+            _iter_prompt_records(args),
+            total=int(args.limit) if int(args.limit) > 0 else None,
+            desc="collect keys",
+            enabled=bool(args.progress),
+        )
+        for item in records:
+            prompt = _build_collection_prompt(item, args)
+            encoded = tokenizer(
+                [prompt],
+                return_tensors="pt",
+                truncation=True,
+                max_length=args.max_length,
+                padding=False,
+            )
+            input_ids = encoded["input_ids"].to(root_device)
+            attention_mask = encoded.get("attention_mask")
+            valid_starts = None
+            if attention_mask is not None:
+                valid_starts = (
+                    attention_mask.shape[1] - torch.sum(attention_mask, dim=-1).detach().cpu()
+                ).tolist()
+            collector.set_valid_starts(valid_starts)
+
+            model._collector = collector
+            model._collector_sequence_total = int(input_ids.size(1))
+            model.kv_cache = _CollectionOnlyCache(valid_starts or [0])
+            model._prefill_prefix_kv_workspace.clear()
+            try:
+                model.prefill_forward_chunked(input_ids)
+            finally:
+                model.kv_cache = None
+                model._collector = None
+                model._collector_sequence_total = 0
+                model._prefill_prefix_kv_workspace.clear()
+
+            prompt_count += 1
+            print(
+                f"[collect] prompts={prompt_count} batch=1 tokens={int(input_ids.size(1))}",
+                flush=True,
+            )
+    finally:
+        collector.set_valid_starts(None)
+        model.apply_rotary_pos_emb = original_apply_rope
+        model.layer_prefill_chunked = original_layer_prefill_chunked
+        model.layers = original_layers
+        model.num_layers = original_num_layers
+        model.layer_mapping = original_layer_mapping
+        model.prefill_chunk_size = original_prefill_chunk_size
+        model.prefill_attn_chunk_size = original_prefill_attn_chunk_size
+        if had_prefill_bsz:
+            model.prefill_bsz = original_prefill_bsz
+        else:
+            try:
+                delattr(model, "prefill_bsz")
+            except AttributeError:
+                pass
+        if had_collector_active_layer:
+            model._collector_active_layer = original_collector_active_layer
+        else:
+            try:
+                delattr(model, "_collector_active_layer")
+            except AttributeError:
+                pass
+        if had_attention_type:
+            model.attention_type = original_attention_type
+        else:
+            try:
+                delattr(model, "attention_type")
+            except AttributeError:
+                pass
+        if had_collector:
+            model._collector = original_collector
+        else:
+            try:
+                delattr(model, "_collector")
+            except AttributeError:
+                pass
+        if had_collector_sequence_total:
+            model._collector_sequence_total = original_collector_sequence_total
+        else:
+            try:
+                delattr(model, "_collector_sequence_total")
+            except AttributeError:
+                pass
+        if had_kv_cache:
+            model.kv_cache = original_kv_cache
+        else:
+            try:
+                delattr(model, "kv_cache")
+            except AttributeError:
+                pass
+        model._prefill_prefix_kv_workspace = original_prefill_workspace
+    return prompt_count, root_device
+
+
+def _runtime_device_metadata(model) -> Dict[str, Any]:
+    layer_mapping = getattr(model, "layer_mapping", None)
+    if not layer_mapping:
+        return {}
+    device_to_layers: Dict[str, List[int]] = {}
+    for layer, device in layer_mapping.items():
+        device_to_layers.setdefault(str(device), []).append(int(layer))
+    return {
+        "runtime_device_to_layers": {
+            device: sorted(layers)
+            for device, layers in device_to_layers.items()
+        },
+        "runtime_layer_to_device": {
+            str(layer): str(device)
+            for layer, device in layer_mapping.items()
+        },
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect online-prompt RoPE-applied keys for AdaptiveIMI partition training."
@@ -500,7 +848,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-start", type=int, default=0)
     parser.add_argument("--static-end", type=int, default=0)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
-    parser.add_argument("--device", type=str, default="cuda:0", help="Use cuda:x for single-GPU loading, or auto for HF multi-GPU device_map.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="Use cuda:x for single-GPU loading, or auto for multi-GPU placement.",
+    )
     parser.add_argument("--attn-implementation", type=str, default="", help="Optional HF attention backend, e.g. flash_attention_2 or sdpa.")
     parser.add_argument("--mlp-chunk-size", type=int, default=0, help="Chunk MLP along sequence dimension to reduce 128k prefill peak memory.")
     parser.add_argument("--out", type=Path, required=True)
@@ -532,24 +885,6 @@ def main() -> None:
     num_layers = int(hf_config.num_hidden_layers)
     layer_ids = _parse_layers(args.layers, num_layers)
     stop_layer = max(layer_ids)
-    model = _load_model_for_collection(
-        model_path,
-        args,
-        dtype,
-        hf_config,
-        num_layers=num_layers,
-        stop_layer=stop_layer,
-    )
-    model.eval()
-    if str(args.device).strip().lower() == "auto":
-        original_layers = _limit_model_to_layers(model, stop_layer)
-        if original_layers is not None:
-            print(f"[collect] limiting forward to layers 0..{stop_layer}", flush=True)
-    else:
-        original_layers = None
-    input_device = _model_input_device(model, str(args.device))
-    print(f"[collect] input_device={input_device}", flush=True)
-    restore_mlp_chunking = _patch_mlp_chunking(model, int(args.mlp_chunk_size))
     collector = RopeKeyCollector(
         layer_ids=layer_ids,
         static_start=args.static_start,
@@ -559,83 +894,127 @@ def main() -> None:
         sample_seed=args.sample_seed,
     )
 
-    llama_modeling = _resolve_modeling_module(model_path, args.model)
+    native_qwen_fp8 = (
+        str(getattr(hf_config, "model_type", "")).lower() == "qwen2"
+        and _is_fp8_compressed_config(hf_config)
+    )
+    runtime_metadata: Dict[str, Any] = {}
 
-    original_apply_rope = llama_modeling.apply_rotary_pos_emb
-    original_forwards = []
-
-    def wrapped_apply_rotary_pos_emb(*rope_args, **rope_kwargs):
-        q_embed, k_embed = original_apply_rope(*rope_args, **rope_kwargs)
-        if collector.active_layer is not None:
-            collector.add(collector.active_layer, k_embed)
-        return q_embed, k_embed
-
-    llama_modeling.apply_rotary_pos_emb = wrapped_apply_rotary_pos_emb
-
-    for layer_idx, layer in enumerate(model.model.layers):
-        original_forward = layer.self_attn.forward
-        original_forwards.append((layer.self_attn, original_forward))
-
-        def make_forward(fn, idx):
-            def wrapped_forward(*forward_args, **forward_kwargs):
-                collector.active_layer = idx
-                try:
-                    return fn(*forward_args, **forward_kwargs)
-                finally:
-                    collector.active_layer = None
-
-            return wrapped_forward
-
-        layer.self_attn.forward = make_forward(original_forward, layer_idx)
-
-    prompt_count = 0
-    try:
+    if native_qwen_fp8:
+        model = _load_qwen_fp8_runtime(
+            model_path,
+            args,
+            dtype,
+            stop_layer=stop_layer,
+        )
+        collection_backend = "qwen_fp8_runtime"
+        input_device = torch.device(str(model.layers[0].device))
         with torch.inference_mode():
-            prompt_total = int(args.limit) if int(args.limit) > 0 else None
-            records = _progress(
-                _iter_prompt_records(args),
-                total=prompt_total,
-                desc="collect keys",
-                enabled=bool(args.progress),
+            prompt_count, input_device_name = _collect_qwen_fp8_runtime(
+                model,
+                tokenizer,
+                args,
+                collector,
             )
-            for batch in _batched(records, max(int(args.collect_batch_size), 1)):
-                prompts = [_build_collection_prompt(item, args) for item in batch]
-                encoded = tokenizer(
-                    prompts,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=args.max_length,
-                    padding=len(prompts) > 1,
+        input_device = torch.device(input_device_name)
+        runtime_metadata = _runtime_device_metadata(model)
+    else:
+        model = _load_model_for_collection(
+            model_path,
+            args,
+            dtype,
+            hf_config,
+            num_layers=num_layers,
+            stop_layer=stop_layer,
+        )
+        model.eval()
+        if str(args.device).strip().lower() == "auto":
+            original_layers = _limit_model_to_layers(model, stop_layer)
+            if original_layers is not None:
+                print(f"[collect] limiting forward to layers 0..{stop_layer}", flush=True)
+        else:
+            original_layers = None
+        input_device = _model_input_device(model, str(args.device))
+        print(f"[collect] input_device={input_device}", flush=True)
+        restore_mlp_chunking = _patch_mlp_chunking(model, int(args.mlp_chunk_size))
+
+        llama_modeling = _resolve_modeling_module(model_path, args.model)
+        original_apply_rope = llama_modeling.apply_rotary_pos_emb
+        original_forwards = []
+
+        def wrapped_apply_rotary_pos_emb(*rope_args, **rope_kwargs):
+            q_embed, k_embed = original_apply_rope(*rope_args, **rope_kwargs)
+            if collector.active_layer is not None:
+                collector.add(collector.active_layer, k_embed)
+            return q_embed, k_embed
+
+        llama_modeling.apply_rotary_pos_emb = wrapped_apply_rotary_pos_emb
+
+        for layer_idx, layer in enumerate(model.model.layers):
+            original_forward = layer.self_attn.forward
+            original_forwards.append((layer.self_attn, original_forward))
+
+            def make_forward(fn, idx):
+                def wrapped_forward(*forward_args, **forward_kwargs):
+                    collector.active_layer = idx
+                    try:
+                        return fn(*forward_args, **forward_kwargs)
+                    finally:
+                        collector.active_layer = None
+
+                return wrapped_forward
+
+            layer.self_attn.forward = make_forward(original_forward, layer_idx)
+
+        prompt_count = 0
+        try:
+            with torch.inference_mode():
+                prompt_total = int(args.limit) if int(args.limit) > 0 else None
+                records = _progress(
+                    _iter_prompt_records(args),
+                    total=prompt_total,
+                    desc="collect keys",
+                    enabled=bool(args.progress),
                 )
-                input_ids = encoded["input_ids"].to(input_device)
-                attention_mask = encoded.get("attention_mask")
-                valid_starts = None
-                if attention_mask is not None:
-                    valid_starts = (
-                        attention_mask.shape[1] - torch.sum(attention_mask, dim=-1).detach().cpu()
-                    ).tolist()
-                    attention_mask = attention_mask.to(input_device)
-                collector.set_valid_starts(valid_starts)
-                _forward_last_logits(
-                    model,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                )
-                prompt_count += len(prompts)
-                print(
-                    f"[collect] prompts={prompt_count - len(prompts) + 1}-{prompt_count} "
-                    f"batch={len(prompts)} tokens={int(input_ids.size(1))}",
-                    flush=True,
-                )
-    finally:
-        collector.set_valid_starts(None)
-        restore_mlp_chunking()
-        if original_layers is not None:
-            model.model.layers = original_layers
-        llama_modeling.apply_rotary_pos_emb = original_apply_rope
-        for attention, original_forward in original_forwards:
-            attention.forward = original_forward
+                for batch in _batched(records, max(int(args.collect_batch_size), 1)):
+                    prompts = [_build_collection_prompt(item, args) for item in batch]
+                    encoded = tokenizer(
+                        prompts,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=args.max_length,
+                        padding=len(prompts) > 1,
+                    )
+                    input_ids = encoded["input_ids"].to(input_device)
+                    attention_mask = encoded.get("attention_mask")
+                    valid_starts = None
+                    if attention_mask is not None:
+                        valid_starts = (
+                            attention_mask.shape[1] - torch.sum(attention_mask, dim=-1).detach().cpu()
+                        ).tolist()
+                        attention_mask = attention_mask.to(input_device)
+                    collector.set_valid_starts(valid_starts)
+                    _forward_last_logits(
+                        model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
+                    prompt_count += len(prompts)
+                    print(
+                        f"[collect] prompts={prompt_count - len(prompts) + 1}-{prompt_count} "
+                        f"batch={len(prompts)} tokens={int(input_ids.size(1))}",
+                        flush=True,
+                    )
+        finally:
+            collector.set_valid_starts(None)
+            restore_mlp_chunking()
+            if original_layers is not None:
+                model.model.layers = original_layers
+            llama_modeling.apply_rotary_pos_emb = original_apply_rope
+            for attention, original_forward in original_forwards:
+                attention.forward = original_forward
+        collection_backend = "transformers"
 
     keys = collector.to_lhtd()
     profiling = profiler.stop()
@@ -644,6 +1023,7 @@ def main() -> None:
         "metadata": {
             "model": args.model,
             "model_path": model_path,
+            "collection_backend": collection_backend,
             "layout": "lhtd",
             "layers": layer_ids,
             "prompt_count": prompt_count,
@@ -659,6 +1039,7 @@ def main() -> None:
             "device_arg": str(args.device),
             "input_device": str(input_device),
             "hf_device_map": getattr(model, "hf_device_map", None),
+            **runtime_metadata,
             "tokenizer_padding_side": str(getattr(tokenizer, "padding_side", "")),
             "tokenizer_pad_token_id": None if tokenizer.pad_token_id is None else int(tokenizer.pad_token_id),
             "seen_tokens": {str(layer): int(collector.seen_tokens.get(layer, 0)) for layer in layer_ids},

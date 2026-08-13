@@ -30,7 +30,7 @@ LONG_BENCH_TASKS = [
     "narrativeqa",
     "qasper",
     "multifieldqa_en",
-    "multifieldqa_zh",
+    # "multifieldqa_zh",
     "hotpotqa",
     "2wikimqa",
     "musique",
@@ -97,11 +97,23 @@ def parse_args(args=None):
     parser.add_argument("--token_rerank_budget_ratio", type=float, default=None)
     parser.add_argument("--prefill_bsz", type=int, default=1)
     parser.add_argument(
+        "--prefill_chunk_size",
+        "--prefill-chunk-size",
+        type=int,
+        default=None,
+        help="Sequence chunk size for long-context prefill.",
+    )
+    parser.add_argument(
         "--chat_template_mode",
         type=str,
         default="longbench",
         choices=["longbench", "always", "never"],
         help="LongBench applies chat formatting only for chat models and skips few-shot/code tasks.",
+    )
+    parser.add_argument(
+        "--enable_thinking",
+        action="store_true",
+        help="Allow DeepSeek-R1-Distill models to generate a reasoning block.",
     )
     parser.add_argument("--disable_resume", action="store_true", help="Regenerate predictions even if output jsonl exists.")
     return parser.parse_args(args)
@@ -205,7 +217,10 @@ LONG_BENCH_NO_CHAT_TASKS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobe
 
 def is_chat_model(model_name, model_path):
     text = f"{model_name} {model_path}".lower()
-    return any(key in text for key in ("chat", "instruct", "longchat", "vicuna"))
+    return any(
+        key in text
+        for key in ("chat", "instruct", "longchat", "vicuna", "deepseek-r1-distill")
+    )
 
 
 def should_apply_chat_template(args, dataset):
@@ -224,6 +239,27 @@ def apply_chat_template(tokenizer, prompt):
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
         return prompt
+
+
+def is_deepseek_r1_distill(model_name, model_path):
+    text = f"{model_name} {model_path}".lower()
+    return "deepseek-r1-distill" in text
+
+
+def prepare_prompt(tokenizer, prompt, dataset, args):
+    use_chat_template = should_apply_chat_template(args, dataset)
+    if is_deepseek_r1_distill(args.config_model_name or args.model, args.model_path or ""):
+        use_chat_template = True
+
+    if use_chat_template:
+        prompt = apply_chat_template(tokenizer, prompt)
+
+    if (
+        is_deepseek_r1_distill(args.config_model_name or args.model, args.model_path or "")
+        and not args.enable_thinking
+    ):
+        prompt += "<think>\n</think>\n\n"
+    return prompt
 
 
 def build_decode_search_config(args):
@@ -256,8 +292,7 @@ def get_pred(llm, data, max_new_tokens, prompt_format, dataset, config_model_nam
     with out_path.open("a", encoding="utf-8") as fout:
         for json_obj in tqdm(data[start_idx:]):
             prompt = prompt_format.format(**json_obj)
-            if should_apply_chat_template(args, dataset):
-                prompt = apply_chat_template(llm.tokenizer, prompt)
+            prompt = prepare_prompt(llm.tokenizer, prompt, dataset, args)
 
             inputs = llm.tokenizer([prompt], return_tensors="pt", padding=True)
             input_ids = inputs.input_ids
@@ -278,6 +313,7 @@ def get_pred(llm, data, max_new_tokens, prompt_format, dataset, config_model_nam
                 imi_engine=args.imi_engine,
                 partition_path=args.partition_path,
                 decode_search=build_decode_search_config(args),
+                prefill_chunk_size=args.prefill_chunk_size,
             )
 
             out = llm.generate(
@@ -329,6 +365,7 @@ if __name__ == "__main__":
         weight_loading=args.weight_loading,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
+    llm.tokenizer.model_max_length = max_length
     datasets = resolve_tasks(args.task, args.e)
 
     pred_root = Path(args.output_dir) / ("pred_e" if args.e else "pred") / model_name / args.attn_type

@@ -54,12 +54,15 @@ ROOT_DIR="${ROOT_DIR:-${PROJECT_ROOT}/longbench_eval_result}"
 DATA_DIR="${LONG_BENCH_DATA_DIR:-/home/yjy/LongBench/data}"
 NUM_SAMPLES="${NUM_SAMPLES:--1}"
 DEVICE="${DEVICE:-cuda:0}"
+PARALLEL_MODE="${PARALLEL_MODE:-layer}"
+PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-4096}"
 SUBSPACE_PARTS="${SUBSPACE_PARTS:-8}"
 IMI_ENGINE="${IMI_ENGINE:-hybrid_8way_v2}"
 PARTITION_PATH="${PARTITION_PATH:-}"
 DECODE_SEARCH_MODE="${DECODE_SEARCH_MODE:-flat}"
 GPU_ONLY="${GPU_ONLY:-1}"
 CHAT_TEMPLATE_MODE="${CHAT_TEMPLATE_MODE:-longbench}"
+ENABLE_THINKING="${ENABLE_THINKING:-0}"
 LONG_BENCH_E="${LONG_BENCH_E:-0}"
 
 if [[ "${GPU_ONLY}" == "1" || "${GPU_ONLY,,}" == "true" || "${GPU_ONLY,,}" == "yes" || "${GPU_ONLY,,}" == "on" ]]; then
@@ -88,6 +91,9 @@ MAX_LEN_ARGS=()
 if [[ -n "${CONTEXT_LENGTH_ARG}" ]]; then
     MAX_LEN_ARGS+=(--max_len "${CONTEXT_LENGTH_ARG}")
 fi
+if [[ -n "${PREFILL_CHUNK_SIZE}" ]]; then
+    MAX_LEN_ARGS+=(--prefill_chunk_size "${PREFILL_CHUNK_SIZE}")
+fi
 
 EXTRA_ARGS=()
 if [[ -n "${IMI_ENGINE}" ]]; then
@@ -114,6 +120,9 @@ fi
 if [[ "${LONG_BENCH_RESUME:-1}" != "1" ]]; then
     EXTRA_ARGS+=(--disable_resume)
 fi
+if [[ "${ENABLE_THINKING}" == "1" || "${ENABLE_THINKING,,}" == "true" || "${ENABLE_THINKING,,}" == "yes" || "${ENABLE_THINKING,,}" == "on" ]]; then
+    EXTRA_ARGS+=(--enable_thinking)
+fi
 
 EVAL_EXTRA_ARGS=()
 if [[ "${LONG_BENCH_E}" == "1" || "${LONG_BENCH_E,,}" == "true" || "${LONG_BENCH_E,,}" == "yes" || "${LONG_BENCH_E,,}" == "on" ]]; then
@@ -132,6 +141,7 @@ python -u pred.py \
     --attn_type "${ATTN_TYPE_ARG}" \
     --dtype "${DTYPE_ARG}" \
     --device "${DEVICE}" \
+    --parallel_mode "${PARALLEL_MODE}" \
     --retrieval_budget "${BUDGET_RATIO_ARG}" \
     --subspace_parts "${SUBSPACE_PARTS}" \
     --chat_template_mode "${CHAT_TEMPLATE_MODE}" \

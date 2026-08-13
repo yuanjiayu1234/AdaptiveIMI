@@ -91,6 +91,12 @@ class flash_attn_cache_offload(KV_Cache):
     def prefill_update_kv_cache(self, query_states, key_states, value_states, layer_idx, start_bdx):
         bsz, seq_len, _, _ = key_states.shape
 
+        if self.batch_size != 1:
+            raise NotImplementedError(
+                "Full_Flash_Attn_Offload currently requires batch_size=1 because "
+                "decode uses one shared KV cache length."
+            )
+
         if self.valid_length is None:
             # bsz is typically 1 in RULER; store CPU int32 tensor for simplicity.
             self.valid_length = torch.from_numpy(seq_len - self.valid_start_list).to(torch.int32)
@@ -141,6 +147,10 @@ class flash_attn_cache_offload(KV_Cache):
 
     def load_kv_to_gpu(self, layer_idx, desired_len, device=None):
         """Load KV cache for a layer to the specified GPU device."""
+        if desired_len <= 0 or desired_len > self.max_length:
+            raise ValueError(
+                f"Offload KV length must be in [1, {self.max_length}], got {desired_len}"
+            )
         if device is None:
             device = self.layer_mapping[str(layer_idx)]
 
@@ -169,3 +179,19 @@ class flash_attn_cache_offload(KV_Cache):
             torch.cuda.synchronize(device)
 
         return buf_k[:, :desired_len], buf_v[:, :desired_len]
+
+    def cleanup(self):
+        for dev in self.device_list:
+            try:
+                torch.cuda.synchronize(dev)
+            except RuntimeError:
+                pass
+        self.key_cache = []
+        self.value_cache = []
+        self.gpu_key_buffer.clear()
+        self.gpu_value_buffer.clear()
+        self.gpu_buffer_capacity.clear()
+        self.copystream.clear()
+        self.copyevent.clear()
+        self.kv_ready_event.clear()
+        self.valid_length = None

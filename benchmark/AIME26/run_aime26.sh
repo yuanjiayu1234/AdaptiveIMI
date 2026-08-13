@@ -21,12 +21,21 @@ SEED="${SEED:-2026}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
 CONFIG_MODEL_NAME="${CONFIG_MODEL_NAME:-Qwen3-8B}"
+BOXED_ANSWER_STOP_INTERVAL="${BOXED_ANSWER_STOP_INTERVAL:-8}"
 OUT_PATH="${OUT_PATH:-$SCRIPT_DIR/results/${ATTN_TYPE,,}_pass@${PASS_K}.jsonl}"
 
 if [[ "$PASS_K" -le 0 ]]; then
   echo "PASS_K must be positive" >&2
   exit 2
 fi
+
+case "$ATTN_TYPE" in
+  Full_Flash_Attn|Full_Flash_Attn_Offload|AdaptiveIMI) ;;
+  *)
+    echo "Unsupported ATTN_TYPE: $ATTN_TYPE" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$PASS_K" -gt 1 && "$TEMPERATURE" == "0.0" ]]; then
   echo "Warning: pass@${PASS_K} with temperature=0.0 repeats greedy decoding." >&2
@@ -50,6 +59,7 @@ python -u benchmark/AIME26/aime26_inference.py \
   --temperature "$TEMPERATURE" \
   --top_p "$TOP_P" \
   --top_k "$TOP_K" \
+  --boxed_answer_stop_interval "$BOXED_ANSWER_STOP_INTERVAL" \
   --n_generate "$PASS_K" \
   --pass_k "$PASS_K" \
   --dtype "$DTYPE" \
@@ -59,4 +69,5 @@ python -u benchmark/AIME26/aime26_inference.py \
 
 python -u benchmark/AIME26/evaluate_aime26.py \
   "$OUT_PATH" \
-  --pass_k "$PASS_K"
+  --pass_k "$PASS_K" \
+  --complete_only
