@@ -97,6 +97,14 @@ class AdaptiveIMIRuntimeMixin:
         self.nprobe = min(self.nprobe, self.n_centroids - 1)
         requested_retrieval_tokens = max(int(self.retrieval_budget * self.list_capacity), 1)
         self.max_retrieval_tokens = requested_retrieval_tokens
+        if self.async_update_enabled and self.async_update_pages:
+            # Never take tokens away from the already validated prompt path.
+            # The configured budget is a floor; generated leaves receive a
+            # reserve in addition to the prompt retrieval allowance.
+            self.async_update_total_budget = max(
+                int(self.async_update_total_budget),
+                int(self.max_retrieval_tokens) + int(self.async_update_generated_reserve),
+            )
         self.budget_tokens = self.max_retrieval_tokens
         self.max_retrieval_pages = self._tokens_to_pages(self.max_retrieval_tokens)
 
@@ -118,11 +126,18 @@ class AdaptiveIMIRuntimeMixin:
         self.buffer_size = self._resolve_budget_pages(requested_buffer_pages)
         self.buffer_budget_pages = self.buffer_size
 
-        delta_execution_tokens = (
-            (int(self.async_update_delta_nprobe) + int(self.async_update_spill_slots)) * int(self.async_update_interval)
-            if self.async_update_enabled
-            else 0
-        )
+        if self.async_update_enabled:
+            if self.async_update_pages:
+                overflow_budget = max(int(self.async_update_total_budget) - int(self.max_retrieval_tokens), 0)
+                delta_execution_tokens = overflow_budget + (
+                    int(self.async_update_spill_slots) * int(self.async_update_interval)
+                )
+            else:
+                delta_execution_tokens = (
+                    int(self.async_update_delta_nprobe) + int(self.async_update_spill_slots)
+                ) * int(self.async_update_interval)
+        else:
+            delta_execution_tokens = 0
         self.execution_stride = self.buffer_size * self.page_size + self.static_capacity + delta_execution_tokens
         self.retrieval_execution_stride = self.buffer_size * self.page_size
 
@@ -146,15 +161,60 @@ class AdaptiveIMIRuntimeMixin:
             for ldx in range(self.layer_num):
                 device = self.layer_mapping[str(ldx)]
                 self.generated_spill_keys[ldx] = torch.empty(
-                    (self.batch_groups, self.async_update_spill_slots, self.async_update_interval, self.head_dim),
+                    (self.async_update_spill_slots, self.batch_groups, self.async_update_interval, self.head_dim),
                     dtype=self.dtype,
                     device=device,
                 ).contiguous()
                 self.generated_spill_values[ldx] = torch.empty(
-                    (self.batch_groups, self.async_update_spill_slots, self.async_update_interval, self.head_dim),
+                    (self.async_update_spill_slots, self.batch_groups, self.async_update_interval, self.head_dim),
                     dtype=self.dtype,
                     device=device,
                 ).contiguous()
+                if self.async_update_pages:
+                    # One open page per active base centroid is sufficient in
+                    # addition to ceil(history/page_tokens) completed pages.
+                    # The entire pool is allocated once; decode never grows or
+                    # reallocates it.
+                    history_tokens = max(int(self.async_update_page_capacity_tokens), 1)
+                    page_tokens = int(self.async_update_page_tokens)
+                    total_pages = (history_tokens + page_tokens - 1) // page_tokens + int(self.n_centroids)
+                    self.generated_page_total_pages = total_pages
+                    spill_shape = (self.async_update_spill_slots, self.batch_groups, self.async_update_interval)
+                    spill_kv_shape = spill_shape + (self.head_dim,)
+                    page_shape = (self.batch_groups, total_pages, page_tokens, self.head_dim)
+                    cluster_shape = (self.batch_groups, self.n_centroids)
+                    page_meta_shape = (self.batch_groups, total_pages)
+                    self.generated_page_staging_keys[ldx] = torch.empty(spill_kv_shape, dtype=self.dtype, pin_memory=True)
+                    self.generated_page_staging_values[ldx] = torch.empty(spill_kv_shape, dtype=self.dtype, pin_memory=True)
+                    self.generated_page_staging_assignments[ldx] = torch.empty(spill_shape, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_assignments_gpu[ldx] = torch.empty(spill_shape, dtype=torch.int32, device=device)
+                    self.generated_page_keys_cpu[ldx] = torch.empty(page_shape, dtype=self.dtype, pin_memory=True)
+                    self.generated_page_values_cpu[ldx] = torch.empty(page_shape, dtype=self.dtype, pin_memory=True)
+                    self.generated_page_cluster_heads_cpu[ldx] = torch.full(cluster_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_cluster_tails_cpu[ldx] = torch.full(cluster_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_prev_cpu[ldx] = torch.full(page_meta_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_sizes_cpu[ldx] = torch.zeros(page_meta_shape, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_next_cpu[ldx] = torch.zeros((self.batch_groups,), dtype=torch.int32, pin_memory=True)
+                    self.generated_page_cluster_tails_gpu[ldx] = torch.full(cluster_shape, -1, dtype=torch.int32, device=device)
+                    self.generated_page_prev_gpu[ldx] = torch.full(page_meta_shape, -1, dtype=torch.int32, device=device)
+                    self.generated_page_sizes_gpu[ldx] = torch.zeros(page_meta_shape, dtype=torch.int32, device=device)
+                    self.generated_cluster_counts_gpu[ldx] = torch.zeros(cluster_shape, dtype=torch.int32, device=device)
+                    commit_shape = spill_shape
+                    self.generated_page_commit_cluster_ids_cpu[ldx] = torch.full(commit_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_commit_cluster_heads_cpu[ldx] = torch.full(commit_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_commit_cluster_tails_cpu[ldx] = torch.full(commit_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_commit_page_ids_cpu[ldx] = torch.full(commit_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_commit_page_prev_cpu[ldx] = torch.full(commit_shape, -1, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_commit_page_sizes_cpu[ldx] = torch.zeros(commit_shape, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_commit_cluster_sums_cpu[ldx] = torch.zeros(spill_kv_shape, dtype=torch.float32, pin_memory=True)
+                    self.generated_page_commit_cluster_counts_cpu[ldx] = torch.zeros(commit_shape, dtype=torch.int32, pin_memory=True)
+                    self.generated_page_commit_cluster_ids_gpu[ldx] = torch.empty(commit_shape, dtype=torch.int32, device=device)
+                    self.generated_page_commit_cluster_tails_gpu[ldx] = torch.empty(commit_shape, dtype=torch.int32, device=device)
+                    self.generated_page_commit_page_ids_gpu[ldx] = torch.empty(commit_shape, dtype=torch.int32, device=device)
+                    self.generated_page_commit_page_prev_gpu[ldx] = torch.empty(commit_shape, dtype=torch.int32, device=device)
+                    self.generated_page_commit_page_sizes_gpu[ldx] = torch.empty(commit_shape, dtype=torch.int32, device=device)
+                    self.generated_page_commit_cluster_sums_gpu[ldx] = torch.empty(spill_kv_shape, dtype=torch.float32, device=device)
+                    self.generated_page_commit_cluster_counts_gpu[ldx] = torch.empty(commit_shape, dtype=torch.int32, device=device)
 
         if profile_prepare:
             log_step("async_update")

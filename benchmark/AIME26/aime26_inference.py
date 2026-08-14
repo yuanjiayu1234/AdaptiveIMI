@@ -37,7 +37,6 @@ finally:
 
 from aime26_utils import (  # noqa: E402
     answers_equal,
-    extract_boxed_aime_answer,
     extract_integer_answer,
     latest_attempts_by_problem,
     load_aime26_data,
@@ -110,12 +109,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early_stop_on_first_correct", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--disable_thinking", action="store_true")
-    parser.add_argument(
-        "--boxed_answer_stop_interval",
-        type=int,
-        default=8,
-        help="Check generated text every N tokens and stop after a valid \\boxed{0..999}.",
-    )
     parser.add_argument("--disable_resume", action="store_true")
     return parser.parse_args()
 
@@ -210,8 +203,6 @@ def matches_experiment(row: dict[str, Any], args: argparse.Namespace) -> bool:
         "top_p": args.top_p,
         "top_k": args.top_k,
         "enable_thinking": not args.disable_thinking,
-        "boxed_answer_stop_interval": args.boxed_answer_stop_interval,
-        "boxed_answer_after_thinking": True,
     }
     return all(config.get(name) == value for name, value in expected.items())
 
@@ -230,8 +221,6 @@ def main() -> None:
         raise ValueError("--max_model_len must be larger than --max_new_tokens")
     if args.temperature < 0:
         raise ValueError("--temperature must be non-negative")
-    if args.boxed_answer_stop_interval <= 0:
-        raise ValueError("--boxed_answer_stop_interval must be positive")
     if args.attn_type == "AdaptiveIMI" and args.retrieval_budget is None:
         args.retrieval_budget = 0.1
     if args.attn_type == "AdaptiveIMI" and args.cache_ratio is None:
@@ -318,23 +307,6 @@ def main() -> None:
                 prefill_chunk_size=args.prefill_chunk_size,
             )
 
-            def stop_after_boxed_answer(generated_ids: torch.Tensor) -> str | None:
-                generated_text = tokenizer.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True,
-                )[0]
-                think_start = generated_text.find("<think>")
-                if think_start >= 0:
-                    think_end = generated_text.find("</think>", think_start)
-                    if think_end < 0:
-                        return None
-                    generated_text = generated_text[think_end + len("</think>") :]
-                return (
-                    "boxed_answer"
-                    if extract_boxed_aime_answer(generated_text) is not None
-                    else None
-                )
-
             attempt_rows: list[dict[str, Any]] = []
             for attempt_index in range(args.n_generate):
                 stored_attempt = existing_by_index.get(attempt_index + 1)
@@ -359,8 +331,6 @@ def main() -> None:
                         top_p=args.top_p,
                         top_k=args.top_k,
                         ignore_eos=False,
-                        text_stop_callback=stop_after_boxed_answer,
-                        text_stop_interval=args.boxed_answer_stop_interval,
                     )
                     response = tokenizer.batch_decode(
                         output_ids,
@@ -417,8 +387,6 @@ def main() -> None:
                         "top_p": args.top_p,
                         "top_k": args.top_k,
                         "enable_thinking": not args.disable_thinking,
-                        "boxed_answer_stop_interval": args.boxed_answer_stop_interval,
-                        "boxed_answer_after_thinking": True,
                     },
                     "completion_status": (
                         "error"

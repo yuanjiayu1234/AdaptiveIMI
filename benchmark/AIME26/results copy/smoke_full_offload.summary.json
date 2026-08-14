@@ -1,0 +1,12 @@
+{
+  "total_problems": 1,
+  "passed_problems": 1,
+  "pass_k": 1,
+  "pass_at_k": 1.0,
+  "pass_at_k_percent": 100.0,
+  "total_attempts": 1,
+  "correct_attempts": 1,
+  "mean_correct_attempts_per_problem": 1.0,
+  "prediction_path": "benchmark/AIME26/results/smoke_full_offload.jsonl",
+  "num_summary_rows": 1
+}

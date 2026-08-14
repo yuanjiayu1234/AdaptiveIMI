@@ -775,13 +775,21 @@ class AdaptiveIMIRetrievalMixin:
             )
         if profile:
             delta_start_event = self._record_timing_event()
-        self._append_generated_history_to_execution(
-            layer_idx,
-            device,
-            query_grouped,
-            execution_keys,
-            execution_values,
-        )
+        if self.async_update_enabled and self.async_update_pages:
+            self._append_generated_pages_to_execution(
+                layer_idx,
+                selected,
+                execution_keys,
+                execution_values,
+            )
+        else:
+            self._append_generated_history_to_execution(
+                layer_idx,
+                device,
+                query_grouped,
+                execution_keys,
+                execution_values,
+            )
         self._append_inflight_spills_to_execution(
             layer_idx,
             device,

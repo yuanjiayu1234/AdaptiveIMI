@@ -233,6 +233,28 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         self.async_update_delta_nprobe = max(int(async_cfg.get("delta_nprobe", 8)), 0)
         self.async_update_spill_slots = max(int(async_cfg.get("spill_slots", 4)), 1)
         self.async_update_cpu_block_chunks = max(int(async_cfg.get("cpu_block_chunks", 256)), 1)
+        self.async_update_mode = str(async_cfg.get("mode", "legacy_delta")).lower()
+        if self.async_update_mode == "unified_overflow":
+            raise ValueError(
+                "async_update.mode=unified_overflow was removed because its independent "
+                "overflow-leaf index can diverge from the prompt IMI. Use unified_pages."
+            )
+        # ``unified_pages`` is the generated-KV path: full-centroid assignment,
+        # immutable pinned CPU delta pages, and decode-stream publication.
+        self.async_update_pages = self.async_update_mode == "unified_pages"
+        self.async_update_page_tokens = self.async_update_interval
+        self.async_update_pages_per_probe = max(int(async_cfg.get("pages_per_probe", 8)), 1)
+        self.async_update_page_capacity_tokens = max(
+            int(async_cfg.get("page_capacity_tokens", max_new_length)),
+            self.async_update_interval,
+        )
+        self.async_update_total_budget = max(
+            int(async_cfg.get("total_token_budget", max(self.async_update_delta_nprobe * self.async_update_interval, 128))),
+            1,
+        )
+        self.async_update_generated_reserve = max(
+            int(async_cfg.get("generated_token_reserve", async_cfg.get("leaf_token_reserve", 128))), 0
+        )
 
         self.input_length = int(input_length) if input_length is not None else self.max_length - max_new_length
         actual_gen_len = max_new_length - 1
@@ -469,7 +491,45 @@ class AdaptiveIMICacheBase(AdaptiveIMIIndexingMixin, AdaptiveIMIAsyncUpdateMixin
         self.generated_history_lock = threading.Lock()
         self.generated_history_worker_queue: queue.Queue[Optional[tuple[int, int, int, torch.Tensor, torch.Tensor, torch.cuda.Event]]] = queue.Queue()
         self.generated_history_worker = None
+        # A background failure must never turn into silently missing history.
+        # The decode thread checks this value before it consumes generated KV.
+        self.generated_history_worker_error: Optional[BaseException] = None
+        self.generated_history_worker_error_context = ""
+        self.generated_history_worker_traceback = ""
         self.generated_history_worker_streams: Dict[str, torch.cuda.Stream] = {}
+        # Per-layer FIFO queues prevent cross-layer commits from being applied
+        # by the wrong decode stream.
+        self.generated_page_commit_queues: List[queue.Queue] = [queue.Queue() for _ in range(self.layer_num)]
+        self.generated_page_staging_keys = [None] * self.layer_num
+        self.generated_page_staging_values = [None] * self.layer_num
+        self.generated_page_staging_assignments = [None] * self.layer_num
+        self.generated_page_assignments_gpu = [None] * self.layer_num
+        self.generated_page_keys_cpu = [None] * self.layer_num
+        self.generated_page_values_cpu = [None] * self.layer_num
+        self.generated_page_cluster_heads_cpu = [None] * self.layer_num
+        self.generated_page_cluster_tails_cpu = [None] * self.layer_num
+        self.generated_page_prev_cpu = [None] * self.layer_num
+        self.generated_page_sizes_cpu = [None] * self.layer_num
+        self.generated_page_next_cpu = [None] * self.layer_num
+        self.generated_page_cluster_tails_gpu = [None] * self.layer_num
+        self.generated_page_prev_gpu = [None] * self.layer_num
+        self.generated_page_sizes_gpu = [None] * self.layer_num
+        self.generated_cluster_counts_gpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_ids_cpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_heads_cpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_tails_cpu = [None] * self.layer_num
+        self.generated_page_commit_page_ids_cpu = [None] * self.layer_num
+        self.generated_page_commit_page_prev_cpu = [None] * self.layer_num
+        self.generated_page_commit_page_sizes_cpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_sums_cpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_counts_cpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_ids_gpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_tails_gpu = [None] * self.layer_num
+        self.generated_page_commit_page_ids_gpu = [None] * self.layer_num
+        self.generated_page_commit_page_prev_gpu = [None] * self.layer_num
+        self.generated_page_commit_page_sizes_gpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_sums_gpu = [None] * self.layer_num
+        self.generated_page_commit_cluster_counts_gpu = [None] * self.layer_num
         if self.async_update_enabled:
             self.generated_history_worker = threading.Thread(
                 target=self._generated_history_worker_loop,

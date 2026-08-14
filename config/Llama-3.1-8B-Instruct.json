@@ -6,7 +6,7 @@
         "cache_ratio": 0.1,
         "retrieval_budget": 0.1,
         "buffer_cluster_num": 32,   
-        "partition_path": "",
+        "partition_path": "/home/yjy/AdaptiveIMI/outputs/train_data/partitions/booksum_nolima_babilong_long64k_128k_token_balanced/llama3_partition.json",
         "hybrid_index": {
             "policy": "gpu_only",
             "start": "gpu"

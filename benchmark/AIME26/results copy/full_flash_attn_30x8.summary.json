@@ -1,0 +1,12 @@
+{
+  "total_problems": 30,
+  "passed_problems": 0,
+  "pass_k": 8,
+  "pass_at_k": 0.0,
+  "pass_at_k_percent": 0.0,
+  "total_attempts": 240,
+  "correct_attempts": 0,
+  "mean_correct_attempts_per_problem": 0.0,
+  "prediction_path": "/home/yjy/AdaptiveIMI/benchmark/AIME26/results/full_flash_attn_30x8.jsonl",
+  "num_summary_rows": 30
+}

@@ -18,6 +18,11 @@ _HYBRID_8WAY_CUDA_EXT = None
 class HybridBuildResult:
     metadata: List[Dict[str, object]]
     base_metadata_gpu: Optional[Dict[str, torch.Tensor]] = None
+    # Immutable routing state for online generated-token insertion.  It is
+    # deliberately kept separate from decode metadata: the latter contains
+    # full-dimensional leaf means, whereas online insertion must use the
+    # frozen 8-way codebooks that created the original IMI leaves.
+    routing_metadata: Optional[Dict[str, torch.Tensor]] = None
     stats: Dict[str, float] = field(default_factory=dict)
 
 
@@ -96,6 +101,7 @@ class HybridLayerBuildJob:
         raw_keys_cpu: Optional[torch.Tensor] = None,
         raw_values_cpu: Optional[torch.Tensor] = None,
         raw_layout: str = "bhtd",
+        export_routing_metadata: bool = False,
     ) -> None:
         if keys.dim() != 4 or values.dim() != 4:
             raise ValueError("keys/values must be [batch, kv_heads, tokens, head_dim]")
@@ -163,6 +169,7 @@ class HybridLayerBuildJob:
         self._raw_keys_cpu_ref: Optional[torch.Tensor] = raw_keys_cpu
         self._raw_values_cpu_ref: Optional[torch.Tensor] = raw_values_cpu
         self.raw_layout = str(raw_layout)
+        self.export_routing_metadata = bool(export_routing_metadata)
         self.source_ready_event = source_ready_event
 
         self.copy_event: Optional[torch.cuda.Event] = None
@@ -172,6 +179,7 @@ class HybridLayerBuildJob:
         self.build_stream: Optional[torch.cuda.Stream] = None
         self._metadata_device: Optional[Dict[str, torch.Tensor]] = None
         self._metadata_cpu: Optional[Dict[str, torch.Tensor]] = None
+        self._routing_cpu: Optional[Dict[str, torch.Tensor]] = None
         self._metadata_cpu_event: Optional[torch.cuda.Event] = None
         self._metadata_cpu_stream: Optional[torch.cuda.Stream] = None
         self._metadata_cpu_started = False
@@ -181,6 +189,7 @@ class HybridLayerBuildJob:
         self._gpu_build_ms = 0.0
         self._raw_d2h_wait_ms = 0.0
         self._metadata_d2h_ms = 0.0
+        self._routing_d2h_bytes = 0
         self._gpu_sources_released = False
 
         self.keys_cpu = None
@@ -389,6 +398,8 @@ class HybridLayerBuildJob:
             int(max_k),
             int(max_compact_clusters),
         )
+        has_routing_metadata = False
+        subspace_centroids = None
         if len(build_outputs) == 5:
             (
                 token_ids_by_cluster,
@@ -397,6 +408,16 @@ class HybridLayerBuildJob:
                 cluster_counts,
                 full_centroids,
             ) = build_outputs
+        elif len(build_outputs) == 6:
+            (
+                token_ids_by_cluster,
+                cluster_sizes,
+                cluster_offsets,
+                cluster_counts,
+                full_centroids,
+                subspace_centroids,
+            ) = build_outputs
+            has_routing_metadata = True
         elif len(build_outputs) == 8:
             (
                 _subspace_centroids_cuda,
@@ -410,7 +431,7 @@ class HybridLayerBuildJob:
             ) = build_outputs
         else:
             raise RuntimeError(
-                f"hybrid 8-way builder returned {len(build_outputs)} tensors; expected 5 flat-only tensors"
+                f"hybrid 8-way builder returned {len(build_outputs)} tensors; expected 5 or 6 tensors"
             )
         metadata = {
             "token_counts": row_token_counts.to(torch.int32),
@@ -419,6 +440,21 @@ class HybridLayerBuildJob:
             "cluster_offsets": cluster_offsets.to(torch.int32),
             "centroids": full_centroids.to(torch.float32),
             "token_ids_by_cluster": token_ids_by_cluster.to(torch.int32),
+            # Keep this on GPU here.  `start_cpu_metadata_d2h()` submits the
+            # tiny routing transfer on its dedicated D2H stream; putting a
+            # `.to('cpu')` here would serialize the prefill critical path.
+            "routing_subspace_centroids": (
+                subspace_centroids if has_routing_metadata and self.export_routing_metadata else None
+            ),
+            "routing_subspace_dim_ids": (
+                subspace_dim_ids if has_routing_metadata and self.export_routing_metadata else None
+            ),
+            "routing_subspace_dim_masks": (
+                subspace_dim_masks if has_routing_metadata and self.export_routing_metadata else None
+            ),
+            "routing_k_values": (
+                k_values_tensor if has_routing_metadata and self.export_routing_metadata else None
+            ),
         }
         return metadata
 
@@ -446,6 +482,12 @@ class HybridLayerBuildJob:
             "cluster_offsets",
             "token_ids_by_cluster",
         ]
+        routing_metadata_keys = [
+            "routing_subspace_centroids",
+            "routing_subspace_dim_ids",
+            "routing_subspace_dim_masks",
+            "routing_k_values",
+        ]
         first_tensor = next(
             (self._metadata_device[key] for key in cpu_metadata_keys if key in self._metadata_device),
             None,
@@ -466,11 +508,27 @@ class HybridLayerBuildJob:
                 for key in cpu_metadata_keys
                 if key in self._metadata_device
             }
+            self._routing_cpu = {
+                key: torch.empty(
+                    self._metadata_device[key].shape,
+                    dtype=self._metadata_device[key].dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for key in routing_metadata_keys
+                if self._metadata_device.get(key) is not None
+            }
+            self._routing_d2h_bytes = sum(
+                int(tensor.numel()) * int(tensor.element_size())
+                for tensor in self._routing_cpu.values()
+            )
         with nvtx_range(f"imi.prefill.L{self.layer_idx}.metadata_d2h.enqueue_copy"):
             with torch.cuda.stream(self._metadata_cpu_stream):
                 if self.build_end is not None:
                     self._metadata_cpu_stream.wait_event(self.build_end)
                 for key, dst in self._metadata_cpu.items():
+                    dst.copy_(self._metadata_device[key], non_blocking=True)
+                for key, dst in self._routing_cpu.items():
                     dst.copy_(self._metadata_device[key], non_blocking=True)
                 self._metadata_cpu_event.record()
         self._metadata_cpu_started = True
@@ -595,6 +653,7 @@ class HybridLayerBuildJob:
             "gpu_build_ms": gpu_build_ms,
             "cpu_build_ms": float(getattr(self, "cpu_build_ms", 0.0)),
             "metadata_d2h_ms": metadata_d2h_ms,
+            "routing_d2h_bytes": float(self._routing_d2h_bytes),
             "raw_d2h_wait_ms": raw_d2h_wait_ms,
             "reorganize_ms": reorg_ms,
             "total_tokens": float(int(self.token_counts.sum().item()) * self.kv_heads),
@@ -603,6 +662,14 @@ class HybridLayerBuildJob:
             "batch_groups": float(self.batch_size * self.kv_heads),
         }
 
+        routing_metadata = None
+        if self._routing_cpu:
+            routing_metadata = {
+                "subspace_centroids": self._routing_cpu["routing_subspace_centroids"],
+                "subspace_dim_ids": self._routing_cpu["routing_subspace_dim_ids"],
+                "subspace_dim_masks": self._routing_cpu["routing_subspace_dim_masks"],
+                "k_values": self._routing_cpu["routing_k_values"],
+            }
         base_gpu = {
             "centroids": self._metadata_device["centroids"],
             "cluster_sizes": self._metadata_device["cluster_sizes"],
@@ -619,6 +686,7 @@ class HybridLayerBuildJob:
         return HybridBuildResult(
             metadata=structured,
             base_metadata_gpu=base_gpu,
+            routing_metadata=routing_metadata,
             stats=stats,
         )
 

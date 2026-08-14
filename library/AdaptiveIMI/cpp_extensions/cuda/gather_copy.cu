@@ -1220,6 +1220,240 @@ __global__ void copy_miss_chunks_kernel(
     }
 }
 
+// Select generated overflow leaves on GPU, then gather their pinned-CPU KV
+// pages through UVA.  The worker only publishes immutable leaf metadata; no
+// host-side top-k, D2H scalar readback, or decode/worker mutex is required.
+template <typename T>
+__global__ void gather_selected_overflow_leaves_kernel(
+    const int64_t* __restrict__ selected_ids,
+    const int32_t* __restrict__ leaf_indices,
+    const int32_t* __restrict__ leaf_sizes,
+    const T* __restrict__ src_keys,
+    const T* __restrict__ src_values,
+    T* __restrict__ dst_keys,
+    T* __restrict__ dst_values,
+    int32_t* __restrict__ valid_lengths,
+    int rows,
+    int leaves,
+    int leaf_size,
+    int history_tokens,
+    int dim,
+    int nprobe,
+    int budget,
+    int dst_stride
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ int shared[];
+    int* selected = shared;
+    int* counts = selected + nprobe;
+    int* offsets = counts + nprobe;
+    int* old_length_ptr = offsets + nprobe;
+
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < nprobe; ++i) {
+            selected[i] = static_cast<int>(selected_ids[static_cast<int64_t>(row) * nprobe + i]);
+            counts[i] = 0;
+            offsets[i] = 0;
+        }
+        int cursor = 0;
+        const int available = max(0, min(budget, dst_stride - valid_lengths[row]));
+        for (int pos = 0; pos < nprobe; ++pos) {
+            const int leaf = selected[pos];
+            const int count = leaf >= 0 ? min(leaf_sizes[row * leaves + leaf], available - cursor) : 0;
+            offsets[pos] = cursor;
+            counts[pos] = count;
+            cursor += count;
+        }
+        *old_length_ptr = valid_lengths[row];
+        valid_lengths[row] += cursor;
+    }
+    __syncthreads();
+
+    for (int pos = 0; pos < nprobe; ++pos) {
+        const int leaf = selected[pos];
+        const int count = counts[pos];
+        const int offset = offsets[pos];
+        if (leaf >= 0 && count > 0) {
+            for (int linear = threadIdx.x; linear < count * dim; linear += blockDim.x) {
+                const int token_pos = linear / dim;
+                const int d = linear - token_pos * dim;
+                const int source_token = leaf_indices[(row * leaves + leaf) * leaf_size + token_pos];
+                if (source_token >= 0 && source_token < history_tokens) {
+                    const int64_t src = (static_cast<int64_t>(row) * history_tokens + source_token) * dim + d;
+                    const int64_t dst = (static_cast<int64_t>(row) * dst_stride + *old_length_ptr + offset + token_pos) * dim + d;
+                    dst_keys[dst] = src_keys[src];
+                    dst_values[dst] = src_values[src];
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+void gather_selected_overflow_leaves(
+    torch::Tensor& selected,
+    torch::Tensor& leaf_indices,
+    torch::Tensor& leaf_sizes,
+    torch::Tensor& src_keys,
+    torch::Tensor& src_values,
+    torch::Tensor& dst_keys,
+    torch::Tensor& dst_values,
+    torch::Tensor& valid_lengths,
+    int nprobe,
+    int budget
+) {
+    TORCH_CHECK(selected.is_cuda() && selected.scalar_type() == torch::kInt64, "selected overflow leaves must be CUDA int64");
+    TORCH_CHECK(leaf_indices.is_cuda() && leaf_sizes.is_cuda(), "overflow leaf tables must be CUDA");
+    TORCH_CHECK(!src_keys.is_cuda() && !src_values.is_cuda() && src_keys.is_pinned() && src_values.is_pinned(), "overflow KV must be pinned CPU");
+    TORCH_CHECK(dst_keys.is_cuda() && dst_values.is_cuda() && valid_lengths.is_cuda(), "overflow outputs must be CUDA");
+    TORCH_CHECK(src_keys.scalar_type() == src_values.scalar_type() && src_keys.scalar_type() == dst_keys.scalar_type(), "overflow KV dtype mismatch");
+    TORCH_CHECK(dst_values.scalar_type() == dst_keys.scalar_type(), "overflow output dtype mismatch");
+    TORCH_CHECK(selected.dim() == 2 && leaf_indices.dim() == 3 && leaf_sizes.dim() == 2, "invalid overflow tensor rank");
+    TORCH_CHECK(src_keys.dim() == 3 && src_values.sizes() == src_keys.sizes(), "invalid overflow source KV shape");
+    TORCH_CHECK(dst_keys.dim() == 3 && dst_values.sizes() == dst_keys.sizes(), "invalid overflow destination KV shape");
+    TORCH_CHECK(leaf_indices.size(0) == selected.size(0) && leaf_sizes.size(0) == selected.size(0) &&
+                leaf_indices.size(1) == leaf_sizes.size(1), "overflow leaf row/leaf dimensions mismatch");
+    TORCH_CHECK(src_keys.size(0) == selected.size(0) && dst_keys.size(0) == selected.size(0) &&
+                src_keys.size(2) == dst_keys.size(2), "overflow KV rows or head dimension mismatch");
+    TORCH_CHECK(valid_lengths.numel() == selected.size(0), "overflow valid_lengths row mismatch");
+    TORCH_CHECK(selected.is_contiguous() && leaf_indices.is_contiguous() && leaf_sizes.is_contiguous() &&
+                src_keys.is_contiguous() && src_values.is_contiguous() && dst_keys.is_contiguous() &&
+                dst_values.is_contiguous() && valid_lengths.is_contiguous(), "overflow tensors must be contiguous");
+    const int rows = static_cast<int>(selected.size(0));
+    const int leaf_size = static_cast<int>(leaf_indices.size(2));
+    TORCH_CHECK(nprobe > 0 && nprobe <= 64 && selected.size(1) == nprobe, "invalid selected overflow leaves");
+    TORCH_CHECK(budget >= 0 && dst_keys.size(1) >= budget, "invalid overflow budget");
+    const size_t shared_bytes = static_cast<size_t>(3 * nprobe + 1) * sizeof(int);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, src_keys.scalar_type(), "gather_selected_overflow_leaves", [&] {
+        gather_selected_overflow_leaves_kernel<scalar_t><<<rows, 256, shared_bytes, stream>>>(
+            selected.data_ptr<int64_t>(),
+            leaf_indices.data_ptr<int32_t>(), leaf_sizes.data_ptr<int32_t>(),
+            src_keys.data_ptr<scalar_t>(), src_values.data_ptr<scalar_t>(),
+            dst_keys.data_ptr<scalar_t>(), dst_values.data_ptr<scalar_t>(), valid_lengths.data_ptr<int32_t>(),
+            rows, static_cast<int>(leaf_sizes.size(1)), leaf_size, static_cast<int>(src_keys.size(1)),
+            static_cast<int>(dst_keys.size(2)), nprobe, budget, static_cast<int>(dst_keys.size(1)));
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Gather immutable, published delta pages belonging to the same compact
+// clusters selected by the base IMI path.  Page metadata is GPU-resident;
+// page KV lives in pinned host memory and is read through UVA.  The kernel
+// never consults an in-flight page: publication writes page_counts only after
+// the producer's D2H event has completed.
+template <typename T>
+__global__ void gather_selected_cluster_delta_pages_kernel(
+    const int64_t* __restrict__ selected_clusters,
+    const int32_t* __restrict__ cluster_tails,
+    const int32_t* __restrict__ page_prev,
+    const int32_t* __restrict__ page_sizes,
+    const T* __restrict__ page_keys,
+    const T* __restrict__ page_values,
+    T* __restrict__ dst_keys,
+    T* __restrict__ dst_values,
+    int32_t* __restrict__ valid_lengths,
+    int rows,
+    int nprobe,
+    int clusters,
+    int pages_per_cluster,
+    int total_pages,
+    int page_tokens,
+    int dim,
+    int budget,
+    int dst_stride
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ int shared[];
+    int* page_offsets = shared;
+    int* page_token_counts = page_offsets + nprobe * pages_per_cluster;
+    int* old_length = page_token_counts + nprobe * pages_per_cluster;
+    const int descriptors = nprobe * pages_per_cluster;
+
+    if (threadIdx.x == 0) {
+        const int available = max(0, min(budget, dst_stride - valid_lengths[row]));
+        int cursor = 0;
+        for (int descriptor = 0; descriptor < descriptors; ++descriptor) {
+            const int probe = descriptor / pages_per_cluster;
+            const int page_slot = descriptor - probe * pages_per_cluster;
+            const int cluster = static_cast<int>(selected_clusters[static_cast<int64_t>(row) * nprobe + probe]);
+            int page = -1;
+            if (cluster >= 0 && cluster < clusters) {
+                page = cluster_tails[static_cast<int64_t>(row) * clusters + cluster];
+                for (int hop = 0; hop < page_slot && page >= 0 && page < total_pages; ++hop) {
+                    page = page_prev[static_cast<int64_t>(row) * total_pages + page];
+                }
+            }
+            int count = 0;
+            if (page >= 0 && page < total_pages) count = min(page_sizes[static_cast<int64_t>(row) * total_pages + page], available - cursor);
+            page_offsets[descriptor] = cursor;
+            page_token_counts[descriptor] = max(count, 0);
+            cursor += max(count, 0);
+        }
+        *old_length = valid_lengths[row];
+        valid_lengths[row] += cursor;
+    }
+    __syncthreads();
+
+    for (int descriptor = 0; descriptor < descriptors; ++descriptor) {
+        const int count = page_token_counts[descriptor];
+        if (count <= 0) continue;
+        const int probe = descriptor / pages_per_cluster;
+        const int page_slot = descriptor - probe * pages_per_cluster;
+        const int cluster = static_cast<int>(selected_clusters[static_cast<int64_t>(row) * nprobe + probe]);
+        int page = cluster_tails[static_cast<int64_t>(row) * clusters + cluster];
+        for (int hop = 0; hop < page_slot; ++hop) page = page_prev[static_cast<int64_t>(row) * total_pages + page];
+        const int dst_offset = *old_length + page_offsets[descriptor];
+        for (int linear = threadIdx.x; linear < count * dim; linear += blockDim.x) {
+            const int token = linear / dim;
+            const int d = linear - token * dim;
+            const int64_t src = ((static_cast<int64_t>(row) * total_pages + page) * page_tokens + token) * dim + d;
+            const int64_t dst = (static_cast<int64_t>(row) * dst_stride + dst_offset + token) * dim + d;
+            dst_keys[dst] = page_keys[src];
+            dst_values[dst] = page_values[src];
+        }
+        __syncthreads();
+    }
+}
+
+void gather_selected_cluster_delta_pages(
+    torch::Tensor& selected_clusters, torch::Tensor& cluster_tails, torch::Tensor& page_prev,
+    torch::Tensor& page_sizes, torch::Tensor& page_keys, torch::Tensor& page_values,
+    torch::Tensor& dst_keys, torch::Tensor& dst_values, torch::Tensor& valid_lengths,
+    int pages_per_cluster, int budget
+) {
+    TORCH_CHECK(selected_clusters.is_cuda() && selected_clusters.scalar_type() == torch::kInt64, "selected clusters must be CUDA int64");
+    TORCH_CHECK(cluster_tails.is_cuda() && page_prev.is_cuda() && page_sizes.is_cuda(), "delta page metadata must be CUDA");
+    TORCH_CHECK(!page_keys.is_cuda() && !page_values.is_cuda() && page_keys.is_pinned() && page_values.is_pinned(), "delta page KV must be pinned CPU");
+    TORCH_CHECK(dst_keys.is_cuda() && dst_values.is_cuda() && valid_lengths.is_cuda(), "delta page outputs must be CUDA");
+    TORCH_CHECK(selected_clusters.dim() == 2 && cluster_tails.dim() == 2 && page_prev.dim() == 2 && page_sizes.dim() == 2, "invalid delta page metadata rank");
+    TORCH_CHECK(page_keys.dim() == 4 && page_values.sizes() == page_keys.sizes(), "invalid delta page KV shape");
+    TORCH_CHECK(dst_keys.dim() == 3 && dst_values.sizes() == dst_keys.sizes(), "invalid delta page output shape");
+    TORCH_CHECK(selected_clusters.is_contiguous() && cluster_tails.is_contiguous() && page_prev.is_contiguous() && page_sizes.is_contiguous() && page_keys.is_contiguous() && page_values.is_contiguous() && dst_keys.is_contiguous() && dst_values.is_contiguous() && valid_lengths.is_contiguous(), "delta page tensors must be contiguous");
+    const int rows = static_cast<int>(selected_clusters.size(0));
+    const int nprobe = static_cast<int>(selected_clusters.size(1));
+    const int clusters = static_cast<int>(cluster_tails.size(1));
+    const int total_pages = static_cast<int>(page_keys.size(1));
+    const int page_tokens = static_cast<int>(page_keys.size(2));
+    const int dim = static_cast<int>(page_keys.size(3));
+    TORCH_CHECK(pages_per_cluster > 0 && pages_per_cluster <= 128, "invalid pages_per_cluster");
+    TORCH_CHECK(nprobe > 0 && nprobe <= 64 && rows == cluster_tails.size(0) && rows == page_prev.size(0) && rows == page_sizes.size(0) && rows == page_keys.size(0), "delta page row mismatch");
+    TORCH_CHECK(page_prev.size(1) == total_pages && page_sizes.size(1) == total_pages && page_values.size(1) == total_pages && dst_keys.size(0) == rows && dst_keys.size(2) == dim && valid_lengths.numel() == rows, "delta page shape mismatch");
+    TORCH_CHECK(budget >= 0 && dst_keys.size(1) >= budget, "invalid delta page budget");
+    TORCH_CHECK(nprobe * pages_per_cluster <= 4096, "delta page descriptor count exceeds shared-memory limit");
+    const size_t shared_bytes = static_cast<size_t>(2 * nprobe * pages_per_cluster + 1) * sizeof(int);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, page_keys.scalar_type(), "gather_selected_cluster_delta_pages", [&] {
+        gather_selected_cluster_delta_pages_kernel<scalar_t><<<rows, 256, shared_bytes, stream>>>(
+            selected_clusters.data_ptr<int64_t>(), cluster_tails.data_ptr<int32_t>(), page_prev.data_ptr<int32_t>(), page_sizes.data_ptr<int32_t>(),
+            page_keys.data_ptr<scalar_t>(), page_values.data_ptr<scalar_t>(), dst_keys.data_ptr<scalar_t>(), dst_values.data_ptr<scalar_t>(), valid_lengths.data_ptr<int32_t>(),
+            rows, nprobe, clusters, pages_per_cluster, total_pages, page_tokens, dim, budget, static_cast<int>(dst_keys.size(1)));
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <typename T>
 __global__ void copy_hit_chunks_kernel(
     const T* __restrict__ src_keys,
@@ -1459,6 +1693,14 @@ void gather_copy_hit_chunks_profile(
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gather_selected_overflow_leaves", &gather_selected_overflow_leaves, "GPU select and UVA gather generated overflow leaves",
+          py::arg("selected"), py::arg("leaf_indices"), py::arg("leaf_sizes"),
+          py::arg("src_keys"), py::arg("src_values"), py::arg("dst_keys"), py::arg("dst_values"), py::arg("valid_lengths"),
+          py::arg("nprobe"), py::arg("budget"));
+    m.def("gather_selected_cluster_delta_pages", &gather_selected_cluster_delta_pages, "GPU gather published IMI delta pages",
+        py::arg("selected_clusters"), py::arg("cluster_tails"), py::arg("page_prev"), py::arg("page_sizes"),
+          py::arg("page_keys"), py::arg("page_values"), py::arg("dst_keys"), py::arg("dst_values"), py::arg("valid_lengths"),
+          py::arg("pages_per_cluster"), py::arg("budget"));
     m.def("gather_copy_static_chunks_profile", &gather_copy_static_chunks_profile, "Profile-only static chunk copy (CUDA)",
     py::arg("key_data"), py::arg("key_buffer"), py::arg("value_data"), py::arg("value_buffer"),
     py::arg("valid_lengths"), py::arg("groups"), py::arg("data_length"), py::arg("buffer_length"),

@@ -221,6 +221,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 cluster_offsets: int32[batch_groups, max_compact_clusters + 1]
                 cluster_counts: int32[batch_groups]
                 full_centroids: float32[batch_groups, max_compact_clusters, head_dim]
+                subspace_centroids: float32[batch_groups, 8, max_k, max_sub_dim]
         )pbdoc"
     );
 

@@ -518,6 +518,7 @@ class LLM(PrefillMixin, SamplingMixin):
                 "finish_total_wall_ms": round(float(row.get("finish_total_wall_ms", 0.0) or 0.0), 4),
                 "raw_d2h_wait_ms": round(float(row.get("raw_d2h_wait_ms", 0.0) or 0.0), 4),
                 "metadata_d2h_ms": round(float(row.get("metadata_d2h_ms", 0.0) or 0.0), 4),
+                "routing_d2h_bytes": int(float(row.get("routing_d2h_bytes", 0.0) or 0.0)),
                 "reorganize_ms": round(float(row.get("reorganize_ms", 0.0) or 0.0), 4),
                 "total_tokens": int(float(row.get("total_tokens", 0.0) or 0.0)),
             }

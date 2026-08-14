@@ -30,9 +30,12 @@
         },
         "async_update": {
             "enabled": true,
+            "mode": "unified_pages",
             "recent_generated_tokens": 512,
             "interval": 16,
-            "delta_nprobe": 8
+            "pages_per_probe": 8,
+            "total_token_budget": 256,
+            "generated_token_reserve": 128
         },
         "cpu_threads": 24
     }

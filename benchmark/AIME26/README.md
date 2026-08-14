@@ -51,10 +51,10 @@ Run the fixed comparable experiment with:
 ```
 
 It sequentially runs all 30 dataset problems with pass@8 for Full Flash
-Attention and AdaptiveIMI. The fixed AdaptiveIMI `retrieval_budget` and
+Attention Offload and AdaptiveIMI. The fixed AdaptiveIMI `retrieval_budget` and
 `cache_ratio` are both `0.1`. Both methods use the same sampling settings and
-a `65536` model context / `49152` generation safety cap, while stopping early
-after the first valid `\boxed{0..999}` answer.
+a `65536` model context / `49152` generation safety cap, and stop naturally at
+the model EOS token; the evaluator extracts the last valid integer answer.
 
 ## Replay an Existing Full-Attention Attempt Set
 

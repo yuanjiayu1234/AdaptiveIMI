@@ -1319,6 +1319,7 @@ std::vector<torch::Tensor> run_hybrid_8way_kmeans_cuda(
         cluster_offsets,
         cluster_counts,
         full_centroids,
+        centroids,
     };
 }
 

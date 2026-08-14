@@ -126,6 +126,7 @@ class HybridGpuPrefillMixin:
                 source_ready_event=source_ready_event,
                 auto_start_raw_d2h=True,
                 auto_start_gpu_build=True,
+                export_routing_metadata=False,
                 **raw_kwargs,
             )
         with nvtx_range(f"imi.prefill.L{layer_idx}.submit.wait_gpu_metadata_build"):
@@ -237,6 +238,7 @@ class HybridGpuPrefillMixin:
                     "gpu_build_ms": round(float(stats.get("gpu_build_ms", 0.0)), 3),
                     "raw_d2h_wait_ms": round(float(stats.get("raw_d2h_wait_ms", 0.0)), 3),
                     "metadata_d2h_ms": round(float(stats.get("metadata_d2h_ms", 0.0)), 3),
+                    "routing_d2h_bytes": int(stats.get("routing_d2h_bytes", 0)),
                     "reorganize_ms": round(float(stats.get("reorganize_ms", 0.0)), 3),
                 }, ensure_ascii=False),
                 flush=True,
@@ -261,6 +263,7 @@ class HybridGpuPrefillMixin:
                 "total_tokens": int(stats.get("total_tokens", 0)),
                 "build_device": str(stats.get("build_device", build_mode)),
                 "metadata_d2h_ms": round(float(stats.get("metadata_d2h_ms", 0.0)), 4),
+                "routing_d2h_bytes": int(stats.get("routing_d2h_bytes", 0)),
             })
 
         if progress and start_ts is not None:

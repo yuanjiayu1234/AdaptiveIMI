@@ -234,6 +234,7 @@ CUDA_ARCH_FLAGS = get_cuda_arch_flags()
 gpu_cluster_manager_sources = [
     str(HERE / 'src' / 'gpu_bindings.cpp'),
     str(HERE / 'src' / 'compute_wrappers.cpp'),
+    str(HERE / 'src' / 'generated_page_packer.cpp'),
     str(HERE / 'cuda' / 'compute_impl.cu'),
 ]
 
@@ -309,18 +310,36 @@ hybrid_8way_builder_ext = CUDAExtension(
 # ============================================================================
 # Setup
 # ============================================================================
+_all_extensions = [
+    gpu_cluster_manager_ext,
+    ultra_layer_pipeline_ext,
+    copy_ext,
+    hybrid_8way_builder_ext,
+]
+_requested_modules = {
+    item.strip() for item in os.environ.get("IMI_BUILD_MODULES", "").split(",") if item.strip()
+}
+if _requested_modules:
+    _extension_aliases = {
+        "gpu_cluster_manager_cpp": gpu_cluster_manager_ext,
+        "ultra_layer_pipeline_cpp": ultra_layer_pipeline_ext,
+        "Copy": copy_ext,
+        "hybrid_8way_builder_cpp": hybrid_8way_builder_ext,
+    }
+    unknown_modules = _requested_modules.difference(_extension_aliases)
+    if unknown_modules:
+        raise RuntimeError(f"unknown IMI_BUILD_MODULES entries: {sorted(unknown_modules)}")
+    _all_extensions = [
+        extension for alias, extension in _extension_aliases.items() if alias in _requested_modules
+    ]
+
 setup(
     name='imi_cpp_extensions',
     version='1.0.0',
     packages=['library', 'library.AdaptiveIMI', 'library.AdaptiveIMI.cpp_extensions'],
     package_dir={'': str(REPO_ROOT)},
     description='IMI Cache C++/CUDA Extensions',
-    ext_modules=[
-        gpu_cluster_manager_ext,
-        ultra_layer_pipeline_ext,
-        copy_ext,
-        hybrid_8way_builder_ext,
-    ],
+    ext_modules=_all_extensions,
     cmdclass={
         'build_ext': BuildExtension,
     },

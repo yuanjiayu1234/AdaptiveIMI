@@ -20,6 +20,7 @@ def _import_required(module_name: str, symbol_names: list[str]):
     gather_copy_miss_chunks_profile,
     gather_copy_selected_clusters_profile,
     gather_copy_hit_chunks_profile,
+    gather_selected_overflow_leaves,
     build_cache_aware_retrieval_plan,
     promote_hot_cold_cache_pages_from_execution,
 ] = _import_required(
@@ -29,16 +30,25 @@ def _import_required(module_name: str, symbol_names: list[str]):
         "gather_copy_miss_chunks_profile",
         "gather_copy_selected_clusters_profile",
         "gather_copy_hit_chunks_profile",
+        "gather_selected_overflow_leaves",
         "build_cache_aware_retrieval_plan",
         "promote_hot_cold_cache_pages_from_execution",
     ],
 )
+
+# This symbol was added after the original Copy extension ABI.  Keep package
+# import compatible with an existing .so so the runtime can report exactly
+# which extension needs rebuilding.
+_copy_module = import_module(f"{__name__}.Copy")
+gather_selected_cluster_delta_pages = getattr(_copy_module, "gather_selected_cluster_delta_pages", None)
 
 __all__ = [
     "gather_copy_static_chunks_profile",
     "gather_copy_miss_chunks_profile",
     "gather_copy_selected_clusters_profile",
     "gather_copy_hit_chunks_profile",
+    "gather_selected_overflow_leaves",
+    "gather_selected_cluster_delta_pages",
     "build_cache_aware_retrieval_plan",
     "promote_hot_cold_cache_pages_from_execution",
 ]

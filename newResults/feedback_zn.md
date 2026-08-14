@@ -5,7 +5,7 @@ R1W1:
 R1W2:
 我们补充了RULER实验16k-96k，例如llama3-8B在96k长度下 full/Magic/PQ/ParisKV/Retro/our 分数分别为80.32/76.35/65.97/69.75/77.46/79.65。
 
-//sequential 和 pair-sequential效率方面一样，两者正文比了recall，同时给出qasper分数对比：43.27/
+//sequential 和 pair-sequential效率方面一样，两者正文比了recall
 
 R1W3:
 <!-- why 10% -->
@@ -14,7 +14,7 @@ R1W3:
 2）Full attention并非在所有长上下文任务中都是最优选择——当上下文过长时，强制关注每一个 token 反而可能引入无关或干扰性信息。以 Long/Easy 场景为例，正确答案往往仅依赖于上下文中一个相对较小的子集；此时，AdaptiveIMI 基于相关性的检索机制能够有效抑制无关 token，起到隐式降噪的作用，从而在该任务上取得更高的分数。需要强调的是，我们并不认为 AdaptiveIMI 在整体准确性上优于Full attention。总体而言，充分注意力仍然是一种强大且表现更为稳定的基线方法。上述例子仅说明：在特定任务场景下，选择性地聚焦上下文可能是有益的。<!-- 实际只多对了几道题 -->
 3）由于 Llama3、Qwen3 支持的最大上下文长度为 128K 个 token，对于超出该限制的样本，我们对所有方法统一采用中间截断策略，保留输入的开头和结尾部分。
 
-<!-- R2W1: -->
+R2W1:
 AdaptiveIMI 中的 learned partition 并非为了学习显式的语义类别，而是针对每个 layer-head 的 KV 表征分布，在 cell-size 约束下优化向量量化结构，使划分尽可能适应该 layer-head 特有的 KV 几何分布以及 RoPE 所引入的表示结构。因此，其核心意义并不在于不同 layer/head 之间形成某种统一、直观的语义模式，而在于为不同 layer/head 自适应地构建与其 KV 几何结构相匹配的搜索空间。
 
 R2W2:
@@ -37,14 +37,15 @@ PQCache的预算为10%和20%，Retroinfer的实际attention预算大于10%，见
 预算太小会使精度下降，同时我们补充更多预算的分数：
 Qasper Full（44.82）
 MagicPIG/PQCache/ParisKV/RetroInfer/Our
-2% budget: 42.68/41.56/42.03/42.11/42.15
-5% budget: 43.60/42.78/43.30/42.74/
+2% budget: 42.15/41.56/42.03/42.11/42.68
+5% budget: 43.60/42.78/43.30/42.74/43.77
 10% budget: 44.44/43.32/43.04/45.16/45.30
 
 R2D3:
 我们增加了32B模型(deepseek32b-fp8):
-Full/AdaptiveIMI(10%) qasper：37.96/37.41(-0.55)；narrativeqa：23.22/24.01(+0.79)
-和70B模型(Llama-3.1-70B-Instruct)，Full/AdaptiveIMI(10%) qasper：50.33/; narrativeqa：35.03/；
+Full/AdaptiveIMI(10%) qasper：37.96/37.41；narrativeqa：23.22/24.01。
+和70B模型(Llama-3.1-70B-Instruct)：
+Full/AdaptiveIMI(10%) qasper：50.33/49.27; narrativeqa：35.26/35.03。
 
 R2D4:
 <!-- 1）⻓⽣成场景下的索引增量更新未得到验证
@@ -56,7 +57,7 @@ R2D4:
 R3W1:
 我们的离线预处理按层进行：使用 11 个约 128K-token 的校准样本（每 layer/head 保留 131,072 个 K vectors），以 layer 为单位顺序处理。完整预处理平均为 12.9 min/layer：其中全维 KMeans teacher 仅 0.35 s/head，而 RoPE-pair 分组搜索为主要开销（92.3 s/head，约 12.5K 个候选）。此外，搜索通常较早趋于稳定：约 29.6 s/head 时，结果已达到完整搜索最终目标的 1% 以内，未来可通过早停进一步降低离线成本。峰值内存占用分别为：KV 采集阶段 RAM 5.39 GiB、GPU 显存 10.36 GiB；分组搜索阶段 RAM 1.26 GiB、GPU 显存 6.47 GiB。
 
-R3W2:
+<!-- R3W2: -->
 见R2D4的AIME26长输出数据集，我们给出Full attention准确度对比（没有下降）。以及tpot依然很低，这是因为对于长输出，索引是使用CPU后台更新，所以不会增加开销。
 <!-- 输出数千个token的实验应报告每步召回率、TPOT、缓存命中率、索引更新开销以及⻓⽂本⽣成质量。 -->
 
@@ -65,8 +66,7 @@ R3W3: Longbench 10%预算下：ours/ShadowKV：49.06/45.23。LycheeCluster和KVD
 
 
 R3W4:
-<!-- 本实验仅在配备 PCIe Gen4 接⼝和 64GB 主机内存的单台 A100-40GB 服务器上进⾏。由于 AdaptiveIMI 可能对 GPU 显存容量、PCIe 带宽以及 CPU 内存带宽较为敏感，因此在消费级 GPU、更⼩主机内存配置、H100/H200 等新型加速器以及 SSD 分层环境下开展评估，将进⼀步增强其实⽤性结论。此外，⼦空间数量 $m=8$、⽬标聚类规模$n_c=16$、检索⽐例 10% 以及热度⽐例 0.3 等关键参数均基本固定。需要开展更全⾯ 
-的敏感性分析，以明确这些参数在不同模型、上下⽂⻓度和⼯作负载下对准确率、召回 率、TPOT 指标及内存占⽤的影响。 -->
+<!-- 本实验仅在配备 PCIe Gen4 接⼝和 64GB 主机内存的单台 A100-40GB 服务器上进⾏。由于 AdaptiveIMI 可能对 GPU 显存容量、PCIe 带宽以及 CPU 内存带宽较为敏感，因此在消费级 GPU、更⼩主机内存配置、H100/H200 等新型加速器以及 SSD 分层环境下开展评估，将进⼀步增强其实⽤性结论。此外，⼦空间数量 $m=8$、⽬标聚类规模$n_c=16$、检索⽐例 10% 以及热度⽐例 0.3 等关键参数均基本固定。需要开展更全⾯的敏感性分析，以明确这些参数在不同模型、上下⽂⻓度和⼯作负载下对准确率、召回 率、TPOT 指标及内存占⽤的影响。 -->
 为了验证硬件影响，我们补充在单张  NVIDIA GeForce RTX 4090（24GB) 上进行，GPU 通过 PCIe 4.0 ×16 连接，CPU 内存带宽：。
 RULER结果见R1W2，
 
